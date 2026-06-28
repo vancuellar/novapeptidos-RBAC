@@ -1,0 +1,140 @@
+from pydantic import BaseModel, Field, EmailStr, ConfigDict
+from typing import List, Optional
+from datetime import datetime, timezone
+import uuid
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# ---------- Auth ----------
+class RegisterInput(BaseModel):
+    name: str
+    email: EmailStr
+    password: str = Field(min_length=6)
+
+
+class LoginInput(BaseModel):
+    email: EmailStr
+    password: str
+
+
+# ---------- Products ----------
+class PriceTier(BaseModel):
+    min_qty: int
+    price: float
+
+
+class ProductBase(BaseModel):
+    name: str
+    slug: str
+    category: str
+    short_description: str = ''
+    description: str = ''
+    presentation: str = ''      # e.g. '10 mg / vial'
+    form: str = 'Liofilizado'
+    purity: str = '99%'
+    price: float
+    tiers: List[PriceTier] = []
+    stock: int = 0
+    image_url: str = ''
+    coa_url: str = ''
+    batch_number: str = ''
+    storage: str = 'Conservar a -20 C, protegido de la luz.'
+    featured: bool = False
+    is_new: bool = False
+
+
+class ProductCreate(ProductBase):
+    pass
+
+
+class Product(ProductBase):
+    model_config = ConfigDict(extra='ignore')
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    created_at: str = Field(default_factory=now_iso)
+
+
+class ProductUpdate(BaseModel):
+    name: Optional[str] = None
+    slug: Optional[str] = None
+    category: Optional[str] = None
+    short_description: Optional[str] = None
+    description: Optional[str] = None
+    presentation: Optional[str] = None
+    form: Optional[str] = None
+    purity: Optional[str] = None
+    price: Optional[float] = None
+    tiers: Optional[List[PriceTier]] = None
+    stock: Optional[int] = None
+    image_url: Optional[str] = None
+    coa_url: Optional[str] = None
+    batch_number: Optional[str] = None
+    storage: Optional[str] = None
+    featured: Optional[bool] = None
+    is_new: Optional[bool] = None
+
+
+# ---------- Categories ----------
+class Category(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str
+    slug: str
+    description: str = ''
+    icon: str = 'FlaskConical'
+
+
+# ---------- Orders ----------
+class OrderItem(BaseModel):
+    product_id: str
+    name: str
+    price: float
+    quantity: int
+    presentation: str = ''
+    image_url: str = ''
+
+
+class CustomerInfo(BaseModel):
+    full_name: str
+    email: EmailStr
+    phone: str
+    address: str
+    city: str = ''
+    state: str = ''
+    postal_code: str = ''
+    notes: str = ''
+
+
+class OrderCreate(BaseModel):
+    items: List[OrderItem]
+    customer: CustomerInfo
+    payment_method: str   # mercado_pago | tarjeta | oxxo | spei | contra_entrega
+    shipping: float = 0
+
+
+class Order(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    order_number: str
+    user_id: Optional[str] = None
+    items: List[OrderItem]
+    customer: CustomerInfo
+    payment_method: str
+    subtotal: float
+    shipping: float
+    total: float
+    status: str = 'pendiente'   # pendiente | confirmado | enviado | entregado | cancelado
+    created_at: str = Field(default_factory=now_iso)
+
+
+class OrderStatusUpdate(BaseModel):
+    status: str
+
+
+# ---------- AI Chat ----------
+class ChatInput(BaseModel):
+    session_id: str
+    message: str
+    product_context: Optional[str] = None
