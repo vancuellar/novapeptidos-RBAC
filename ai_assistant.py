@@ -1,9 +1,8 @@
 import os
-from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
+from openai import AsyncOpenAI
 
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY')
-AI_MODEL_PROVIDER = 'openai'
-AI_MODEL_NAME = 'gpt-5.4'
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+AI_MODEL_NAME = os.environ.get('AI_MODEL_NAME', 'gpt-4o-mini')
 
 SYSTEM_PROMPT = """Eres \"Nova\", el asistente virtual de Nova Peptides, una tienda en linea
 de peptidos de investigacion en Mexico. Responde SIEMPRE en espanol (Mexico), con tono
@@ -30,22 +29,32 @@ MOTS-c, Epitalon, Selank, Semax, PT-141, DSIP, Semaglutide, Tirzepatide, y stack
 Se breve (2-4 frases salvo que pidan mas detalle). Usa vinetas cuando compares productos."""
 
 
-def build_chat(session_id: str, product_context: str = None) -> LlmChat:
+def build_chat(session_id: str, product_context: str = None) -> dict:
     system = SYSTEM_PROMPT
     if product_context:
         system += f"\n\nCONTEXTO: el usuario esta viendo el producto: {product_context}."
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=session_id,
-        system_message=system,
-    ).with_model(AI_MODEL_PROVIDER, AI_MODEL_NAME)
-    return chat
+    return {
+        'session_id': session_id,
+        'system_message': system,
+    }
 
 
-async def stream_reply(chat: LlmChat, message: str):
+async def stream_reply(chat: dict, message: str):
     """Async generator yielding text chunks."""
-    async for event in chat.stream_message(UserMessage(text=message)):
-        if isinstance(event, TextDelta):
-            yield event.content
-        elif isinstance(event, StreamDone):
-            break
+    if not OPENAI_API_KEY:
+        raise RuntimeError('OPENAI_API_KEY is not configured.')
+
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    stream = await client.chat.completions.create(
+        model=AI_MODEL_NAME,
+        messages=[
+            {'role': 'system', 'content': chat['system_message']},
+            {'role': 'user', 'content': message},
+        ],
+        stream=True,
+    )
+
+    async for event in stream:
+        chunk = event.choices[0].delta.content
+        if chunk:
+            yield chunk

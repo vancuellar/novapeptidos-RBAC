@@ -1,8 +1,9 @@
 import requests
 import sys
+import os
 from datetime import datetime
 
-BASE_URL = "https://peptides-mexico.preview.emergentagent.com/api"
+BASE_URL = os.environ.get("NOVA_API_BASE_URL", "http://localhost:8001/api")
 
 class NovaPeptidesAPITester:
     def __init__(self):
