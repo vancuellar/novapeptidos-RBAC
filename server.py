@@ -306,14 +306,17 @@ async def chat_history(session_id: str):
 @app.on_event('startup')
 async def seed_db():
     try:
-        if not await db.users.find_one({'email': 'admin@novapeptides.mx'}):
+        admin_email = os.environ.get('ADMIN_EMAIL')
+        admin_password = os.environ.get('ADMIN_PASSWORD')
+        if admin_email and admin_password and not await db.users.find_one({'email': admin_email.lower()}):
             await db.users.insert_one({
-                'id': str(uuid.uuid4()), 'name': 'Administrador',
-                'email': 'admin@novapeptides.mx', 'password_hash': hash_password('Admin123!'),
+                'id': str(uuid.uuid4()), 'name': os.environ.get('ADMIN_NAME', 'Administrador'),
+                'email': admin_email.lower(), 'password_hash': hash_password(admin_password),
                 'role': 'admin', 'created_at': now_iso(),
             })
             logger.info('Seeded admin user')
-        if not await db.users.find_one({'email': 'cliente@novapeptides.mx'}):
+
+        if os.environ.get('SEED_DEMO_USERS') == 'true' and not await db.users.find_one({'email': 'cliente@novapeptides.mx'}):
             await db.users.insert_one({
                 'id': str(uuid.uuid4()), 'name': 'Cliente Demo',
                 'email': 'cliente@novapeptides.mx', 'password_hash': hash_password('Cliente123!'),
