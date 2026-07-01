@@ -13,7 +13,7 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: CORS_ORIGINS
-        value: https://vancuellar.github.io
+        value: https://novapeptidos.mx,https://www.novapeptidos.mx
       - key: ADMIN_EMAIL
         sync: false
       - key: ADMIN_PASSWORD
