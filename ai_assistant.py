@@ -4,7 +4,7 @@ from google.genai import types
 
 # Capa gratuita de Google (Gemini). Genera la llave en https://aistudio.google.com/apikey
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
-AI_MODEL_NAME = os.environ.get('AI_MODEL_NAME', 'gemini-2.0-flash')
+AI_MODEL_NAME = os.environ.get('AI_MODEL_NAME', 'gemini-3.5-flash')
 
 SYSTEM_PROMPT = """Eres \"Nova\", el asistente virtual de la tienda Nova Peptides, un comercio en linea
 de peptidos de investigacion en Mexico. Responde SIEMPRE en espanol (Mexico), con tono
