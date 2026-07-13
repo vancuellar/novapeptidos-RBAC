@@ -1,8 +1,10 @@
 import os
-from openai import AsyncOpenAI
+from google import genai
+from google.genai import types
 
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
-AI_MODEL_NAME = os.environ.get('AI_MODEL_NAME', 'gpt-4o-mini')
+# Capa gratuita de Google (Gemini). Genera la llave en https://aistudio.google.com/apikey
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
+AI_MODEL_NAME = os.environ.get('AI_MODEL_NAME', 'gemini-2.0-flash')
 
 SYSTEM_PROMPT = """Eres \"Nova\", el asistente virtual de la tienda Nova Peptides, un comercio en linea
 de peptidos de investigacion en Mexico. Responde SIEMPRE en espanol (Mexico), con tono
@@ -60,21 +62,18 @@ def build_chat(session_id: str, product_context: str = None) -> dict:
 
 
 async def stream_reply(chat: dict, message: str):
-    """Async generator yielding text chunks."""
-    if not OPENAI_API_KEY:
-        raise RuntimeError('OPENAI_API_KEY is not configured.')
+    """Async generator yielding text chunks (Gemini)."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError('GEMINI_API_KEY is not configured.')
 
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-    stream = await client.chat.completions.create(
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    stream = await client.aio.models.generate_content_stream(
         model=AI_MODEL_NAME,
-        messages=[
-            {'role': 'system', 'content': chat['system_message']},
-            {'role': 'user', 'content': message},
-        ],
-        stream=True,
+        contents=message,
+        config=types.GenerateContentConfig(system_instruction=chat['system_message']),
     )
 
     async for event in stream:
-        chunk = event.choices[0].delta.content
+        chunk = getattr(event, 'text', None)
         if chunk:
             yield chunk
