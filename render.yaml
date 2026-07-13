@@ -18,5 +18,5 @@ services:
         sync: false
       - key: ADMIN_PASSWORD
         sync: false
-      - key: OPENAI_API_KEY
+      - key: GEMINI_API_KEY
         sync: false
