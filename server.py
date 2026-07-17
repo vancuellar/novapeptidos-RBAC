@@ -18,6 +18,8 @@ from auth import (
     get_current_user, get_optional_user, get_current_admin,
 )
 from ai_assistant import build_chat, stream_reply
+from emails import send_welcome_email, normalize_language
+import asyncio
 from seed_data import CATEGORIES, PRODUCTS
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -56,9 +58,11 @@ async def register(payload: RegisterInput):
         'email': payload.email.lower(),
         'password_hash': hash_password(payload.password),
         'role': 'user',
+        'language': normalize_language(payload.language),
         'created_at': now_iso(),
     }
     await db.users.insert_one(user)
+    asyncio.create_task(send_welcome_email(user['name'], user['email'], user['language']))
     token = create_token(user['id'])
     return {
         'token': token,
