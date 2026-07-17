@@ -13,6 +13,7 @@ class RegisterInput(BaseModel):
     name: str
     email: EmailStr
     password: str = Field(min_length=6)
+    language: str = 'es'   # es | en | pt — UI language at signup, drives email language
 
 
 class LoginInput(BaseModel):
