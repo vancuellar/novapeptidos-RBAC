@@ -250,6 +250,73 @@ async def admin_stats(admin=Depends(get_current_admin)):
     }
 
 
+# ----------------- Admin: Customers -----------------
+@api_router.get('/admin/customers')
+async def admin_customers(admin=Depends(get_current_admin)):
+    """Todos los clientes con su historial de compra. Nunca expone password_hash."""
+    users = await db.users.find({'role': {'$ne': 'admin'}}, {'_id': 0, 'password_hash': 0}).to_list(2000)
+    orders = await db.orders.find({}, {'_id': 0}).to_list(5000)
+    by_user = {}
+    for o in orders:
+        if o.get('user_id'):
+            by_user.setdefault(o['user_id'], []).append(o)
+    out = []
+    for u in users:
+        uo = sorted(by_user.get(u['id'], []), key=lambda o: o.get('created_at', ''), reverse=True)
+        valid = [o for o in uo if o.get('status') != 'cancelado']
+        addresses, phones = [], []
+        for o in uo:
+            c = o.get('customer') or {}
+            addr = ', '.join(x for x in [c.get('address'), c.get('city'), c.get('state'), c.get('postal_code')] if x)
+            if addr and addr not in addresses:
+                addresses.append(addr)
+            if c.get('phone') and c['phone'] not in phones:
+                phones.append(c['phone'])
+        out.append({
+            **u,
+            'orders_count': len(uo),
+            'total_spent': sum(o.get('total', 0) for o in valid),
+            'last_order_at': uo[0].get('created_at') if uo else None,
+            'addresses': addresses,
+            'phones': phones,
+            'orders': uo,
+        })
+    out.sort(key=lambda u: (-u['total_spent'], u.get('created_at', '')))
+    return out
+
+
+# ----------------- Admin: Analytics -----------------
+@api_router.get('/admin/analytics')
+async def admin_analytics(admin=Depends(get_current_admin)):
+    """Ventas agregadas: por mes, por producto, por metodo de pago y por estado."""
+    orders = await db.orders.find({}, {'_id': 0}).to_list(10000)
+    valid = [o for o in orders if o.get('status') != 'cancelado']
+    by_month, by_pay, by_status, prod = {}, {}, {}, {}
+    for o in orders:
+        s = o.get('status', 'pendiente')
+        by_status[s] = by_status.get(s, 0) + 1
+    for o in valid:
+        month = (o.get('created_at') or '')[:7]
+        e = by_month.setdefault(month, {'month': month, 'revenue': 0, 'orders': 0})
+        e['revenue'] += o.get('total', 0)
+        e['orders'] += 1
+        pm = o.get('payment_method', 'otro')
+        by_pay[pm] = by_pay.get(pm, 0) + o.get('total', 0)
+        for it in o.get('items', []):
+            p = prod.setdefault(it.get('name', '?'), {'name': it.get('name', '?'), 'units': 0, 'revenue': 0})
+            p['units'] += it.get('quantity', 1)
+            p['revenue'] += it.get('price', 0) * it.get('quantity', 1)
+    revenue_total = sum(o.get('total', 0) for o in valid)
+    return {
+        'monthly': sorted(by_month.values(), key=lambda e: e['month']),
+        'top_products': sorted(prod.values(), key=lambda p: -p['revenue'])[:10],
+        'by_payment': [{'method': k, 'revenue': v} for k, v in sorted(by_pay.items(), key=lambda x: -x[1])],
+        'by_status': by_status,
+        'avg_ticket': round(revenue_total / len(valid)) if valid else 0,
+        'revenue_total': revenue_total,
+    }
+
+
 # ----------------- AI Chat (streaming) -----------------
 @api_router.post('/ai/chat')
 async def ai_chat(payload: ChatInput):
