@@ -69,7 +69,7 @@ class NovaPeptidesAPITester:
             "POST",
             "/auth/login",
             200,
-            data={"email": "admin@novapeptides.mx", "password": "Admin123!"}
+            data={"email": "admin@exygenlabs.com", "password": "Admin123!"}
         )
         if success and 'token' in response:
             self.admin_token = response['token']
@@ -81,7 +81,7 @@ class NovaPeptidesAPITester:
             "POST",
             "/auth/login",
             200,
-            data={"email": "cliente@novapeptides.mx", "password": "Cliente123!"}
+            data={"email": "cliente@exygenlabs.com", "password": "Cliente123!"}
         )
         if success and 'token' in response:
             self.customer_token = response['token']
@@ -407,7 +407,7 @@ class NovaPeptidesAPITester:
 
     def run_all_tests(self):
         """Run all tests"""
-        self.log("🚀", "Starting Nova Peptides API Tests")
+        self.log("🚀", "Starting Exygen Labs API Tests")
         self.log("🌐", f"Base URL: {self.base_url}")
         
         # Test health endpoint

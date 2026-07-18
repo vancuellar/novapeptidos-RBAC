@@ -1,4 +1,4 @@
-"""Seed data for Nova Peptides: categories + realistic MXN catalog.
+"""Seed data for Exygen Labs: categories + realistic MXN catalog.
 Prices in MXN. All products are research-use-only (RUO).
 This catalog is fully editable/replaceable from the admin panel.
 """
@@ -34,7 +34,7 @@ def _p(name, slug, category, sd, desc, presentation, purity, price, stock, img,
         'name': name, 'slug': slug, 'category': category, 'short_description': sd,
         'description': desc, 'presentation': presentation, 'form': form, 'purity': purity,
         'price': price, 'tiers': tiers or [], 'stock': stock, 'image_url': img,
-        'coa_url': f'https://novapeptides.mx/coa/{slug}.pdf', 'batch_number': batch,
+        'coa_url': f'https://exygenlabs.com/coa/{slug}.pdf', 'batch_number': batch,
         'storage': storage, 'featured': featured, 'is_new': is_new,
     }
 

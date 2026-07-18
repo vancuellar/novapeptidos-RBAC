@@ -25,7 +25,7 @@ from seed_data import CATEGORIES, PRODUCTS
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title='Nova Peptides API')
+app = FastAPI(title='Exygen Labs API')
 api_router = APIRouter(prefix='/api')
 
 
@@ -43,7 +43,7 @@ def gen_order_number():
 # ----------------- Health -----------------
 @api_router.get('/')
 async def root():
-    return {'message': 'Nova Peptides API', 'status': 'ok'}
+    return {'message': 'Exygen Labs API', 'status': 'ok'}
 
 
 # ----------------- Auth -----------------
@@ -268,7 +268,7 @@ async def ai_chat(payload: ChatInput):
         recent = prior[-8:]
         lines = []
         for m in recent:
-            who = 'Usuario' if m['role'] == 'user' else 'Nova'
+            who = 'Usuario' if m['role'] == 'user' else 'Exygen'
             lines.append(f"{who}: {m['content']}")
         history_text = 'Conversacion previa:\n' + '\n'.join(lines) + '\n\nNuevo mensaje del usuario:\n'
 
@@ -320,10 +320,10 @@ async def seed_db():
             })
             logger.info('Seeded admin user')
 
-        if os.environ.get('SEED_DEMO_USERS') == 'true' and not await db.users.find_one({'email': 'cliente@novapeptides.mx'}):
+        if os.environ.get('SEED_DEMO_USERS') == 'true' and not await db.users.find_one({'email': 'cliente@exygenlabs.com'}):
             await db.users.insert_one({
                 'id': str(uuid.uuid4()), 'name': 'Cliente Demo',
-                'email': 'cliente@novapeptides.mx', 'password_hash': hash_password('Cliente123!'),
+                'email': 'cliente@exygenlabs.com', 'password_hash': hash_password('Cliente123!'),
                 'role': 'user', 'created_at': now_iso(),
             })
             logger.info('Seeded test customer')

@@ -13,9 +13,9 @@ SUPPORTED_LANGUAGES = {'es', 'en', 'pt'}
 DEFAULT_LANGUAGE = 'es'
 
 WELCOME_SUBJECTS = {
-    'es': 'Tu cuenta en Nova Peptides está lista',
-    'en': 'Your Nova Peptides account is ready',
-    'pt': 'Sua conta na Nova Peptides está pronta',
+    'es': 'Tu cuenta en Exygen Labs está lista',
+    'en': 'Your Exygen Labs account is ready',
+    'pt': 'Sua conta na Exygen Labs está pronta',
 }
 
 
@@ -26,7 +26,7 @@ def normalize_language(language):
 
 def _send_email_sync(to_address, subject, html_body):
     region = os.environ.get('SES_REGION', 'us-east-1')
-    sender = os.environ.get('EMAIL_FROM', 'Nova Peptides <hola@novapeptidos.mx>')
+    sender = os.environ.get('EMAIL_FROM', 'Exygen Labs <hola@exygenlabs.com>')
     ses = boto3.client('sesv2', region_name=region)
     ses.send_email(
         FromEmailAddress=sender,
