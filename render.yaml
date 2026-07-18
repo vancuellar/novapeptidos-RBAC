@@ -13,7 +13,7 @@ services:
       - key: JWT_SECRET
         generateValue: true
       - key: CORS_ORIGINS
-        value: https://novapeptidos.mx,https://www.novapeptidos.mx
+        value: https://novapeptidos.mx,https://www.novapeptidos.mx,https://exygenlabs.com,https://www.exygenlabs.com
       - key: ADMIN_EMAIL
         sync: false
       - key: ADMIN_PASSWORD
