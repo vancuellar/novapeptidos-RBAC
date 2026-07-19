@@ -377,12 +377,19 @@ CARRIER_TRACKING_URLS = {
     'estafeta': 'https://www.estafeta.com/Herramientas/Rastreo?wayBill={n}',
     'ups': 'https://www.ups.com/track?tracknum={n}',
     'paquetexpress': 'https://www.paquetexpress.com.mx/rastreo?guia={n}',
+    'paqueteexpress': 'https://www.paquetexpress.com.mx/rastreo?guia={n}',
+    'redpack': 'https://www.redpack.com.mx/es/rastreo/?guias={n}',
+    'correosdemexico': 'https://www.correosdemexico.gob.mx/SSLServicios/SeguimientoEnvio/Seguimiento.aspx?guia={n}',
 }
 
 
 def build_tracking_url(carrier: str, number: str) -> str:
-    """URL de rastreo del transportista. Vacío si no lo conocemos."""
+    """URL de rastreo del transportista. Vacío si no lo conocemos.
+
+    Normalizamos espacios y acentos porque el admin escribe el nombre a mano.
+    """
     key = (carrier or '').strip().lower().replace(' ', '')
+    key = key.translate(str.maketrans('áéíóúü', 'aeiouu'))
     tpl = CARRIER_TRACKING_URLS.get(key)
     return tpl.format(n=number.strip()) if tpl and number else ''
 
