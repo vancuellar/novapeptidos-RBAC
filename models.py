@@ -22,6 +22,16 @@ class LoginInput(BaseModel):
     password: str
 
 
+class ForgotPasswordInput(BaseModel):
+    email: EmailStr
+    language: str = 'es'
+
+
+class ResetPasswordInput(BaseModel):
+    token: str
+    password: str = Field(min_length=6)
+
+
 # ---------- Products ----------
 class PriceTier(BaseModel):
     min_qty: int

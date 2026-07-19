@@ -10,7 +10,8 @@ from typing import List, Optional
 
 from database import db, client
 from models import (
-    RegisterInput, LoginInput, ProductCreate, ProductUpdate, Product, Category,
+    RegisterInput, LoginInput, ForgotPasswordInput, ResetPasswordInput,
+    ProductCreate, ProductUpdate, Product, Category,
     OrderCreate, Order, OrderStatusUpdate, ChatInput, DistributorCreate, now_iso,
 )
 from auth import (
@@ -18,7 +19,8 @@ from auth import (
     get_current_user, get_optional_user, get_current_admin, get_current_distributor,
 )
 from ai_assistant import build_chat, stream_reply
-from emails import send_welcome_email, normalize_language
+from emails import send_welcome_email, send_reset_email, normalize_language
+from datetime import timedelta
 import asyncio
 from seed_data import CATEGORIES, PRODUCTS
 
@@ -94,6 +96,38 @@ async def login(payload: LoginInput):
         'token': token,
         'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
     }
+
+
+SITE_URL = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+
+
+@api_router.post('/auth/forgot-password')
+async def forgot_password(payload: ForgotPasswordInput):
+    """Siempre responde ok (no revela si el correo existe)."""
+    user = await db.users.find_one({'email': payload.email.lower()}, {'_id': 0, 'password_hash': 0})
+    if user:
+        token = uuid.uuid4().hex
+        await db.password_resets.insert_one({
+            'token': token,
+            'user_id': user['id'],
+            'expires_at': (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+            'used': False,
+            'created_at': now_iso(),
+        })
+        link = f'{SITE_URL}/restablecer?token={token}'
+        asyncio.create_task(send_reset_email(user['name'], user['email'], link,
+                                             payload.language or user.get('language')))
+    return {'ok': True}
+
+
+@api_router.post('/auth/reset-password')
+async def reset_password(payload: ResetPasswordInput):
+    rec = await db.password_resets.find_one({'token': payload.token, 'used': False}, {'_id': 0})
+    if not rec or rec.get('expires_at', '') < datetime.now(timezone.utc).isoformat():
+        raise HTTPException(status_code=400, detail='El enlace no es valido o ya expiro. Solicita uno nuevo.')
+    await db.users.update_one({'id': rec['user_id']}, {'$set': {'password_hash': hash_password(payload.password)}})
+    await db.password_resets.update_one({'token': payload.token}, {'$set': {'used': True}})
+    return {'ok': True}
 
 
 @api_router.get('/auth/me')
