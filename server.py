@@ -5,6 +5,7 @@ import os
 import logging
 import uuid
 import random
+import re
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -13,7 +14,9 @@ from models import (
     RegisterInput, LoginInput, ForgotPasswordInput, ResetPasswordInput,
     ProfileUpdate, ChangePasswordInput,
     ProductCreate, ProductUpdate, Product, Category,
-    OrderCreate, Order, OrderStatusUpdate, ChatInput, DistributorCreate, now_iso,
+    OrderCreate, Order, OrderStatusUpdate, OrderShippingUpdate,
+    ProtocolInput, ProtocolUpdate,
+    ChatInput, DistributorCreate, now_iso,
 )
 from auth import (
     hash_password, verify_password, create_token,
@@ -356,11 +359,64 @@ async def admin_orders(admin=Depends(get_current_admin)):
 
 @api_router.put('/admin/orders/{order_id}/status')
 async def update_order_status(order_id: str, payload: OrderStatusUpdate, admin=Depends(get_current_admin)):
-    result = await db.orders.update_one({'id': order_id}, {'$set': {'status': payload.status}})
+    update = {'status': payload.status}
+    if payload.status == 'enviado':
+        update['shipped_at'] = now_iso()
+    elif payload.status == 'entregado':
+        update['delivered_at'] = now_iso()
+    result = await db.orders.update_one({'id': order_id}, {'$set': update})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail='Pedido no encontrado')
     order = await db.orders.find_one({'id': order_id}, {'_id': 0})
     return order
+
+
+CARRIER_TRACKING_URLS = {
+    'fedex': 'https://www.fedex.com/fedextrack/?trknbr={n}',
+    'dhl': 'https://www.dhl.com/mx-es/home/rastreo.html?tracking-id={n}',
+    'estafeta': 'https://www.estafeta.com/Herramientas/Rastreo?wayBill={n}',
+    'ups': 'https://www.ups.com/track?tracknum={n}',
+    'paquetexpress': 'https://www.paquetexpress.com.mx/rastreo?guia={n}',
+}
+
+
+def build_tracking_url(carrier: str, number: str) -> str:
+    """URL de rastreo del transportista. Vacío si no lo conocemos."""
+    key = (carrier or '').strip().lower().replace(' ', '')
+    tpl = CARRIER_TRACKING_URLS.get(key)
+    return tpl.format(n=number.strip()) if tpl and number else ''
+
+
+@api_router.put('/admin/orders/{order_id}/shipping')
+async def update_order_shipping(order_id: str, payload: OrderShippingUpdate, admin=Depends(get_current_admin)):
+    """Captura guía y transportista. Si no dan URL, la armamos con la del transportista."""
+    order = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    update = {}
+    for field in ('carrier', 'tracking_number', 'tracking_url', 'eta'):
+        value = getattr(payload, field)
+        if value is not None:
+            update[field] = value.strip()
+    carrier = update.get('carrier', order.get('carrier', ''))
+    number = update.get('tracking_number', order.get('tracking_number', ''))
+    if not update.get('tracking_url') and number:
+        auto = build_tracking_url(carrier, number)
+        if auto:
+            update['tracking_url'] = auto
+    if payload.status:
+        update['status'] = payload.status
+        if payload.status == 'enviado' and not order.get('shipped_at'):
+            update['shipped_at'] = now_iso()
+        elif payload.status == 'entregado' and not order.get('delivered_at'):
+            update['delivered_at'] = now_iso()
+    # Capturar una guía implica que ya salió: si seguía pendiente, pasa a enviado.
+    if number and not payload.status and order.get('status') in ('pendiente', 'confirmado'):
+        update['status'] = 'enviado'
+        update.setdefault('shipped_at', now_iso())
+    if update:
+        await db.orders.update_one({'id': order_id}, {'$set': update})
+    return await db.orders.find_one({'id': order_id}, {'_id': 0})
 
 
 @api_router.get('/admin/stats')
@@ -588,14 +644,20 @@ async def distributor_clients(dist=Depends(get_current_distributor)):
     return out
 
 
-@api_router.get('/distributor/sales')
-async def distributor_sales(dist=Depends(get_current_distributor)):
+async def _distributor_orders(dist):
+    """Órdenes atribuidas al distribuidor: por código o por cliente referido."""
     users = await db.users.find({'referred_by': dist['id']}, {'_id': 0}).to_list(5000)
     client_ids = {u['id'] for u in users}
     orders = await db.orders.find(
         {'$or': [{'referred_by': dist['id']}, {'user_id': {'$in': list(client_ids)}}]}, {'_id': 0}
     ).to_list(10000)
     orders.sort(key=lambda o: o.get('created_at', ''), reverse=True)
+    return orders
+
+
+@api_router.get('/distributor/sales')
+async def distributor_sales(dist=Depends(get_current_distributor)):
+    orders = await _distributor_orders(dist)
     # Solo lo que el distribuidor necesita: no exponemos datos internos de margen del negocio.
     return [{
         'order_number': o.get('order_number'),
@@ -608,10 +670,232 @@ async def distributor_sales(dist=Depends(get_current_distributor)):
     } for o in orders]
 
 
+@api_router.get('/distributor/orders')
+async def distributor_orders(dist=Depends(get_current_distributor)):
+    """Pedidos de SUS clientes con estatus y seguimiento de envío.
+
+    Incluye datos de contacto y entrega del cliente (el distribuidor los atiende),
+    pero nunca el margen interno del negocio.
+    """
+    orders = await _distributor_orders(dist)
+    out = []
+    for o in orders:
+        c = o.get('customer') or {}
+        out.append({
+            'order_number': o.get('order_number'),
+            'created_at': o.get('created_at'),
+            'status': o.get('status', 'pendiente'),
+            'customer_name': c.get('full_name'),
+            'customer_email': c.get('email'),
+            'customer_phone': c.get('phone'),
+            'destination': ', '.join(x for x in [c.get('city'), c.get('state')] if x),
+            'payment_method': o.get('payment_method'),
+            'items': [{'name': it.get('name'), 'quantity': it.get('quantity'),
+                       'presentation': it.get('presentation', '')} for it in o.get('items', [])],
+            'total': o.get('total', 0),
+            'discount_rate': o.get('discount_rate', 0),
+            'commission': o.get('commission', 0),
+            'carrier': o.get('carrier', ''),
+            'tracking_number': o.get('tracking_number', ''),
+            'tracking_url': o.get('tracking_url', ''),
+            'shipped_at': o.get('shipped_at'),
+            'delivered_at': o.get('delivered_at'),
+            'eta': o.get('eta', ''),
+        })
+    return out
+
+
+# ----------------- Protocolos: consumo y recompra -----------------
+REPURCHASE_WARN_DAYS = 14   # a partir de aquí sugerimos recomprar
+
+
+def _protocol_projection(p: dict) -> dict:
+    """Calcula cuánto material queda y para cuándo alcanza.
+
+    Todo en mcg internamente. Si faltan datos o la frecuencia es 0, devolvemos
+    los campos calculados en None en vez de inventar una fecha.
+    """
+    dose_mcg = float(p.get('dose', 0)) * (1000 if p.get('dose_unit') == 'mg' else 1)
+    total_mcg = float(p.get('vial_mg', 0)) * 1000 * max(1, int(p.get('vials', 1)))
+    per_week = float(p.get('doses_per_week', 0))
+    out = {**p, 'total_doses': None, 'doses_used': None, 'doses_left': None,
+           'days_left': None, 'runs_out_at': None, 'pct_left': None, 'needs_repurchase': False}
+    if dose_mcg <= 0 or total_mcg <= 0 or per_week <= 0:
+        return out
+    total_doses = int(total_mcg // dose_mcg)
+    try:
+        started = datetime.fromisoformat((p.get('started_at') or '').replace('Z', '+00:00'))
+    except ValueError:
+        started = datetime.now(timezone.utc)
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    days_elapsed = max(0, (datetime.now(timezone.utc) - started).days)
+    per_day = per_week / 7
+    doses_used = min(total_doses, int(days_elapsed * per_day))
+    doses_left = max(0, total_doses - doses_used)
+    days_left = int(doses_left / per_day) if per_day else None
+    runs_out = (datetime.now(timezone.utc) + timedelta(days=days_left)).isoformat() if days_left is not None else None
+    out.update({
+        'total_doses': total_doses,
+        'doses_used': doses_used,
+        'doses_left': doses_left,
+        'days_left': days_left,
+        'runs_out_at': runs_out,
+        'pct_left': round(100 * doses_left / total_doses) if total_doses else 0,
+        'needs_repurchase': bool(p.get('active', True)) and days_left is not None and days_left <= REPURCHASE_WARN_DAYS,
+    })
+    return out
+
+
+@api_router.get('/me/protocols')
+async def list_protocols(user=Depends(get_current_user)):
+    rows = await db.protocols.find({'user_id': user['id']}, {'_id': 0}).to_list(200)
+    rows.sort(key=lambda r: r.get('created_at', ''), reverse=True)
+    return [_protocol_projection(r) for r in rows]
+
+
+@api_router.post('/me/protocols')
+async def create_protocol(payload: ProtocolInput, user=Depends(get_current_user)):
+    doc = {
+        'id': str(uuid.uuid4()),
+        'user_id': user['id'],
+        **payload.model_dump(),
+        'active': True,
+        'created_at': now_iso(),
+    }
+    doc['started_at'] = doc.get('started_at') or now_iso()
+    await db.protocols.insert_one(doc)
+    return _protocol_projection({k: v for k, v in doc.items() if k != '_id'})
+
+
+@api_router.put('/me/protocols/{protocol_id}')
+async def edit_protocol(protocol_id: str, payload: ProtocolUpdate, user=Depends(get_current_user)):
+    update = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
+    if not update:
+        raise HTTPException(status_code=400, detail='Sin cambios')
+    result = await db.protocols.update_one({'id': protocol_id, 'user_id': user['id']}, {'$set': update})
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail='Seguimiento no encontrado')
+    row = await db.protocols.find_one({'id': protocol_id}, {'_id': 0})
+    return _protocol_projection(row)
+
+
+@api_router.delete('/me/protocols/{protocol_id}')
+async def delete_protocol(protocol_id: str, user=Depends(get_current_user)):
+    result = await db.protocols.delete_one({'id': protocol_id, 'user_id': user['id']})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail='Seguimiento no encontrado')
+    return {'ok': True}
+
+
+@api_router.get('/admin/repurchase')
+async def admin_repurchase(admin=Depends(get_current_admin)):
+    """Clientes cuyo material está por acabarse — oportunidad de recompra."""
+    rows = await db.protocols.find({'active': True}, {'_id': 0}).to_list(5000)
+    users = await db.users.find({}, {'_id': 0, 'password_hash': 0}).to_list(5000)
+    by_id = {u['id']: u for u in users}
+    out = []
+    for r in rows:
+        proj = _protocol_projection(r)
+        if proj['days_left'] is None:
+            continue
+        u = by_id.get(r.get('user_id')) or {}
+        out.append({
+            'user_id': r.get('user_id'),
+            'customer_name': u.get('name', '?'),
+            'customer_email': u.get('email', ''),
+            'product_name': r.get('product_name'),
+            'product_slug': r.get('product_slug', ''),
+            'days_left': proj['days_left'],
+            'doses_left': proj['doses_left'],
+            'runs_out_at': proj['runs_out_at'],
+            'needs_repurchase': proj['needs_repurchase'],
+        })
+    out.sort(key=lambda r: r['days_left'])
+    return out
+
+
 # ----------------- AI Chat (streaming) -----------------
+STATUS_LABEL = {
+    'pendiente': 'pendiente de confirmar pago',
+    'confirmado': 'confirmado, en preparacion',
+    'enviado': 'enviado',
+    'entregado': 'entregado',
+    'cancelado': 'cancelado',
+}
+
+ORDER_NUMBER_RE = re.compile(r'\bEX[-\s]?(\d{8})[-\s]?(\d{4})\b', re.IGNORECASE)
+SHIPPING_INTENT_RE = re.compile(
+    r'\b(pedido|orden|envio|env[ií]o|guia|gu[ií]a|rastre|paqueter|entrega|lleg|track|estatus|status)\w*',
+    re.IGNORECASE,
+)
+
+
+def _order_summary_line(o: dict) -> str:
+    """Resumen de una orden para el prompt. Sin direccion ni datos personales."""
+    parts = [
+        f"Pedido {o.get('order_number')}",
+        f"estado: {STATUS_LABEL.get(o.get('status', ''), o.get('status', 'desconocido'))}",
+        f"fecha: {(o.get('created_at') or '')[:10]}",
+        f"total: ${round(o.get('total', 0)):,} MXN",
+    ]
+    items = ', '.join(f"{it.get('quantity', 1)}x {it.get('name', '?')}" for it in o.get('items', [])[:6])
+    if items:
+        parts.append(f'articulos: {items}')
+    if o.get('carrier') or o.get('tracking_number'):
+        parts.append(f"paqueteria: {o.get('carrier') or 'por confirmar'}")
+        if o.get('tracking_number'):
+            parts.append(f"guia: {o['tracking_number']}")
+        if o.get('tracking_url'):
+            parts.append(f"rastreo: {o['tracking_url']}")
+    if o.get('shipped_at'):
+        parts.append(f"enviado el: {o['shipped_at'][:10]}")
+    if o.get('delivered_at'):
+        parts.append(f"entregado el: {o['delivered_at'][:10]}")
+    if o.get('eta'):
+        parts.append(f"tiempo estimado: {o['eta']}")
+    return ' | '.join(parts)
+
+
+async def build_order_context(message: str, user) -> str:
+    """Si el usuario pregunta por su pedido, adjunta los datos reales al prompt.
+
+    Dos vias: (a) numero de pedido escrito en el mensaje; (b) sesion autenticada,
+    de donde tomamos sus ultimos pedidos. Nunca exponemos ordenes ajenas a un
+    usuario anonimo mas alla del estatus y la guia del numero que el mismo dio.
+    """
+    if not SHIPPING_INTENT_RE.search(message or ''):
+        return ''
+    found = []
+    match = ORDER_NUMBER_RE.search(message or '')
+    if match:
+        number = f'EX-{match.group(1)}-{match.group(2)}'
+        order = await db.orders.find_one({'order_number': number}, {'_id': 0})
+        if order:
+            # Si hay sesion, solo su propia orden; si es anonimo, basta el numero exacto.
+            if not user or not order.get('user_id') or order['user_id'] == user['id']:
+                found.append(order)
+        else:
+            return (f'\n\nDATOS DEL SISTEMA: no existe ningun pedido con el numero {number}. '
+                    'Pide al usuario que verifique el numero o que escriba a hola@exygenlabs.com.')
+    if not found and user:
+        recent = await db.orders.find({'user_id': user['id']}, {'_id': 0}).to_list(50)
+        recent.sort(key=lambda o: o.get('created_at', ''), reverse=True)
+        found = recent[:3]
+    if not found:
+        return ('\n\nDATOS DEL SISTEMA: el usuario no ha iniciado sesion y no dio un numero de pedido. '
+                'Pidele su numero de pedido (formato EX-AAAAMMDD-1234) o que inicie sesion para consultarlo.')
+    lines = '\n'.join('- ' + _order_summary_line(o) for o in found)
+    return ('\n\nDATOS DEL SISTEMA (pedidos reales del usuario; usalos para responder sobre estatus '
+            'y envio, no inventes nada mas):\n' + lines)
+
+
 @api_router.post('/ai/chat')
-async def ai_chat(payload: ChatInput):
+async def ai_chat(payload: ChatInput, user=Depends(get_optional_user)):
     chat = build_chat(payload.session_id, payload.product_context)
+    order_context = await build_order_context(payload.message, user)
+    if order_context:
+        chat['system_message'] += order_context
     prior = await db.chat_messages.find(
         {'session_id': payload.session_id}, {'_id': 0}
     ).sort('created_at', 1).to_list(50)
