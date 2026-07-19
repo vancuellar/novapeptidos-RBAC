@@ -15,6 +15,13 @@ class RegisterInput(BaseModel):
     password: str = Field(min_length=6)
     language: str = 'es'   # es | en | pt — UI language at signup, drives email language
     distributor_code: Optional[str] = None   # si el cliente viene referido por un distribuidor
+    # Consentimientos. Los dos primeros son obligatorios y el servidor los exige:
+    # no basta con validarlos en el navegador porque el API es público.
+    age_confirmed: bool = False      # 18+ y acepta Términos y Condiciones
+    privacy_accepted: bool = False   # acepta la Política de privacidad
+    marketing_email: bool = False
+    marketing_sms: bool = False
+    promos: bool = False             # bonos y campañas
 
 
 class LoginInput(BaseModel):

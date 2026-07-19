@@ -70,7 +70,12 @@ async def register(payload: RegisterInput):
     existing = await db.users.find_one({'email': payload.email.lower()})
     if existing:
         raise HTTPException(status_code=400, detail='Este correo ya esta registrado')
+    if not payload.age_confirmed:
+        raise HTTPException(status_code=400, detail='Debes confirmar que tienes 18 anos o mas y aceptar los Terminos y Condiciones')
+    if not payload.privacy_accepted:
+        raise HTTPException(status_code=400, detail='Debes aceptar la Politica de privacidad')
     referrer = await resolve_distributor(payload.distributor_code)
+    consented_at = now_iso()
     user = {
         'id': str(uuid.uuid4()),
         'name': payload.name,
@@ -79,7 +84,17 @@ async def register(payload: RegisterInput):
         'role': 'user',
         'language': normalize_language(payload.language),
         'referred_by': referrer['id'] if referrer else None,
-        'created_at': now_iso(),
+        # Registro de consentimiento: guardamos QUE aceptó y CUÁNDO, porque es
+        # lo que hay que poder demostrar si alguien lo pregunta.
+        'consents': {
+            'age_confirmed': True,
+            'privacy_accepted': True,
+            'marketing_email': bool(payload.marketing_email),
+            'marketing_sms': bool(payload.marketing_sms),
+            'promos': bool(payload.promos),
+            'accepted_at': consented_at,
+        },
+        'created_at': consented_at,
     }
     await db.users.insert_one(user)
     asyncio.create_task(send_welcome_email(user['name'], user['email'], user['language']))
