@@ -272,17 +272,19 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     if payload.payment_method not in ('tarjeta', 'spei'):
         raise HTTPException(status_code=400, detail='Metodo de pago no disponible')
     subtotal = sum(item.price * item.quantity for item in payload.items)
-    # Descuento AUTOMATICO por volumen (misma regla que el frontend; manda el servidor):
-    # 10% lanzamiento, 15% desde $20,000, 20% desde $40,000.
-    discount_rate = 0.20 if subtotal >= 40000 else 0.15 if subtotal >= 20000 else 0.10
-    discount = round(subtotal * discount_rate)
-    after_discount = subtotal - discount
-    shipping = payload.shipping if payload.shipping else 0   # el envio se cotiza por separado
-    total = after_discount + shipping
     # Atribucion a distribuidor: por codigo explicito o por el que refirio al usuario.
     referrer = await resolve_distributor(payload.distributor_code)
     if not referrer and user and user.get('referred_by'):
         referrer = await db.users.find_one({'id': user['referred_by'], 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
+    # Descuento: automatico por volumen (10/15/20%) O el del codigo del distribuidor —
+    # NUNCA se acumulan; aplica el MAYOR de los dos. Manda el servidor.
+    auto_rate = 0.20 if subtotal >= 40000 else 0.15 if subtotal >= 20000 else 0.10
+    code_rate = referrer.get('customer_discount_rate', 0) if referrer else 0
+    discount_rate = max(auto_rate, code_rate)
+    discount = round(subtotal * discount_rate)
+    after_discount = subtotal - discount
+    shipping = payload.shipping if payload.shipping else 0   # el envio se cotiza por separado
+    total = after_discount + shipping
     commission = round(after_discount * referrer.get('commission_rate', 0.25)) if referrer else 0
     order = Order(
         order_number=gen_order_number(),
@@ -445,6 +447,16 @@ async def admin_analytics(admin=Depends(get_current_admin)):
     }
 
 
+# ----------------- Public: validar codigo de distribuidor -----------------
+@api_router.get('/discount-code/{code}')
+async def check_discount_code(code: str):
+    """Publico: valida un codigo y devuelve SOLO el % de descuento (nada personal)."""
+    dist = await resolve_distributor(code.strip().upper())
+    if not dist:
+        raise HTTPException(status_code=404, detail='Codigo no valido')
+    return {'code': dist['distributor_code'], 'discount_rate': dist.get('customer_discount_rate', 0)}
+
+
 # ----------------- Admin: Invite customers -----------------
 @api_router.post('/admin/customers/invite')
 async def invite_customer(payload: DistributorCreate, admin=Depends(get_current_admin)):
@@ -480,6 +492,7 @@ def _distributor_rollup(dist, users, orders):
         'email': dist['email'],
         'distributor_code': dist.get('distributor_code'),
         'commission_rate': dist.get('commission_rate', 0.25),
+        'customer_discount_rate': dist.get('customer_discount_rate', 0),
         'created_at': dist.get('created_at'),
         'clients_count': len(clients),
         'sales_count': len(valid),
@@ -515,6 +528,7 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
         'role': 'distributor',
         'distributor_code': code,
         'commission_rate': max(0.0, min(1.0, payload.commission_rate)),
+        'customer_discount_rate': max(0.05, min(0.50, payload.customer_discount_rate)),
         'language': 'es',
         'created_at': now_iso(),
     }
@@ -522,6 +536,7 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
     # temp_password se entrega al admin para compartir; el distribuidor la cambia al entrar.
     return {'id': dist['id'], 'name': dist['name'], 'email': dist['email'],
             'distributor_code': code, 'commission_rate': dist['commission_rate'],
+            'customer_discount_rate': dist['customer_discount_rate'],
             'temp_password': temp_password}
 
 
@@ -543,6 +558,7 @@ async def distributor_summary(dist=Depends(get_current_distributor)):
     return {
         'distributor_code': dist.get('distributor_code'),
         'commission_rate': dist.get('commission_rate', 0.25),
+        'customer_discount_rate': dist.get('customer_discount_rate', 0),
         'clients_count': len(users),
         'sales_count': len(valid),
         'sales_total': sum(o.get('total', 0) for o in valid),

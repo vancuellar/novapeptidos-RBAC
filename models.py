@@ -177,7 +177,8 @@ class OrderStatusUpdate(BaseModel):
 class DistributorCreate(BaseModel):
     name: str
     email: EmailStr
-    commission_rate: float = 0.25   # 0..1 — proporción de cada venta que gana el distribuidor
+    commission_rate: float = 0.25          # 0..1 — proporción de cada venta que gana el distribuidor
+    customer_discount_rate: float = 0.10   # 0.05..0.50 — descuento que su código da a SUS clientes
 
 
 # ---------- AI Chat ----------
