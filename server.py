@@ -272,13 +272,18 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     if payload.payment_method not in ('tarjeta', 'spei'):
         raise HTTPException(status_code=400, detail='Metodo de pago no disponible')
     subtotal = sum(item.price * item.quantity for item in payload.items)
-    shipping = payload.shipping if payload.shipping else (0 if subtotal >= 2500 else 199)
-    total = subtotal + shipping
+    # Descuento AUTOMATICO por volumen (misma regla que el frontend; manda el servidor):
+    # 10% lanzamiento, 15% desde $20,000, 20% desde $40,000.
+    discount_rate = 0.20 if subtotal >= 40000 else 0.15 if subtotal >= 20000 else 0.10
+    discount = round(subtotal * discount_rate)
+    after_discount = subtotal - discount
+    shipping = payload.shipping if payload.shipping else 0   # el envio se cotiza por separado
+    total = after_discount + shipping
     # Atribucion a distribuidor: por codigo explicito o por el que refirio al usuario.
     referrer = await resolve_distributor(payload.distributor_code)
     if not referrer and user and user.get('referred_by'):
         referrer = await db.users.find_one({'id': user['referred_by'], 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
-    commission = round(subtotal * referrer.get('commission_rate', 0.25)) if referrer else 0
+    commission = round(after_discount * referrer.get('commission_rate', 0.25)) if referrer else 0
     order = Order(
         order_number=gen_order_number(),
         user_id=user['id'] if user else None,
@@ -286,6 +291,8 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         customer=payload.customer,
         payment_method=payload.payment_method,
         subtotal=subtotal,
+        discount=discount,
+        discount_rate=discount_rate,
         shipping=shipping,
         total=total,
         referred_by=referrer['id'] if referrer else None,

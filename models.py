@@ -144,8 +144,9 @@ class CustomerInfo(BaseModel):
 class OrderCreate(BaseModel):
     items: List[OrderItem]
     customer: CustomerInfo
-    payment_method: str   # mercado_pago | tarjeta | oxxo | spei | contra_entrega
+    payment_method: str   # tarjeta | spei
     shipping: float = 0
+    discount: float = 0                      # informativo; el servidor recalcula con su propia regla
     distributor_code: Optional[str] = None   # referido por un distribuidor (atribuye la venta)
 
 
@@ -158,6 +159,8 @@ class Order(BaseModel):
     customer: CustomerInfo
     payment_method: str
     subtotal: float
+    discount: float = 0         # descuento automatico por volumen (10/15/20%)
+    discount_rate: float = 0
     shipping: float
     total: float
     status: str = 'pendiente'   # pendiente | confirmado | enviado | entregado | cancelado
