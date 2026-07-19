@@ -14,6 +14,7 @@ class RegisterInput(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6)
     language: str = 'es'   # es | en | pt — UI language at signup, drives email language
+    distributor_code: Optional[str] = None   # si el cliente viene referido por un distribuidor
 
 
 class LoginInput(BaseModel):
@@ -113,6 +114,7 @@ class OrderCreate(BaseModel):
     customer: CustomerInfo
     payment_method: str   # mercado_pago | tarjeta | oxxo | spei | contra_entrega
     shipping: float = 0
+    distributor_code: Optional[str] = None   # referido por un distribuidor (atribuye la venta)
 
 
 class Order(BaseModel):
@@ -127,11 +129,20 @@ class Order(BaseModel):
     shipping: float
     total: float
     status: str = 'pendiente'   # pendiente | confirmado | enviado | entregado | cancelado
+    referred_by: Optional[str] = None   # id del distribuidor que refirió (si aplica)
+    commission: float = 0               # ganancia del distribuidor en esta orden (MXN)
     created_at: str = Field(default_factory=now_iso)
 
 
 class OrderStatusUpdate(BaseModel):
     status: str
+
+
+# ---------- Distributors ----------
+class DistributorCreate(BaseModel):
+    name: str
+    email: EmailStr
+    commission_rate: float = 0.25   # 0..1 — proporción de cada venta que gana el distribuidor
 
 
 # ---------- AI Chat ----------

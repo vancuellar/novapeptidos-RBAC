@@ -11,11 +11,11 @@ from typing import List, Optional
 from database import db, client
 from models import (
     RegisterInput, LoginInput, ProductCreate, ProductUpdate, Product, Category,
-    OrderCreate, Order, OrderStatusUpdate, ChatInput, now_iso,
+    OrderCreate, Order, OrderStatusUpdate, ChatInput, DistributorCreate, now_iso,
 )
 from auth import (
     hash_password, verify_password, create_token,
-    get_current_user, get_optional_user, get_current_admin,
+    get_current_user, get_optional_user, get_current_admin, get_current_distributor,
 )
 from ai_assistant import build_chat, stream_reply
 from emails import send_welcome_email, normalize_language
@@ -37,7 +37,19 @@ def clean(doc):
 
 
 def gen_order_number():
-    return 'NP-' + datetime.now().strftime('%Y%m%d') + '-' + str(random.randint(1000, 9999))
+    return 'EX-' + datetime.now().strftime('%Y%m%d') + '-' + str(random.randint(1000, 9999))
+
+
+def gen_distributor_code(name: str) -> str:
+    base = ''.join(c for c in name.upper() if c.isalnum())[:4] or 'DIST'
+    return base + '-' + str(random.randint(1000, 9999))
+
+
+async def resolve_distributor(code):
+    """Devuelve el distribuidor (dict) para un codigo dado, o None."""
+    if not code:
+        return None
+    return await db.users.find_one({'distributor_code': code, 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
 
 
 # ----------------- Health -----------------
@@ -52,6 +64,7 @@ async def register(payload: RegisterInput):
     existing = await db.users.find_one({'email': payload.email.lower()})
     if existing:
         raise HTTPException(status_code=400, detail='Este correo ya esta registrado')
+    referrer = await resolve_distributor(payload.distributor_code)
     user = {
         'id': str(uuid.uuid4()),
         'name': payload.name,
@@ -59,6 +72,7 @@ async def register(payload: RegisterInput):
         'password_hash': hash_password(payload.password),
         'role': 'user',
         'language': normalize_language(payload.language),
+        'referred_by': referrer['id'] if referrer else None,
         'created_at': now_iso(),
     }
     await db.users.insert_one(user)
@@ -185,6 +199,11 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     subtotal = sum(item.price * item.quantity for item in payload.items)
     shipping = payload.shipping if payload.shipping else (0 if subtotal >= 2500 else 199)
     total = subtotal + shipping
+    # Atribucion a distribuidor: por codigo explicito o por el que refirio al usuario.
+    referrer = await resolve_distributor(payload.distributor_code)
+    if not referrer and user and user.get('referred_by'):
+        referrer = await db.users.find_one({'id': user['referred_by'], 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
+    commission = round(subtotal * referrer.get('commission_rate', 0.25)) if referrer else 0
     order = Order(
         order_number=gen_order_number(),
         user_id=user['id'] if user else None,
@@ -194,6 +213,8 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         subtotal=subtotal,
         shipping=shipping,
         total=total,
+        referred_by=referrer['id'] if referrer else None,
+        commission=commission,
     )
     await db.orders.insert_one(order.model_dump())
     for item in payload.items:
@@ -315,6 +336,131 @@ async def admin_analytics(admin=Depends(get_current_admin)):
         'avg_ticket': round(revenue_total / len(valid)) if valid else 0,
         'revenue_total': revenue_total,
     }
+
+
+# ----------------- Admin: Distributors -----------------
+def _distributor_rollup(dist, users, orders):
+    """Arma el resumen de un distribuidor: sus clientes y sus ventas atribuidas."""
+    clients = [u for u in users if u.get('referred_by') == dist['id']]
+    client_ids = {u['id'] for u in clients}
+    sales = [o for o in orders if o.get('referred_by') == dist['id'] or o.get('user_id') in client_ids]
+    valid = [o for o in sales if o.get('status') != 'cancelado']
+    return {
+        'id': dist['id'],
+        'name': dist['name'],
+        'email': dist['email'],
+        'distributor_code': dist.get('distributor_code'),
+        'commission_rate': dist.get('commission_rate', 0.25),
+        'created_at': dist.get('created_at'),
+        'clients_count': len(clients),
+        'sales_count': len(valid),
+        'sales_total': sum(o.get('total', 0) for o in valid),
+        'earnings': sum(o.get('commission', 0) for o in valid),
+    }
+
+
+@api_router.get('/admin/distributors')
+async def admin_distributors(admin=Depends(get_current_admin)):
+    dists = await db.users.find({'role': 'distributor'}, {'_id': 0, 'password_hash': 0}).to_list(1000)
+    users = await db.users.find({}, {'_id': 0, 'password_hash': 0}).to_list(5000)
+    orders = await db.orders.find({}, {'_id': 0}).to_list(10000)
+    out = [_distributor_rollup(d, users, orders) for d in dists]
+    out.sort(key=lambda d: -d['earnings'])
+    return out
+
+
+@api_router.post('/admin/distributors')
+async def create_distributor(payload: DistributorCreate, admin=Depends(get_current_admin)):
+    existing = await db.users.find_one({'email': payload.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail='Este correo ya esta registrado')
+    code = gen_distributor_code(payload.name)
+    while await db.users.find_one({'distributor_code': code}):
+        code = gen_distributor_code(payload.name)
+    temp_password = uuid.uuid4().hex[:12]
+    dist = {
+        'id': str(uuid.uuid4()),
+        'name': payload.name,
+        'email': payload.email.lower(),
+        'password_hash': hash_password(temp_password),
+        'role': 'distributor',
+        'distributor_code': code,
+        'commission_rate': max(0.0, min(1.0, payload.commission_rate)),
+        'language': 'es',
+        'created_at': now_iso(),
+    }
+    await db.users.insert_one(dist)
+    # temp_password se entrega al admin para compartir; el distribuidor la cambia al entrar.
+    return {'id': dist['id'], 'name': dist['name'], 'email': dist['email'],
+            'distributor_code': code, 'commission_rate': dist['commission_rate'],
+            'temp_password': temp_password}
+
+
+# ----------------- Distributor portal -----------------
+@api_router.get('/distributor/summary')
+async def distributor_summary(dist=Depends(get_current_distributor)):
+    users = await db.users.find({'referred_by': dist['id']}, {'_id': 0, 'password_hash': 0}).to_list(5000)
+    client_ids = {u['id'] for u in users}
+    orders = await db.orders.find(
+        {'$or': [{'referred_by': dist['id']}, {'user_id': {'$in': list(client_ids)}}]}, {'_id': 0}
+    ).to_list(10000)
+    valid = [o for o in orders if o.get('status') != 'cancelado']
+    by_month = {}
+    for o in valid:
+        m = (o.get('created_at') or '')[:7]
+        e = by_month.setdefault(m, {'month': m, 'earnings': 0, 'sales': 0})
+        e['earnings'] += o.get('commission', 0)
+        e['sales'] += o.get('total', 0)
+    return {
+        'distributor_code': dist.get('distributor_code'),
+        'commission_rate': dist.get('commission_rate', 0.25),
+        'clients_count': len(users),
+        'sales_count': len(valid),
+        'sales_total': sum(o.get('total', 0) for o in valid),
+        'earnings_total': sum(o.get('commission', 0) for o in valid),
+        'monthly': sorted(by_month.values(), key=lambda e: e['month']),
+    }
+
+
+@api_router.get('/distributor/clients')
+async def distributor_clients(dist=Depends(get_current_distributor)):
+    users = await db.users.find({'referred_by': dist['id']}, {'_id': 0, 'password_hash': 0}).to_list(5000)
+    orders = await db.orders.find({}, {'_id': 0}).to_list(10000)
+    by_user = {}
+    for o in orders:
+        if o.get('user_id'):
+            by_user.setdefault(o['user_id'], []).append(o)
+    out = []
+    for u in users:
+        uo = [o for o in by_user.get(u['id'], []) if o.get('status') != 'cancelado']
+        out.append({
+            'id': u['id'], 'name': u['name'], 'email': u['email'], 'created_at': u.get('created_at'),
+            'orders_count': len(uo),
+            'total_spent': sum(o.get('total', 0) for o in uo),
+            'my_earnings': sum(o.get('commission', 0) for o in uo),
+        })
+    out.sort(key=lambda u: -u['total_spent'])
+    return out
+
+
+@api_router.get('/distributor/sales')
+async def distributor_sales(dist=Depends(get_current_distributor)):
+    users = await db.users.find({'referred_by': dist['id']}, {'_id': 0}).to_list(5000)
+    client_ids = {u['id'] for u in users}
+    orders = await db.orders.find(
+        {'$or': [{'referred_by': dist['id']}, {'user_id': {'$in': list(client_ids)}}]}, {'_id': 0}
+    ).to_list(10000)
+    orders.sort(key=lambda o: o.get('created_at', ''), reverse=True)
+    # Solo lo que el distribuidor necesita: no exponemos datos internos de margen del negocio.
+    return [{
+        'order_number': o.get('order_number'),
+        'created_at': o.get('created_at'),
+        'status': o.get('status'),
+        'customer_name': (o.get('customer') or {}).get('full_name'),
+        'total': o.get('total', 0),
+        'commission': o.get('commission', 0),
+        'items': [{'name': it.get('name'), 'quantity': it.get('quantity')} for it in o.get('items', [])],
+    } for o in orders]
 
 
 # ----------------- AI Chat (streaming) -----------------

@@ -66,3 +66,9 @@ async def get_current_admin(user=Depends(get_current_user)):
     if user.get('role') != 'admin':
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Acceso solo para administradores')
     return user
+
+
+async def get_current_distributor(user=Depends(get_current_user)):
+    if user.get('role') not in ('distributor', 'admin'):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Acceso solo para distribuidores')
+    return user
