@@ -436,6 +436,28 @@ async def admin_analytics(admin=Depends(get_current_admin)):
     }
 
 
+# ----------------- Admin: Invite customers -----------------
+@api_router.post('/admin/customers/invite')
+async def invite_customer(payload: DistributorCreate, admin=Depends(get_current_admin)):
+    """Invita a un cliente: crea la cuenta con contrasena temporal y manda bienvenida."""
+    existing = await db.users.find_one({'email': payload.email.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail='Este correo ya esta registrado')
+    temp_password = uuid.uuid4().hex[:12]
+    user = {
+        'id': str(uuid.uuid4()),
+        'name': payload.name,
+        'email': payload.email.lower(),
+        'password_hash': hash_password(temp_password),
+        'role': 'user',
+        'language': 'es',
+        'created_at': now_iso(),
+    }
+    await db.users.insert_one(user)
+    asyncio.create_task(send_welcome_email(user['name'], user['email'], 'es'))
+    return {'id': user['id'], 'name': user['name'], 'email': user['email'], 'temp_password': temp_password}
+
+
 # ----------------- Admin: Distributors -----------------
 def _distributor_rollup(dist, users, orders):
     """Arma el resumen de un distribuidor: sus clientes y sus ventas atribuidas."""
