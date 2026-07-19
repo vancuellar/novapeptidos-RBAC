@@ -27,6 +27,28 @@ class ForgotPasswordInput(BaseModel):
     language: str = 'es'
 
 
+class AddressInput(BaseModel):
+    address: str = ''
+    city: str = ''
+    state: str = ''
+    postal_code: str = ''
+
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    shipping_address: Optional[AddressInput] = None
+    billing_address: Optional[AddressInput] = None
+    preferred_payment: Optional[str] = None   # mercado_pago | tarjeta | oxxo | spei | contra_entrega
+    email: Optional[EmailStr] = None
+    current_password: Optional[str] = None    # requerido solo si cambia el correo
+
+
+class ChangePasswordInput(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=6)
+
+
 class ResetPasswordInput(BaseModel):
     token: str
     password: str = Field(min_length=6)

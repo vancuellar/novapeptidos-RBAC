@@ -11,6 +11,7 @@ from typing import List, Optional
 from database import db, client
 from models import (
     RegisterInput, LoginInput, ForgotPasswordInput, ResetPasswordInput,
+    ProfileUpdate, ChangePasswordInput,
     ProductCreate, ProductUpdate, Product, Category,
     OrderCreate, Order, OrderStatusUpdate, ChatInput, DistributorCreate, now_iso,
 )
@@ -127,6 +128,44 @@ async def reset_password(payload: ResetPasswordInput):
         raise HTTPException(status_code=400, detail='El enlace no es valido o ya expiro. Solicita uno nuevo.')
     await db.users.update_one({'id': rec['user_id']}, {'$set': {'password_hash': hash_password(payload.password)}})
     await db.password_resets.update_one({'token': payload.token}, {'$set': {'used': True}})
+    return {'ok': True}
+
+
+@api_router.put('/auth/profile')
+async def update_profile(payload: ProfileUpdate, user=Depends(get_current_user)):
+    """Perfil del usuario. NUNCA guardamos numeros de tarjeta — solo la preferencia
+    de metodo de pago; los datos de tarjeta viven con el procesador de pagos."""
+    update = {}
+    if payload.name is not None and payload.name.strip():
+        update['name'] = payload.name.strip()
+    if payload.phone is not None:
+        update['phone'] = payload.phone.strip()
+    if payload.preferred_payment is not None:
+        if payload.preferred_payment not in ('', 'mercado_pago', 'tarjeta', 'oxxo', 'spei', 'contra_entrega'):
+            raise HTTPException(status_code=400, detail='Metodo de pago no valido')
+        update['preferred_payment'] = payload.preferred_payment
+    if payload.shipping_address is not None:
+        update['shipping_address'] = payload.shipping_address.model_dump()
+    if payload.billing_address is not None:
+        update['billing_address'] = payload.billing_address.model_dump()
+    if payload.email and payload.email.lower() != user['email']:
+        full = await db.users.find_one({'id': user['id']})
+        if not payload.current_password or not verify_password(payload.current_password, full['password_hash']):
+            raise HTTPException(status_code=400, detail='Para cambiar el correo, confirma tu contrasena actual')
+        if await db.users.find_one({'email': payload.email.lower()}):
+            raise HTTPException(status_code=400, detail='Ese correo ya esta registrado')
+        update['email'] = payload.email.lower()
+    if update:
+        await db.users.update_one({'id': user['id']}, {'$set': update})
+    return await db.users.find_one({'id': user['id']}, {'_id': 0, 'password_hash': 0})
+
+
+@api_router.post('/auth/change-password')
+async def change_password(payload: ChangePasswordInput, user=Depends(get_current_user)):
+    full = await db.users.find_one({'id': user['id']})
+    if not verify_password(payload.current_password, full['password_hash']):
+        raise HTTPException(status_code=400, detail='La contrasena actual no es correcta')
+    await db.users.update_one({'id': user['id']}, {'$set': {'password_hash': hash_password(payload.new_password)}})
     return {'ok': True}
 
 
