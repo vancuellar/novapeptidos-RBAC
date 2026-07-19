@@ -236,6 +236,25 @@ class ProtocolUpdate(BaseModel):
     active: Optional[bool] = None
 
 
+# ---------- Estudios de laboratorio ----------
+class LabMarkerInput(BaseModel):
+    key: str = ''            # clave del catálogo (lab_reference) si la reconocimos
+    label: str               # nombre tal como venía en la hoja
+    value: float
+    unit: str = ''
+    reference: str = ''      # rango impreso por el laboratorio
+
+
+class LabReportInput(BaseModel):
+    """Un estudio. Nunca guardamos el archivo original ni datos de identidad:
+    solo los marcadores y la tabla en texto que sale de la extracción."""
+    taken_at: str = ''       # AAAA-MM-DD
+    lab_name: str = ''
+    markdown: str = ''
+    markers: List[LabMarkerInput] = []
+    sex: str = ''            # male | female | '' — solo para elegir el rango de referencia
+
+
 # ---------- AI Chat ----------
 class ChatInput(BaseModel):
     session_id: str

@@ -19,7 +19,10 @@ from server import (
     ORDER_NUMBER_RE, SHIPPING_INTENT_RE, STATUS_LABEL,
     build_tracking_url, _order_summary_line, _protocol_projection,
     gen_order_number, gen_distributor_code, _distributor_rollup,
-    REPURCHASE_WARN_DAYS,
+    REPURCHASE_WARN_DAYS, _decorate_report,
+)
+from lab_reference import (
+    MARKERS, MARKERS_BY_KEY, evaluate, range_for, families_for_products, relevant_markers,
 )
 
 
@@ -203,3 +206,87 @@ def test_distributor_rollup_counts_orders_attributed_by_code():
     orders = [{'referred_by': 'd1', 'user_id': None, 'status': 'confirmado', 'total': 2000, 'commission': 500}]
     r = _distributor_rollup(dist, [], orders)
     assert r['sales_count'] == 1 and r['earnings'] == 500
+
+
+# ---------- Laboratorio: rangos de referencia ----------
+def test_every_marker_declares_a_usable_range():
+    for m in MARKERS:
+        low, high = range_for(m, 'male')
+        assert low is not None and high is not None, m['key']
+        assert low < high, m['key']
+        assert m['plain'] and m['peptides'], m['key']
+
+
+def test_marker_keys_are_unique():
+    keys = [m['key'] for m in MARKERS]
+    assert len(keys) == len(set(keys))
+
+
+def test_evaluate_classifies_against_the_range():
+    assert evaluate('glucosa', 85) == 'normal'
+    assert evaluate('glucosa', 55) == 'bajo'
+    assert evaluate('glucosa', 130) == 'alto'
+
+
+def test_evaluate_uses_the_range_for_the_declared_sex():
+    # Hemoglobina 12.5 es normal en mujer y baja en hombre.
+    assert evaluate('hemoglobina', 12.5, 'female') == 'normal'
+    assert evaluate('hemoglobina', 12.5, 'male') == 'bajo'
+
+
+def test_evaluate_is_silent_on_what_it_does_not_know():
+    assert evaluate('marcador_inventado', 10) is None
+    assert evaluate('glucosa', None) is None
+    assert evaluate('glucosa', 'no numerico') is None
+
+
+# ---------- Laboratorio: acotar a los compuestos del cliente ----------
+def test_families_are_detected_from_product_names():
+    assert 'incretinas' in families_for_products(['Tirzepatida 20 mg'])
+    assert 'gh' in families_for_products(['CJC-1295 (sin DAC)', 'Ipamorelin'])
+    assert 'reparacion' in families_for_products(['BPC-157 10 mg'])
+    assert families_for_products([]) == set()
+
+
+def test_incretin_user_gets_pancreas_markers_and_not_the_gonadal_axis():
+    keys = {m['key'] for m in relevant_markers(families_for_products(['Semaglutida 2 mg']))}
+    assert {'lipasa', 'hba1c', 'glucosa'} <= keys
+    assert 'testosterona_total' not in keys
+    assert 'igf1' not in keys
+
+
+def test_gh_user_gets_igf1():
+    keys = {m['key'] for m in relevant_markers(families_for_products(['Ipamorelin 5 mg']))}
+    assert 'igf1' in keys
+
+
+def test_a_client_with_no_compounds_gets_no_markers():
+    assert relevant_markers(families_for_products(['Agua bacteriostatica'])) == []
+
+
+def test_report_hides_known_markers_outside_the_clients_scope():
+    report = {'markers': [
+        {'key': 'lipasa', 'label': 'Lipasa', 'value': 40, 'unit': 'U/L'},
+        {'key': 'testosterona_total', 'label': 'Testosterona', 'value': 500, 'unit': 'ng/dL'},
+    ]}
+    allowed = {m['key'] for m in relevant_markers({'incretinas'})}
+    out = _decorate_report(report, 'male', allowed)
+    labels = [m['label'] for m in out['markers']]
+    assert 'Lipasa' in labels
+    assert 'Testosterona' not in labels      # no tiene que ver con sus compuestos
+
+
+def test_report_keeps_unrecognised_markers_and_flags_out_of_range():
+    report = {'markers': [
+        {'key': 'glucosa', 'label': 'Glucosa', 'value': 130, 'unit': 'mg/dL'},
+        {'key': '', 'label': 'Marcador raro del laboratorio', 'value': 3, 'unit': 'x'},
+    ]}
+    allowed = {m['key'] for m in relevant_markers({'incretinas'})}
+    out = _decorate_report(report, 'male', allowed)
+    glucosa = next(m for m in out['markers'] if m['key'] == 'glucosa')
+    assert glucosa['status'] == 'alto'
+    assert glucosa['ref_low'] == 70 and glucosa['ref_high'] == 99
+    assert glucosa['plain']
+    # Lo que no reconocemos se conserva, sin clasificar y sin inventarle rango.
+    raro = next(m for m in out['markers'] if m['key'] == '')
+    assert raro['status'] is None and raro['ref_low'] is None

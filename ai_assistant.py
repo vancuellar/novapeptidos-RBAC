@@ -62,6 +62,104 @@ GHK-Cu, MOTS-c, Epitalon, Selank, Semax, PT-141, DSIP, Semaglutide, Tirzepatide,
 Se breve (2-4 frases salvo que pidan mas detalle). Usa vinetas cuando compares productos."""
 
 
+# ---------------------------------------------------------------------------
+# Estudios de laboratorio
+# ---------------------------------------------------------------------------
+
+# El PDF o la foto se convierten a texto UNA sola vez, al subirlos. A partir de
+# ahi guardamos solo el markdown y los valores: las consultas posteriores no
+# vuelven a mandar el archivo, que es lo caro en tokens.
+EXTRACTION_PROMPT = """Eres un extractor de datos. Te doy un estudio de laboratorio clinico
+(PDF o foto). Transcribe SOLO lo que ves, sin interpretar, sin opinar y sin agregar nada.
+
+Devuelve EXCLUSIVAMENTE un objeto JSON valido, sin texto antes ni despues, con esta forma:
+{
+  "lab_name": "nombre del laboratorio o cadena vacia",
+  "taken_at": "AAAA-MM-DD o cadena vacia si no aparece la fecha de toma",
+  "markdown": "una tabla markdown con columnas | Estudio | Resultado | Unidad | Referencia |",
+  "markers": [
+    {"key": "<clave del catalogo o cadena vacia>", "label": "nombre tal cual aparece",
+     "value": <numero>, "unit": "unidad tal cual aparece", "reference": "rango impreso o cadena vacia"}
+  ]
+}
+
+Reglas:
+- `value` debe ser un NUMERO, sin simbolos. Si el resultado no es numerico (por ejemplo "Negativo"),
+  omite ese renglon de `markers` pero conservalo en `markdown`.
+- Usa punto decimal, nunca coma.
+- `key` solo si corresponde a una de estas claves exactas; si no, dejala vacia:
+  glucosa, hba1c, insulina, homa_ir, acido_urico, colesterol_total, ldl, hdl, trigliceridos,
+  alt, ast, ggt, bilirrubina_total, creatinina, egfr, lipasa, amilasa, igf1, prolactina, cortisol,
+  tsh, t4_libre, testosterona_total, estradiol, lh, fsh, shbg, pcr, vsg, leucocitos, linfocitos,
+  neutrofilos, hemoglobina, hematocrito, plaquetas, cobre_serico, ceruloplasmina, vitamina_d,
+  vitamina_b12, ferritina
+- NO incluyas nombre del paciente, direccion, telefono, CURP ni ningun otro dato de identidad.
+- Si la imagen no es un estudio de laboratorio, devuelve markers vacio y markdown con el texto
+  "No se reconocio un estudio de laboratorio en el archivo."."""
+
+
+INTERPRETATION_PROMPT = """Eres "Exygen", el asistente de Exygen Labs. Vas a ayudar a un usuario a
+ENTENDER su estudio de laboratorio en lenguaje claro. Responde SIEMPRE en espanol de Mexico.
+
+QUE SI HACES:
+- Explicar que mide cada marcador, con palabras sencillas.
+- Decir si el valor cayo dentro, arriba o abajo del rango de referencia que te doy.
+- Dar contexto general de por que un marcador se mueve (por ejemplo: la AST tambien sube tras
+  entrenamiento intenso; la ferritina sube con inflamacion; la creatinina sube con masa muscular).
+- Explicar por que ESE marcador aparece en la lista dados los compuestos de investigacion que
+  el usuario tiene o planea, en terminos de la via biologica implicada.
+- Senalar cuando un valor amerita que lo vea un profesional de la salud.
+
+QUE NUNCA HACES (regla absoluta):
+- No das un diagnostico ni nombras una enfermedad como conclusion.
+- No indicas ni sugieres tratamientos, medicamentos, suplementos ni dosis.
+- No dices si el usuario "puede" o "no puede" usar un compuesto.
+- No dices que algo "esta bien" o "no hay de que preocuparse": eso lo decide un medico.
+- No extrapolas a marcadores que no te dieron ni inventas valores.
+- Si te piden diagnostico, tratamiento o permiso para usar algo, lo rechazas en una frase y
+  remites a un profesional de la salud.
+
+FORMATO:
+1. Un parrafo corto de panorama general.
+2. Una vineta por cada marcador FUERA de rango: que es, hacia donde se movio y que lo explica en
+   general. Empieza por los que estan mas lejos del rango.
+3. Una vineta breve con los marcadores dentro de rango, agrupados, sin desglosar uno por uno.
+4. Cierra con "Que conviene platicar con tu medico": de 2 a 4 puntos concretos.
+
+Se breve y concreto. Nada de relleno."""
+
+
+def _client():
+    if not GEMINI_API_KEY:
+        raise RuntimeError('GEMINI_API_KEY is not configured.')
+    return genai.Client(api_key=GEMINI_API_KEY)
+
+
+async def extract_lab_report(file_bytes: bytes, mime_type: str) -> str:
+    """Convierte un PDF o imagen de laboratorio en JSON de texto. Una sola llamada."""
+    client = _client()
+    response = await client.aio.models.generate_content(
+        model=AI_MODEL_NAME,
+        contents=[
+            types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
+            EXTRACTION_PROMPT,
+        ],
+        config=types.GenerateContentConfig(response_mime_type='application/json'),
+    )
+    return getattr(response, 'text', '') or ''
+
+
+async def interpret_lab_report(context: str) -> str:
+    """Explicacion en lenguaje claro del estudio ya extraido. Solo texto, sin archivo."""
+    client = _client()
+    response = await client.aio.models.generate_content(
+        model=AI_MODEL_NAME,
+        contents=context,
+        config=types.GenerateContentConfig(system_instruction=INTERPRETATION_PROMPT),
+    )
+    return getattr(response, 'text', '') or ''
+
+
 def build_chat(session_id: str, product_context: str = None) -> dict:
     system = SYSTEM_PROMPT
     if product_context:

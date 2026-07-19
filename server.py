@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 import os
@@ -6,6 +6,7 @@ import logging
 import uuid
 import random
 import re
+import json
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -15,14 +16,17 @@ from models import (
     ProfileUpdate, ChangePasswordInput,
     ProductCreate, ProductUpdate, Product, Category,
     OrderCreate, Order, OrderStatusUpdate, OrderShippingUpdate,
-    ProtocolInput, ProtocolUpdate,
+    ProtocolInput, ProtocolUpdate, LabReportInput,
     ChatInput, DistributorCreate, now_iso,
 )
 from auth import (
     hash_password, verify_password, create_token,
     get_current_user, get_optional_user, get_current_admin, get_current_distributor,
 )
-from ai_assistant import build_chat, stream_reply
+from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
+from lab_reference import (
+    MARKERS_BY_KEY, range_for, evaluate, families_for_products, relevant_markers,
+)
 from emails import send_welcome_email, send_reset_email, normalize_language
 from datetime import timedelta
 import asyncio
@@ -835,6 +839,195 @@ async def admin_repurchase(admin=Depends(get_current_admin)):
         })
     out.sort(key=lambda r: r['days_left'])
     return out
+
+
+# ----------------- Estudios de laboratorio -----------------
+LAB_MAX_BYTES = 8 * 1024 * 1024
+LAB_MIME_TYPES = {'application/pdf', 'image/jpeg', 'image/png', 'image/webp', 'image/heic'}
+
+LAB_DISCLAIMER = (
+    'Esto NO es un diagnóstico médico ni una indicación de tratamiento. Es una explicación '
+    'educativa de lo que miden tus marcadores, generada automáticamente. Los rangos de referencia '
+    'varían entre laboratorios: manda siempre el rango impreso en tu hoja. Solo un profesional de '
+    'la salud puede interpretar tus resultados en el contexto de tu historia clínica.'
+)
+
+
+async def _user_compound_names(user_id: str) -> list:
+    """Compuestos que este cliente compró (pedidos pagados) o registró en su seguimiento.
+
+    Es lo que acota la herramienta: sin compuestos no hay marcadores que mostrar.
+    """
+    names = []
+    orders = await db.orders.find(
+        {'user_id': user_id, 'status': {'$in': ['confirmado', 'enviado', 'entregado']}}, {'_id': 0, 'items': 1}
+    ).to_list(200)
+    for o in orders:
+        names += [it.get('name', '') for it in o.get('items', [])]
+    protocols = await db.protocols.find({'user_id': user_id}, {'_id': 0, 'product_name': 1}).to_list(200)
+    names += [p.get('product_name', '') for p in protocols]
+    return [n for n in names if n]
+
+
+def _decorate_report(report: dict, sex: str, allowed_keys: set) -> dict:
+    """Añade rango, clasificación y explicación a cada marcador, y filtra los que
+    no tienen que ver con los compuestos del cliente."""
+    out_markers = []
+    for m in report.get('markers', []):
+        key = m.get('key') or ''
+        catalog = MARKERS_BY_KEY.get(key)
+        if catalog and key not in allowed_keys:
+            continue          # marcador conocido pero ajeno a sus compuestos
+        low, high = range_for(catalog, sex) if catalog else (None, None)
+        out_markers.append({
+            **m,
+            'group': catalog['group'] if catalog else 'Otros',
+            'plain': catalog['plain'] if catalog else '',
+            'ref_low': low,
+            'ref_high': high,
+            'status': evaluate(key, m.get('value'), sex) if catalog else None,
+        })
+    return {**report, 'markers': out_markers}
+
+
+@api_router.get('/me/labs')
+async def list_lab_reports(user=Depends(get_current_user)):
+    """Estudios del cliente, ya evaluados contra los rangos de referencia."""
+    names = await _user_compound_names(user['id'])
+    families = families_for_products(names)
+    allowed = {m['key'] for m in relevant_markers(families)}
+    rows = await db.lab_reports.find({'user_id': user['id']}, {'_id': 0}).to_list(100)
+    rows.sort(key=lambda r: (r.get('taken_at') or r.get('created_at') or ''), reverse=True)
+    reports = [_decorate_report(r, r.get('sex') or '', allowed) for r in rows]
+
+    # Serie por marcador para poder graficar la evolución.
+    series = {}
+    for r in sorted(reports, key=lambda x: (x.get('taken_at') or x.get('created_at') or '')):
+        stamp = (r.get('taken_at') or r.get('created_at') or '')[:10]
+        for m in r['markers']:
+            if m.get('key') and m.get('value') is not None:
+                series.setdefault(m['key'], []).append({'date': stamp, 'value': m['value']})
+
+    return {
+        'reports': reports,
+        'series': series,
+        'relevant_markers': [
+            {'key': m['key'], 'label': m['label'], 'unit': m['unit'], 'group': m['group'], 'plain': m['plain']}
+            for m in relevant_markers(families)
+        ],
+        'families': sorted(families),
+        'disclaimer': LAB_DISCLAIMER,
+    }
+
+
+@api_router.post('/me/labs/extract')
+async def extract_lab_file(file: UploadFile = File(...), user=Depends(get_current_user)):
+    """Convierte un PDF o foto del laboratorio a texto UNA sola vez.
+
+    No guardamos el archivo: devolvemos los valores para que el cliente los
+    revise y confirme antes de guardarlos.
+    """
+    if file.content_type not in LAB_MIME_TYPES:
+        raise HTTPException(status_code=400, detail='Solo aceptamos PDF, JPG, PNG, WEBP o HEIC')
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail='El archivo esta vacio')
+    if len(data) > LAB_MAX_BYTES:
+        raise HTTPException(status_code=400, detail='El archivo pesa mas de 8 MB')
+    try:
+        raw = await extract_lab_report(data, file.content_type)
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=422, detail='No pudimos leer el estudio. Intenta con una foto mas nitida o captura los valores a mano.')
+    except Exception as e:
+        logger.error(f'Lab extraction error: {e}')
+        raise HTTPException(status_code=502, detail='No pudimos procesar el archivo. Intenta de nuevo en un momento.')
+
+    markers = []
+    for m in parsed.get('markers') or []:
+        try:
+            markers.append({
+                'key': (m.get('key') or '').strip(),
+                'label': (m.get('label') or '').strip(),
+                'value': float(m.get('value')),
+                'unit': (m.get('unit') or '').strip(),
+                'reference': (m.get('reference') or '').strip(),
+            })
+        except (TypeError, ValueError):
+            continue          # renglon no numerico: se queda solo en el markdown
+    return {
+        'lab_name': (parsed.get('lab_name') or '').strip(),
+        'taken_at': (parsed.get('taken_at') or '').strip(),
+        'markdown': parsed.get('markdown') or '',
+        'markers': markers,
+        'disclaimer': LAB_DISCLAIMER,
+    }
+
+
+@api_router.post('/me/labs')
+async def create_lab_report(payload: LabReportInput, user=Depends(get_current_user)):
+    doc = {
+        'id': str(uuid.uuid4()),
+        'user_id': user['id'],
+        'taken_at': payload.taken_at or now_iso()[:10],
+        'lab_name': payload.lab_name,
+        'markdown': payload.markdown,
+        'sex': payload.sex if payload.sex in ('male', 'female') else '',
+        'markers': [m.model_dump() for m in payload.markers],
+        'created_at': now_iso(),
+    }
+    await db.lab_reports.insert_one(doc)
+    return {k: v for k, v in doc.items() if k != '_id'}
+
+
+@api_router.delete('/me/labs/{report_id}')
+async def delete_lab_report(report_id: str, user=Depends(get_current_user)):
+    result = await db.lab_reports.delete_one({'id': report_id, 'user_id': user['id']})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail='Estudio no encontrado')
+    return {'ok': True}
+
+
+@api_router.post('/me/labs/{report_id}/interpret')
+async def interpret_lab(report_id: str, user=Depends(get_current_user)):
+    """Explicación educativa, acotada a los compuestos del propio cliente."""
+    report = await db.lab_reports.find_one({'id': report_id, 'user_id': user['id']}, {'_id': 0})
+    if not report:
+        raise HTTPException(status_code=404, detail='Estudio no encontrado')
+
+    names = await _user_compound_names(user['id'])
+    families = families_for_products(names)
+    if not families:
+        raise HTTPException(
+            status_code=400,
+            detail='Todavia no tenemos compuestos tuyos. La explicacion se acota a los peptidos que compraste o registraste.',
+        )
+    allowed = {m['key'] for m in relevant_markers(families)}
+    decorated = _decorate_report(report, report.get('sex') or '', allowed)
+    if not decorated['markers']:
+        raise HTTPException(status_code=400, detail='Este estudio no trae marcadores relacionados con tus compuestos.')
+
+    lines = []
+    for m in decorated['markers']:
+        rng = f"{m['ref_low']}-{m['ref_high']}" if m['ref_low'] is not None else (m.get('reference') or 'sin rango')
+        lines.append(f"- {m['label']}: {m['value']} {m.get('unit', '')} | referencia {rng} | clasificacion: {m.get('status') or 'sin clasificar'}")
+
+    context = (
+        f"Compuestos de investigacion del usuario: {', '.join(sorted(set(names))[:20])}.\n"
+        f"Vias implicadas: {', '.join(sorted(families))}.\n"
+        f"Fecha del estudio: {report.get('taken_at', 'sin fecha')}.\n\n"
+        "Marcadores (solo estos; no menciones ningun otro):\n" + '\n'.join(lines)
+    )
+    try:
+        text = await interpret_lab_report(context)
+    except Exception as e:
+        logger.error(f'Lab interpretation error: {e}')
+        raise HTTPException(status_code=502, detail='No pudimos generar la explicacion. Intenta de nuevo en un momento.')
+
+    await db.lab_reports.update_one(
+        {'id': report_id}, {'$set': {'interpretation': text, 'interpreted_at': now_iso()}}
+    )
+    return {'interpretation': text, 'disclaimer': LAB_DISCLAIMER}
 
 
 # ----------------- AI Chat (streaming) -----------------
