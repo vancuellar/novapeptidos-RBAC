@@ -141,7 +141,7 @@ async def update_profile(payload: ProfileUpdate, user=Depends(get_current_user))
     if payload.phone is not None:
         update['phone'] = payload.phone.strip()
     if payload.preferred_payment is not None:
-        if payload.preferred_payment not in ('', 'mercado_pago', 'tarjeta', 'oxxo', 'spei', 'contra_entrega'):
+        if payload.preferred_payment not in ('', 'tarjeta', 'spei'):
             raise HTTPException(status_code=400, detail='Metodo de pago no valido')
         update['preferred_payment'] = payload.preferred_payment
     if payload.shipping_address is not None:
@@ -269,6 +269,8 @@ async def delete_product(product_id: str, admin=Depends(get_current_admin)):
 async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     if not payload.items:
         raise HTTPException(status_code=400, detail='El carrito esta vacio')
+    if payload.payment_method not in ('tarjeta', 'spei'):
+        raise HTTPException(status_code=400, detail='Metodo de pago no disponible')
     subtotal = sum(item.price * item.quantity for item in payload.items)
     shipping = payload.shipping if payload.shipping else (0 if subtotal >= 2500 else 199)
     total = subtotal + shipping

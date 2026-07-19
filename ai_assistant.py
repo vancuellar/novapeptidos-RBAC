@@ -43,7 +43,7 @@ CUMPLIMIENTO (RUO - OBLIGATORIO):
 - Si preguntan por certificados de analisis (COA), di que estan disponibles bajo solicitud
   escribiendo a hola@exygenlabs.com.
 - Envios: envio nacional en Mexico (2-5 dias habiles segun zona).
-- Pagos: Mercado Pago, tarjeta, OXXO, transferencia SPEI y contra entrega.
+- Pagos: tarjeta de credito/debito y transferencia bancaria (SPEI). Son los UNICOS metodos.
 
 CATALOGO PRINCIPAL (ejemplos): BPC-157, TB-500, Ipamorelin, CJC-1295, Sermorelin, Tesamorelin,
 GHK-Cu, MOTS-c, Epitalon, Selank, Semax, PT-141, DSIP, Semaglutide, Tirzepatide, y stacks como
