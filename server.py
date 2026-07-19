@@ -253,7 +253,32 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     await db.orders.insert_one(order.model_dump())
     for item in payload.items:
         await db.products.update_one({'id': item.product_id}, {'$inc': {'stock': -item.quantity}})
+        # Inventario vivo por presentacion (key = product_id del carrito, ya incluye ::presentacion)
+        await db.stock.update_one({'key': item.product_id}, {'$inc': {'qty': -item.quantity}})
     return clean(order.model_dump())
+
+
+# ----------------- Stock (inventario vivo por presentacion) -----------------
+@api_router.get('/stock')
+async def get_stock():
+    """Publico: {key: {qty, in_hand}} para todas las presentaciones."""
+    rows = await db.stock.find({}, {'_id': 0}).to_list(2000)
+    return {r['key']: {'qty': r.get('qty', 0), 'in_hand': bool(r.get('in_hand'))} for r in rows}
+
+
+@api_router.put('/admin/stock')
+async def set_stock(payload: dict, admin=Depends(get_current_admin)):
+    key = payload.get('key')
+    if not key:
+        raise HTTPException(status_code=400, detail='Falta key')
+    update = {}
+    if 'qty' in payload:
+        update['qty'] = int(payload['qty'])
+    if 'in_hand' in payload:
+        update['in_hand'] = bool(payload['in_hand'])
+    await db.stock.update_one({'key': key}, {'$set': update}, upsert=True)
+    row = await db.stock.find_one({'key': key}, {'_id': 0})
+    return row
 
 
 @api_router.get('/orders/me')
