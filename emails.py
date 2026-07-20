@@ -5,6 +5,7 @@ import logging
 from pathlib import Path
 
 import boto3
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -31,18 +32,48 @@ def email_enabled() -> bool:
     return os.environ.get('EMAIL_ENABLED', 'false').lower() == 'true'
 
 
-def _send_email_sync(to_address, subject, html_body):
+def _sender():
+    return os.environ.get('EMAIL_FROM', 'Exygen Labs <hola@exygenlabs.com>')
+
+
+def _send_via_ses(to_address, subject, html_body):
     region = os.environ.get('SES_REGION', 'us-east-1')
-    sender = os.environ.get('EMAIL_FROM', 'Exygen Labs <hola@exygenlabs.com>')
     ses = boto3.client('sesv2', region_name=region)
     ses.send_email(
-        FromEmailAddress=sender,
+        FromEmailAddress=_sender(),
         Destination={'ToAddresses': [to_address]},
         Content={'Simple': {
             'Subject': {'Data': subject, 'Charset': 'UTF-8'},
             'Body': {'Html': {'Data': html_body, 'Charset': 'UTF-8'}},
         }},
     )
+
+
+def _send_via_resend(to_address, subject, html_body):
+    """Resend por HTTP. No necesita SDK y no tiene sandbox que pedir."""
+    api_key = os.environ.get('RESEND_API_KEY')
+    if not api_key:
+        raise RuntimeError('RESEND_API_KEY is not configured.')
+    resp = requests.post(
+        'https://api.resend.com/emails',
+        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+        json={'from': _sender(), 'to': [to_address], 'subject': subject, 'html': html_body},
+        timeout=20,
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f'Resend {resp.status_code}: {resp.text[:300]}')
+
+
+PROVIDERS = {'ses': _send_via_ses, 'resend': _send_via_resend}
+
+
+def _send_email_sync(to_address, subject, html_body):
+    """Despacha al proveedor configurado. `EMAIL_PROVIDER` = ses | resend."""
+    name = os.environ.get('EMAIL_PROVIDER', 'ses').strip().lower()
+    send = PROVIDERS.get(name)
+    if not send:
+        raise RuntimeError(f'EMAIL_PROVIDER desconocido: {name}')
+    send(to_address, subject, html_body)
 
 
 RESET_SUBJECTS = {
