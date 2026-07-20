@@ -160,10 +160,30 @@ async def interpret_lab_report(context: str) -> str:
     return getattr(response, 'text', '') or ''
 
 
-def build_chat(session_id: str, product_context: str = None) -> dict:
+# Idioma de respuesta segun lo que el usuario eligio en el sitio. El prompt base
+# esta en espanol; esta instruccion va al final para que pese mas.
+LANGUAGE_INSTRUCTIONS = {
+    'es': 'Responde SIEMPRE en espanol (Mexico).',
+    'en': 'IMPORTANT: Reply ALWAYS in English, regardless of the language of these instructions. '
+          'The user selected English on the site.',
+    'pt': 'IMPORTANTE: Responda SEMPRE em portugues (Brasil), independentemente do idioma destas '
+          'instrucoes. O usuario selecionou portugues no site.',
+    'fr': 'IMPORTANT : reponds TOUJOURS en francais, quelle que soit la langue de ces instructions. '
+          "L'utilisateur a choisi le francais sur le site.",
+}
+
+
+def language_instruction(language: str = None) -> str:
+    """Instruccion de idioma a partir del codigo del sitio (es-MX, en-US, ...)."""
+    code = (language or 'es').split('-')[0].lower()
+    return LANGUAGE_INSTRUCTIONS.get(code, LANGUAGE_INSTRUCTIONS['es'])
+
+
+def build_chat(session_id: str, product_context: str = None, language: str = None) -> dict:
     system = SYSTEM_PROMPT
     if product_context:
         system += f"\n\nCONTEXTO: el usuario esta viendo el producto: {product_context}."
+    system += f"\n\nIDIOMA DE RESPUESTA (OBLIGATORIO): {language_instruction(language)}"
     return {
         'session_id': session_id,
         'system_message': system,

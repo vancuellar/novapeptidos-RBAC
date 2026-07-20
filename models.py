@@ -234,6 +234,9 @@ class ProtocolInput(BaseModel):
     dose_unit: str = 'mcg'               # mcg | mg
     doses_per_week: float = 7            # frecuencia
     water_ml: float = 0                  # opcional, solo informativo
+    # Nivel de referencia con el que se calculó: inicial | tipica | avanzada.
+    # La reconstitución cambia con él, así que se guarda para poder repetirla.
+    level: str = ''
     started_at: Optional[str] = None     # ISO; default = hoy
     notes: str = ''
     remind: bool = True                  # avisar cuando se acerque el final
@@ -276,3 +279,6 @@ class ChatInput(BaseModel):
     session_id: str
     message: str
     product_context: Optional[str] = None
+    # Idioma elegido por el usuario en el sitio (es-MX, en-US, pt-BR, fr-CA).
+    # El asistente responde en ese idioma, no siempre en espanol.
+    language: Optional[str] = None

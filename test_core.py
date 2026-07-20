@@ -6,6 +6,7 @@ rompe (descuentos, comision, viales restantes, rastreo de envio).
 
 Correr:  pytest test_core.py -q
 """
+import json
 import os
 
 # database.py exige MONGO_URL al importar. El cliente de motor es perezoso:
@@ -15,6 +16,8 @@ os.environ.setdefault('DB_NAME', 'exygen_test')
 
 from datetime import datetime, timedelta, timezone
 
+import coa_store
+from ai_assistant import build_chat, language_instruction
 from server import (
     ORDER_NUMBER_RE, SHIPPING_INTENT_RE, STATUS_LABEL,
     build_tracking_url, _order_summary_line, _protocol_projection,
@@ -290,3 +293,67 @@ def test_report_keeps_unrecognised_markers_and_flags_out_of_range():
     # Lo que no reconocemos se conserva, sin clasificar y sin inventarle rango.
     raro = next(m for m in out['markers'] if m['key'] == '')
     assert raro['status'] is None and raro['ref_low'] is None
+
+
+# ---------------- Idioma del asistente ----------------
+
+def test_language_instruction_follows_site_selection():
+    """El asistente responde en el idioma que el usuario eligio en el sitio."""
+    assert 'English' in language_instruction('en-US')
+    assert 'portugues' in language_instruction('pt-BR')
+    assert 'francais' in language_instruction('fr-CA')
+    assert 'espanol' in language_instruction('es-MX')
+
+
+def test_language_instruction_defaults_to_spanish():
+    """Sin idioma, o con uno que no manejamos, se queda en espanol."""
+    for value in (None, '', 'de-DE', 'zz'):
+        assert 'espanol' in language_instruction(value)
+
+
+def test_build_chat_appends_language_instruction():
+    chat = build_chat('sess-1', None, 'en-US')
+    assert 'IDIOMA DE RESPUESTA' in chat['system_message']
+    assert 'English' in chat['system_message']
+
+
+# ---------------- Almacen de COAs ----------------
+
+def test_coa_lot_regex_blocks_path_traversal():
+    """Un lote con barras o puntos-punto no debe poder salir de la carpeta."""
+    for bad in ('../secreto', 'a/b', '..', '/etc/passwd', ''):
+        assert coa_store.entry_for_lot(bad) is None
+
+
+def test_coa_file_path_ignores_directories_in_registry(tmp_path, monkeypatch):
+    """Aunque el registro traiga una ruta, solo se usa el nombre del archivo."""
+    monkeypatch.setattr(coa_store, 'COA_DIR', tmp_path)
+    (tmp_path / 'EX-TEST-1.pdf').write_bytes(b'%PDF-1.4')
+    path = coa_store.file_path_for({'file': '../../EX-TEST-1.pdf'})
+    assert path == tmp_path / 'EX-TEST-1.pdf'
+    # Un archivo que no existe no devuelve ruta, en vez de tronar al servirlo.
+    assert coa_store.file_path_for({'file': 'no-existe.pdf'}) is None
+
+
+def test_coa_registry_missing_is_not_fatal(tmp_path, monkeypatch):
+    """Sin registry.json el sitio sigue de pie: simplemente no hay COAs."""
+    monkeypatch.setattr(coa_store, 'COA_DIR', tmp_path / 'vacia')
+    assert coa_store.load_registry() == []
+    assert coa_store.public_entry() is None
+
+
+def test_coa_access_is_scoped_to_purchased_products(tmp_path, monkeypatch):
+    """Solo se listan los COAs de los productos que el cliente compro."""
+    monkeypatch.setattr(coa_store, 'COA_DIR', tmp_path)
+    (tmp_path / 'registry.json').write_text(json.dumps({'lots': [
+        {'lot': 'EX-BPC5-2601', 'product_slug': 'bpc-157', 'file': 'a.pdf'},
+        {'lot': 'EX-TB5-2601', 'product_slug': 'tb-500', 'file': 'b.pdf'},
+        {'lot': 'EX-MUESTRA-1', 'product_slug': 'demo', 'file': 'c.pdf', 'public': True},
+    ]}), encoding='utf-8')
+
+    solo_bpc = coa_store.entries_for_slugs({'bpc-157'})
+    assert [e['lot'] for e in solo_bpc] == ['EX-BPC5-2601']
+    assert coa_store.entries_for_slugs(set()) == []
+    assert coa_store.public_entry()['lot'] == 'EX-MUESTRA-1'
+    # Lo que se manda al navegador nunca incluye la ruta del archivo.
+    assert 'file' not in solo_bpc[0]

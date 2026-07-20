@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from starlette.middleware.cors import CORSMiddleware
 import os
 import logging
@@ -25,6 +25,7 @@ from auth import (
     get_current_user, get_optional_user, get_current_admin, get_current_distributor,
 )
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
+import coa_store
 from lab_reference import (
     MARKERS_BY_KEY, range_for, evaluate, families_for_products, relevant_markers,
 )
@@ -897,6 +898,55 @@ def _protocol_projection(p: dict) -> dict:
     return out
 
 
+async def _user_product_slugs(user_id: str) -> set:
+    """Slugs de los productos que este cliente compró en pedidos ya pagados.
+
+    Es lo que decide a qué COA tiene acceso: se entrega el certificado del
+    producto que compró, no el catálogo completo.
+    """
+    orders = await db.orders.find(
+        {'user_id': user_id, 'status': {'$in': list(coa_store.PAID_STATUSES)}},
+        {'_id': 0, 'items': 1},
+    ).to_list(500)
+    product_ids = {it.get('product_id') for o in orders for it in o.get('items', []) if it.get('product_id')}
+    if not product_ids:
+        return set()
+    rows = await db.products.find({'id': {'$in': list(product_ids)}}, {'_id': 0, 'slug': 1}).to_list(500)
+    return {r.get('slug') for r in rows if r.get('slug')}
+
+
+@api_router.get('/coa/public')
+async def coa_public():
+    """El único COA de muestra visible sin haber comprado. {} si no hay."""
+    return coa_store.public_entry() or {}
+
+
+@api_router.get('/me/coas')
+async def my_coas(user=Depends(get_current_user)):
+    """COAs de los lotes de los productos que el usuario compró."""
+    slugs = await _user_product_slugs(user['id'])
+    return coa_store.entries_for_slugs(slugs)
+
+
+@api_router.get('/me/coa/{lot}')
+async def download_coa(lot: str, user=Depends(get_current_user)):
+    """Descarga el PDF de un lote, si el usuario tiene derecho a verlo."""
+    entry = coa_store.entry_for_lot(lot)
+    if not entry:
+        raise HTTPException(status_code=404, detail='COA no encontrado')
+
+    if not entry.get('public'):
+        slugs = await _user_product_slugs(user['id'])
+        if entry.get('product_slug') not in slugs:
+            # 404 y no 403: no confirmamos qué lotes existen a quien no compró.
+            raise HTTPException(status_code=404, detail='COA no encontrado')
+
+    path = coa_store.file_path_for(entry)
+    if not path:
+        raise HTTPException(status_code=404, detail='El archivo del COA no está disponible')
+    return FileResponse(path, media_type='application/pdf', filename=f'COA-{entry["lot"]}.pdf')
+
+
 @api_router.get('/me/protocols')
 async def list_protocols(user=Depends(get_current_user)):
     rows = await db.protocols.find({'user_id': user['id']}, {'_id': 0}).to_list(200)
@@ -1231,7 +1281,7 @@ async def build_order_context(message: str, user) -> str:
 
 @api_router.post('/ai/chat')
 async def ai_chat(payload: ChatInput, user=Depends(get_optional_user)):
-    chat = build_chat(payload.session_id, payload.product_context)
+    chat = build_chat(payload.session_id, payload.product_context, payload.language)
     order_context = await build_order_context(payload.message, user)
     if order_context:
         chat['system_message'] += order_context
