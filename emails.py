@@ -24,6 +24,13 @@ def normalize_language(language):
     return lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
 
 
+def email_enabled() -> bool:
+    """Si el envio esta apagado no podemos exigir confirmacion de correo:
+    dejaria fuera a todo el que se registre. El servidor lo consulta antes
+    de bloquear un login."""
+    return os.environ.get('EMAIL_ENABLED', 'false').lower() == 'true'
+
+
 def _send_email_sync(to_address, subject, html_body):
     region = os.environ.get('SES_REGION', 'us-east-1')
     sender = os.environ.get('EMAIL_FROM', 'Exygen Labs <hola@exygenlabs.com>')

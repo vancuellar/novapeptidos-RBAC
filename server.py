@@ -30,7 +30,7 @@ from lab_reference import (
 )
 from emails import (
     send_welcome_email, send_reset_email, send_verification_email,
-    send_invitation_email, normalize_language,
+    send_invitation_email, normalize_language, email_enabled,
 )
 from datetime import timedelta
 import asyncio
@@ -104,13 +104,24 @@ async def register(payload: RegisterInput):
         },
         'created_at': consented_at,
     }
-    user['email_verified'] = False
+    # Solo exigimos confirmacion si el correo saliente esta encendido. Si no,
+    # la cuenta nace confirmada: nadie puede quedar encerrado fuera por una
+    # configuracion del servidor.
+    require_confirmation = email_enabled()
+    user['email_verified'] = not require_confirmation
     await db.users.insert_one(user)
-    await _send_verification(user)
+    if require_confirmation:
+        await _send_verification(user)
+        return {
+            'pending_verification': True,
+            'email': user['email'],
+            'message': 'Te mandamos un correo para confirmar tu cuenta. Revisa tambien la carpeta de spam.',
+        }
+    asyncio.create_task(send_welcome_email(user['name'], user['email'], user['language']))
     return {
-        'pending_verification': True,
-        'email': user['email'],
-        'message': 'Te mandamos un correo para confirmar tu cuenta. Revisa tambien la carpeta de spam.',
+        'pending_verification': False,
+        'token': create_token(user['id']),
+        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
     }
 
 
@@ -121,7 +132,7 @@ async def login(payload: LoginInput):
         raise HTTPException(status_code=401, detail='Correo o contrasena incorrectos')
     # Las cuentas viejas no tienen el campo: se dan por confirmadas para no dejar
     # a nadie fuera. Solo las nuevas nacen sin confirmar.
-    if user.get('email_verified') is False:
+    if user.get('email_verified') is False and email_enabled():
         raise HTTPException(
             status_code=403,
             detail='Confirma tu correo antes de entrar. Te mandamos el enlace cuando creaste la cuenta.',
@@ -167,11 +178,14 @@ async def _send_verification(user: dict):
     asyncio.create_task(send_verification_email(user['name'], user['email'], link, user.get('language')))
 
 
-async def _send_invitation(user: dict):
+async def _send_invitation(user: dict) -> str:
+    """Manda la invitacion y devuelve el enlace. Si el correo saliente esta
+    apagado se lo entregamos al admin para que lo comparta el mismo."""
     expires = (datetime.now(timezone.utc) + timedelta(days=INVITE_TTL_DAYS)).isoformat()
     token = await _issue_token(user['id'], 'invite', expires)
     link = f'{SITE_URL}/activar?token={token}'
     asyncio.create_task(send_invitation_email(user['name'], user['email'], link, user.get('language')))
+    return link
 
 
 @api_router.post('/auth/verify-email')
@@ -661,8 +675,10 @@ async def invite_customer(payload: DistributorCreate, admin=Depends(get_current_
         'created_at': now_iso(),
     }
     await db.users.insert_one(user)
-    await _send_invitation(user)
-    return {'id': user['id'], 'name': user['name'], 'email': user['email'], 'invitation_sent': True}
+    link = await _send_invitation(user)
+    sent = email_enabled()
+    return {'id': user['id'], 'name': user['name'], 'email': user['email'],
+            'invitation_sent': sent, 'invitation_link': None if sent else link}
 
 
 # ----------------- Admin: Distributors -----------------
@@ -722,11 +738,12 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
         'created_at': now_iso(),
     }
     await db.users.insert_one(dist)
-    await _send_invitation(dist)
+    link = await _send_invitation(dist)
+    sent = email_enabled()
     return {'id': dist['id'], 'name': dist['name'], 'email': dist['email'],
             'distributor_code': code, 'commission_rate': dist['commission_rate'],
             'customer_discount_rate': dist['customer_discount_rate'],
-            'invitation_sent': True}
+            'invitation_sent': sent, 'invitation_link': None if sent else link}
 
 
 # ----------------- Distributor portal -----------------
