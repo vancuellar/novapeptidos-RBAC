@@ -32,7 +32,7 @@ from lab_reference import (
 )
 from emails import (
     send_welcome_email, send_reset_email, send_verification_email,
-    send_invitation_email, normalize_language, email_enabled,
+    send_invitation_email, send_order_email, normalize_language, email_enabled,
 )
 from datetime import timedelta
 import asyncio
@@ -507,6 +507,9 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         await db.products.update_one({'id': item.product_id}, {'$inc': {'stock': -item.quantity}})
         # Inventario vivo por presentacion (key = product_id del carrito, ya incluye ::presentacion)
         await db.stock.update_one({'key': item.product_id}, {'$inc': {'qty': -item.quantity}})
+    # Confirmacion por correo, en segundo plano: la compra no debe quedarse
+    # esperando al proveedor de correo ni fallar si esta caido.
+    asyncio.create_task(send_order_email(order.model_dump(), user.get('language') if user else None))
     return clean(order.model_dump())
 
 

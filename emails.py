@@ -196,3 +196,173 @@ async def send_welcome_email(name, email, language=None):
         logger.info('Welcome email sent to %s (lang=%s)', email, lang)
     except Exception:
         logger.exception('Failed to send welcome email to %s', email)
+
+
+# ---------- Confirmacion de pedido ----------
+ORDER_SUBJECTS = {
+    'es': 'Recibimos tu pedido {number} — Exygen Labs',
+    'en': 'We received your order {number} — Exygen Labs',
+    'pt': 'Recebemos seu pedido {number} — Exygen Labs',
+}
+
+ORDER_COPY = {
+    'es': {
+        'greet': 'Hola, {name}:',
+        'intro': 'Recibimos tu pedido y ya quedo registrado. Aqui esta el detalle para que lo tengas por escrito.',
+        'orderLabel': 'Numero de pedido',
+        'items': 'Lo que pediste',
+        'subtotal': 'Subtotal',
+        'discount': 'Descuento',
+        'shipping': 'Envio',
+        'total': 'Total',
+        'nextTitle': 'Que sigue',
+        'nextCard': 'Verificamos el pago y preparamos tu pedido. En cuanto salga te mandamos el numero de guia por correo.',
+        'nextSpei': 'Tu pedido queda apartado en cuanto se refleje la transferencia. En horario bancario suele tardar minutos; de noche o en fin de semana puede pasar al siguiente dia habil.',
+        'track': 'Ver mi pedido',
+        'shipTo': 'Enviar a',
+        'ruo': 'Uso exclusivo en investigacion (RUO). No es un medicamento ni un suplemento; no esta destinado a consumo humano ni animal.',
+        'help': 'Cualquier duda, responde a este correo o escribenos a hola@exygenlabs.com.',
+    },
+    'en': {
+        'greet': 'Hi {name},',
+        'intro': 'We received your order and it is now registered. Here is the detail for your records.',
+        'orderLabel': 'Order number',
+        'items': 'What you ordered',
+        'subtotal': 'Subtotal',
+        'discount': 'Discount',
+        'shipping': 'Shipping',
+        'total': 'Total',
+        'nextTitle': "What's next",
+        'nextCard': 'We verify the payment and prepare your order. As soon as it ships we will email you the tracking number.',
+        'nextSpei': 'Your order is reserved as soon as the transfer clears. During banking hours that usually takes minutes; at night or on weekends it may roll to the next business day.',
+        'track': 'View my order',
+        'shipTo': 'Ship to',
+        'ruo': 'Research use only (RUO). Not a medicine or a supplement; not intended for human or animal consumption.',
+        'help': 'Any questions, reply to this email or write to hola@exygenlabs.com.',
+    },
+    'pt': {
+        'greet': 'Ola, {name}:',
+        'intro': 'Recebemos seu pedido e ele ja esta registrado. Aqui esta o detalhe para o seu controle.',
+        'orderLabel': 'Numero do pedido',
+        'items': 'O que voce pediu',
+        'subtotal': 'Subtotal',
+        'discount': 'Desconto',
+        'shipping': 'Frete',
+        'total': 'Total',
+        'nextTitle': 'Proximos passos',
+        'nextCard': 'Verificamos o pagamento e preparamos seu pedido. Assim que for enviado, mandamos o codigo de rastreio por e-mail.',
+        'nextSpei': 'Seu pedido fica reservado assim que a transferencia for compensada. Em horario bancario costuma levar minutos; a noite ou no fim de semana pode passar para o proximo dia util.',
+        'track': 'Ver meu pedido',
+        'shipTo': 'Enviar para',
+        'ruo': 'Uso exclusivo em pesquisa (RUO). Nao e medicamento nem suplemento; nao se destina ao consumo humano ou animal.',
+        'help': 'Qualquer duvida, responda a este e-mail ou escreva para hola@exygenlabs.com.',
+    },
+}
+
+
+def _money(value):
+    """Formato de moneda mexicana, igual que en el sitio."""
+    try:
+        return '$' + f'{float(value):,.0f}' + ' MXN'
+    except (TypeError, ValueError):
+        return '$0 MXN'
+
+
+def _order_email_html(order, copy, link):
+    esc = html.escape
+    rows = []
+    for item in order.get('items', []):
+        name = esc(str(item.get('name', '')))
+        qty = int(item.get('quantity', 1) or 1)
+        line = float(item.get('price', 0) or 0) * qty
+        rows.append(
+            f'<tr>'
+            f'<td style="padding:10px 0;font-size:14px;color:#3D4657;border-bottom:1px solid #ECEEF3;">{name}'
+            f'<span style="color:#8A93A8;"> &times;{qty}</span></td>'
+            f'<td style="padding:10px 0;font-size:14px;color:#3D4657;text-align:right;white-space:nowrap;'
+            f'border-bottom:1px solid #ECEEF3;">{_money(line)}</td>'
+            f'</tr>'
+        )
+
+    def total_row(label, value, strong=False):
+        weight = 'bold' if strong else 'normal'
+        size = '16px' if strong else '14px'
+        color = '#132763' if strong else '#8A93A8'
+        return (f'<tr><td style="padding:6px 0;font-size:{size};color:{color};font-weight:{weight};">{label}</td>'
+                f'<td style="padding:6px 0;font-size:{size};color:{color};font-weight:{weight};text-align:right;'
+                f'white-space:nowrap;">{value}</td></tr>')
+
+    totals = [total_row(copy['subtotal'], _money(order.get('subtotal', 0)))]
+    if float(order.get('discount', 0) or 0) > 0:
+        totals.append(total_row(copy['discount'], '-' + _money(order.get('discount', 0))))
+    totals.append(total_row(copy['shipping'], _money(order.get('shipping', 0))))
+    totals.append(total_row(copy['total'], _money(order.get('total', 0)), strong=True))
+
+    customer = order.get('customer', {}) or {}
+    address_bits = [customer.get('address', ''), customer.get('city', ''),
+                    customer.get('state', ''), customer.get('postal_code', '')]
+    address = esc(', '.join(b for b in address_bits if b))
+
+    is_spei = (order.get('payment_method') or '') == 'spei'
+    next_text = copy['nextSpei'] if is_spei else copy['nextCard']
+
+    # Fondo blanco explicito: varios clientes de correo tienen modo oscuro y sin
+    # esto el texto gris queda ilegible sobre su fondo negro.
+    return f"""
+    <div style="background-color:#FFFFFF;padding:8px 0;">
+    <div style="max-width:560px;margin:0 auto;background-color:#FFFFFF;font-family:Helvetica,Arial,sans-serif;padding:32px 24px;">
+      <div style="text-align:center;font-size:20px;letter-spacing:3px;color:#132763;font-weight:bold;">EXYGEN&nbsp;LABS</div>
+      <div style="text-align:center;font-size:11px;letter-spacing:2px;color:#8A93A8;padding-top:4px;">RESEARCH PEPTIDES</div>
+
+      <p style="font-size:15px;color:#3D4657;margin-top:28px;">{copy['greet'].format(name=esc(str(order.get('customer', {}).get('full_name', ''))))}</p>
+      <p style="font-size:15px;color:#3D4657;line-height:1.6;">{copy['intro']}</p>
+
+      <div style="background-color:#F5F6FA;border-radius:12px;padding:16px 20px;margin:24px 0;">
+        <div style="font-size:11px;letter-spacing:1.5px;color:#8A93A8;text-transform:uppercase;">{copy['orderLabel']}</div>
+        <div style="font-size:20px;color:#132763;font-weight:bold;letter-spacing:1px;padding-top:4px;">{esc(str(order.get('order_number', '')))}</div>
+      </div>
+
+      <div style="font-size:11px;letter-spacing:1.5px;color:#8A93A8;text-transform:uppercase;padding-bottom:6px;">{copy['items']}</div>
+      <table style="width:100%;border-collapse:collapse;">{''.join(rows)}</table>
+      <table style="width:100%;border-collapse:collapse;margin-top:12px;">{''.join(totals)}</table>
+
+      <div style="background-color:#F5F6FA;border-radius:12px;padding:16px 20px;margin:24px 0;">
+        <div style="font-size:11px;letter-spacing:1.5px;color:#8A93A8;text-transform:uppercase;">{copy['nextTitle']}</div>
+        <p style="font-size:14px;color:#3D4657;line-height:1.6;margin:8px 0 0;">{next_text}</p>
+      </div>
+
+      <p style="font-size:13px;color:#8A93A8;line-height:1.6;">
+        <strong style="color:#3D4657;">{copy['shipTo']}:</strong> {address}
+      </p>
+
+      <p style="text-align:center;margin:28px 0;">
+        <a href="{link}" style="display:inline-block;background-color:#132763;color:#FFFFFF;font-size:15px;font-weight:bold;text-decoration:none;padding:14px 36px;border-radius:999px;">{copy['track']}</a>
+      </p>
+
+      <p style="font-size:12px;color:#8A93A8;line-height:1.6;border-top:1px solid #ECEEF3;padding-top:16px;">{copy['ruo']}</p>
+      <p style="font-size:13px;color:#8A93A8;line-height:1.6;">{copy['help']}</p>
+    </div>
+    </div>
+    """
+
+
+async def send_order_email(order, language=None):
+    """Confirmacion de pedido. Nunca lanza: una compra no puede fallar porque
+    el proveedor de correo este caido."""
+    if not email_enabled():
+        logger.info('EMAIL_ENABLED != true, skipping order email for %s', order.get('order_number'))
+        return
+    to_address = (order.get('customer', {}) or {}).get('email')
+    if not to_address:
+        logger.warning('Order %s has no customer email', order.get('order_number'))
+        return
+    lang = normalize_language(language)
+    copy = ORDER_COPY[lang]
+    site = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+    link = f"{site}/pedido/{order.get('order_number', '')}"
+    subject = ORDER_SUBJECTS[lang].format(number=order.get('order_number', ''))
+    try:
+        await asyncio.to_thread(_send_email_sync, to_address, subject, _order_email_html(order, copy, link))
+        logger.info('Order email sent to %s (order=%s, lang=%s)', to_address, order.get('order_number'), lang)
+    except Exception:
+        logger.exception('Failed to send order email for %s', order.get('order_number'))
