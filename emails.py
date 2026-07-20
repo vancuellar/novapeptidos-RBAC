@@ -135,22 +135,27 @@ INVITE_BODIES = {
 
 
 def _action_email_html(greet, body, cta, footer, name, email, link):
-    """Plantilla comun de los correos con un boton de accion."""
-    return f"""
+    """Plantilla comun de los correos con un boton de accion. Documento
+    completo para que el bloque de modo oscuro (DARK_EMAIL_STYLE) aplique."""
+    return f"""<!DOCTYPE html>
+<html lang="es-MX">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{DARK_EMAIL_STYLE}</head>
+<body class="em-bg" style="margin:0;padding:0;background-color:#FFFFFF;">
     <div style="max-width:560px;margin:0 auto;font-family:Helvetica,Arial,sans-serif;padding:32px 24px;">
-      <div style="text-align:center;font-size:20px;letter-spacing:3px;color:#132763;font-weight:bold;">EXYGEN&nbsp;LABS</div>
-      <div style="text-align:center;font-size:11px;letter-spacing:2px;color:#8A93A8;padding-top:4px;">RESEARCH PEPTIDES</div>
-      <p style="font-size:15px;color:#3D4657;margin-top:28px;">{greet.format(name=html.escape(name))}</p>
-      <p style="font-size:15px;color:#3D4657;line-height:1.6;">{body.format(email=html.escape(email))}</p>
+      <div class="em-ink" style="text-align:center;font-size:20px;letter-spacing:3px;color:#132763;font-weight:bold;">EXYGEN&nbsp;LABS</div>
+      <div class="em-muted" style="text-align:center;font-size:11px;letter-spacing:2px;color:#8A93A8;padding-top:4px;">RESEARCH PEPTIDES</div>
+      <p class="em-body" style="font-size:15px;color:#3D4657;margin-top:28px;">{greet.format(name=html.escape(name))}</p>
+      <p class="em-body" style="font-size:15px;color:#3D4657;line-height:1.6;">{body.format(email=html.escape(email))}</p>
       <p style="text-align:center;margin:28px 0;">
-        <a href="{link}" style="display:inline-block;background-color:#132763;color:#FFFFFF;font-size:15px;font-weight:bold;text-decoration:none;padding:14px 36px;border-radius:999px;">{cta}</a>
+        <a href="{link}" class="em-btn" style="display:inline-block;background-color:#132763;color:#FFFFFF;font-size:15px;font-weight:bold;text-decoration:none;padding:14px 36px;border-radius:999px;">{cta}</a>
       </p>
-      <p style="font-size:13px;color:#8A93A8;line-height:1.6;word-break:break-all;">
+      <p class="em-muted" style="font-size:13px;color:#8A93A8;line-height:1.6;word-break:break-all;">
         Si el boton no funciona, copia y pega este enlace:<br>{html.escape(link)}
       </p>
-      <p style="font-size:13px;color:#8A93A8;line-height:1.6;">{footer}</p>
+      <p class="em-muted" style="font-size:13px;color:#8A93A8;line-height:1.6;">{footer}</p>
     </div>
-    """
+</body>
+</html>"""
 
 
 async def _send_action_email(name, email, link, language, subjects, bodies, kind):
@@ -277,10 +282,37 @@ def _money(value):
         return '$0 MXN'
 
 
+# Modo oscuro en correo: los estilos van en linea (obligatorio para Outlook),
+# asi que cada color que cambia se duplica como clase con !important dentro de
+# @media (prefers-color-scheme: dark). El claro sigue siendo el diseno base,
+# porque Gmail app y Outlook no respetan el modo oscuro de forma confiable.
+# Paleta oscura = la del sitio: lienzo negro, grises neutros, azul aclarado.
+DARK_EMAIL_STYLE = """
+  <meta name="color-scheme" content="light dark">
+  <meta name="supported-color-schemes" content="light dark">
+  <style>
+    :root { color-scheme: light dark; supported-color-schemes: light dark; }
+    @media (prefers-color-scheme: dark) {
+      body, .em-bg { background-color: #0A0A0A !important; }
+      .em-card { background-color: #141414 !important; border-color: #262626 !important; }
+      .em-box { background-color: #0A0A0A !important; border-color: #262626 !important; }
+      .em-line { border-color: #262626 !important; }
+      .em-ink { color: #F5F5F5 !important; }
+      .em-body { color: #D6D6D6 !important; }
+      .em-muted { color: #A3A3A3 !important; }
+      .em-footer { color: #8C8C8C !important; }
+      .em-btn { background-color: #4E73E8 !important; color: #FFFFFF !important; }
+      .em-link { color: #93AAF0 !important; }
+    }
+  </style>
+"""
+
+
 def _order_email_html(order, copy, link):
     """Mismo lenguaje visual que el correo de bienvenida: tarjeta blanca sobre
     fondo gris, tablas anidadas y estilos en linea, que es lo unico que rinde
-    parejo en Gmail, Outlook y Apple Mail."""
+    parejo en Gmail, Outlook y Apple Mail. Con version oscura via clases em-*
+    (ver DARK_EMAIL_STYLE)."""
     esc = html.escape
     INK, BODY, MUTED, LINE, BG = '#132763', '#3D4657', '#8A93A8', '#E4E8F0', '#FBFCFE'
     FONT = 'Helvetica,Arial,sans-serif'
@@ -291,22 +323,23 @@ def _order_email_html(order, copy, link):
         line_total = float(item.get('price', 0) or 0) * qty
         rows.append(
             f'<tr>'
-            f'<td style="padding:10px 0;border-bottom:1px solid {LINE};font-family:{FONT};'
+            f'<td class="em-body em-line" style="padding:10px 0;border-bottom:1px solid {LINE};font-family:{FONT};'
             f'font-size:14px;line-height:1.5;color:{BODY};">{esc(str(item.get("name", "")))}'
-            f'<span style="color:{MUTED};">&nbsp;&times;{qty}</span></td>'
-            f'<td align="right" style="padding:10px 0;border-bottom:1px solid {LINE};font-family:{FONT};'
+            f'<span class="em-muted" style="color:{MUTED};">&nbsp;&times;{qty}</span></td>'
+            f'<td align="right" class="em-body em-line" style="padding:10px 0;border-bottom:1px solid {LINE};font-family:{FONT};'
             f'font-size:14px;color:{BODY};white-space:nowrap;">{_money(line_total)}</td>'
             f'</tr>'
         )
 
     def total_row(label, value, strong=False):
         color = INK if strong else MUTED
+        cls = 'em-ink' if strong else 'em-muted'
         size = '16px' if strong else '14px'
         weight = 'bold' if strong else 'normal'
         pad = '12px 0 0 0' if strong else '6px 0 0 0'
         return (f'<tr>'
-                f'<td style="padding:{pad};font-family:{FONT};font-size:{size};color:{color};font-weight:{weight};">{label}</td>'
-                f'<td align="right" style="padding:{pad};font-family:{FONT};font-size:{size};color:{color};'
+                f'<td class="{cls}" style="padding:{pad};font-family:{FONT};font-size:{size};color:{color};font-weight:{weight};">{label}</td>'
+                f'<td align="right" class="{cls}" style="padding:{pad};font-family:{FONT};font-size:{size};color:{color};'
                 f'font-weight:{weight};white-space:nowrap;">{value}</td>'
                 f'</tr>')
 
@@ -324,35 +357,35 @@ def _order_email_html(order, copy, link):
 
     return f"""<!DOCTYPE html>
 <html lang="es-MX">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-<body style="margin:0; padding:0; background-color:{BG};">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{DARK_EMAIL_STYLE}</head>
+<body class="em-bg" style="margin:0; padding:0; background-color:{BG};">
   <div style="display:none; max-height:0; overflow:hidden; mso-hide:all;">{copy['preheader'].format(number=number)}</div>
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:{BG};">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-bg" style="background-color:{BG};">
     <tr>
       <td align="center" style="padding:32px 16px;">
-        <table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px; width:100%; background-color:#FFFFFF; border:1px solid {LINE}; border-radius:14px;">
+        <table role="presentation" width="560" cellpadding="0" cellspacing="0" class="em-card" style="max-width:560px; width:100%; background-color:#FFFFFF; border:1px solid {LINE}; border-radius:14px;">
 
           <tr>
             <td align="center" style="padding:36px 40px 8px 40px;">
-              <div style="font-family:{FONT}; font-size:20px; letter-spacing:3px; color:{INK}; font-weight:bold;">EXYGEN&nbsp;LABS</div>
-              <div style="font-family:{FONT}; font-size:11px; letter-spacing:2px; color:{MUTED}; padding-top:4px;">RESEARCH PEPTIDES</div>
+              <div class="em-ink" style="font-family:{FONT}; font-size:20px; letter-spacing:3px; color:{INK}; font-weight:bold;">EXYGEN&nbsp;LABS</div>
+              <div class="em-muted" style="font-family:{FONT}; font-size:11px; letter-spacing:2px; color:{MUTED}; padding-top:4px;">RESEARCH PEPTIDES</div>
             </td>
           </tr>
 
           <tr>
             <td style="padding:28px 40px 0 40px; font-family:{FONT};">
-              <h1 style="margin:0; font-size:26px; line-height:1.25; color:{INK}; font-weight:bold;">{copy['heading']}</h1>
-              <p style="margin:16px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{copy['greet'].format(name=esc(str(customer.get('full_name', ''))))}</p>
-              <p style="margin:12px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{copy['intro']}</p>
+              <h1 class="em-ink" style="margin:0; font-size:26px; line-height:1.25; color:{INK}; font-weight:bold;">{copy['heading']}</h1>
+              <p class="em-body" style="margin:16px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{copy['greet'].format(name=esc(str(customer.get('full_name', ''))))}</p>
+              <p class="em-body" style="margin:12px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{copy['intro']}</p>
             </td>
           </tr>
 
           <tr>
             <td style="padding:22px 40px 0 40px;">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:{BG}; border:1px solid {LINE}; border-radius:10px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-box" style="background-color:{BG}; border:1px solid {LINE}; border-radius:10px;">
                 <tr><td align="center" style="padding:14px 20px; font-family:{FONT};">
-                  <div style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase;">{copy['orderLabel']}</div>
-                  <div style="font-size:20px; color:{INK}; font-weight:bold; letter-spacing:1px; padding-top:5px;">{number}</div>
+                  <div class="em-muted" style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase;">{copy['orderLabel']}</div>
+                  <div class="em-ink" style="font-size:20px; color:{INK}; font-weight:bold; letter-spacing:1px; padding-top:5px;">{number}</div>
                 </td></tr>
               </table>
             </td>
@@ -360,7 +393,7 @@ def _order_email_html(order, copy, link):
 
           <tr>
             <td style="padding:26px 40px 0 40px; font-family:{FONT};">
-              <div style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase; padding-bottom:4px;">{copy['items']}</div>
+              <div class="em-muted" style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase; padding-bottom:4px;">{copy['items']}</div>
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{''.join(rows)}</table>
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{''.join(totals)}</table>
             </td>
@@ -368,38 +401,38 @@ def _order_email_html(order, copy, link):
 
           <tr>
             <td style="padding:24px 40px 0 40px; font-family:{FONT};">
-              <div style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase;">{copy['nextTitle']}</div>
-              <p style="margin:8px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{next_text}</p>
-              <p style="margin:14px 0 0 0; font-size:14px; line-height:1.6; color:{MUTED};">
-                <strong style="color:{BODY};">{copy['shipTo']}:</strong> {address}
+              <div class="em-muted" style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase;">{copy['nextTitle']}</div>
+              <p class="em-body" style="margin:8px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{next_text}</p>
+              <p class="em-muted" style="margin:14px 0 0 0; font-size:14px; line-height:1.6; color:{MUTED};">
+                <strong class="em-body" style="color:{BODY};">{copy['shipTo']}:</strong> {address}
               </p>
             </td>
           </tr>
 
           <tr>
             <td align="center" style="padding:28px 40px 8px 40px;">
-              <a href="{link}" style="display:inline-block; background-color:{INK}; color:#FFFFFF; font-family:{FONT}; font-size:15px; font-weight:bold; text-decoration:none; padding:14px 36px; border-radius:999px;">{copy['track']}</a>
+              <a href="{link}" class="em-btn" style="display:inline-block; background-color:{INK}; color:#FFFFFF; font-family:{FONT}; font-size:15px; font-weight:bold; text-decoration:none; padding:14px 36px; border-radius:999px;">{copy['track']}</a>
             </td>
           </tr>
 
           <tr>
-            <td align="center" style="padding:20px 40px 28px 40px; font-family:{FONT}; font-size:12px; color:{MUTED}; letter-spacing:0.5px;">
+            <td align="center" class="em-muted" style="padding:20px 40px 28px 40px; font-family:{FONT}; font-size:12px; color:{MUTED}; letter-spacing:0.5px;">
               Pureza HPLC &ge;99% &nbsp;&middot;&nbsp; {copy['trustShipping']}
             </td>
           </tr>
 
-          <tr><td style="padding:0 40px;"><div style="border-top:1px solid {LINE};"></div></td></tr>
+          <tr><td style="padding:0 40px;"><div class="em-line" style="border-top:1px solid {LINE};"></div></td></tr>
 
           <tr>
-            <td style="padding:20px 40px 8px 40px; font-family:{FONT}; font-size:13px; line-height:1.6; color:{MUTED};">
-              {copy['help']} <a href="mailto:hola@exygenlabs.com" style="color:{INK};">hola@exygenlabs.com</a>
+            <td class="em-muted" style="padding:20px 40px 8px 40px; font-family:{FONT}; font-size:13px; line-height:1.6; color:{MUTED};">
+              {copy['help']} <a href="mailto:hola@exygenlabs.com" class="em-link" style="color:{INK};">hola@exygenlabs.com</a>
             </td>
           </tr>
 
           <tr>
-            <td style="padding:12px 40px 28px 40px; font-family:{FONT}; font-size:11px; line-height:1.6; color:#A6ADBE;">
+            <td class="em-footer" style="padding:12px 40px 28px 40px; font-family:{FONT}; font-size:11px; line-height:1.6; color:#A6ADBE;">
               {copy['ruo']}<br><br>
-              &copy; 2026 Exygen Labs &middot; <a href="https://exygenlabs.com" style="color:{MUTED};">exygenlabs.com</a>
+              &copy; 2026 Exygen Labs &middot; <a href="https://exygenlabs.com" class="em-footer" style="color:{MUTED};">exygenlabs.com</a>
             </td>
           </tr>
 
