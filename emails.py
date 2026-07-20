@@ -207,6 +207,9 @@ ORDER_SUBJECTS = {
 
 ORDER_COPY = {
     'es': {
+        'heading': 'Recibimos tu pedido',
+        'preheader': 'Tu pedido {number} quedo registrado. Aqui esta el detalle.',
+        'trustShipping': 'Envio nacional',
         'greet': 'Hola, {name}:',
         'intro': 'Recibimos tu pedido y ya quedo registrado. Aqui esta el detalle para que lo tengas por escrito.',
         'orderLabel': 'Numero de pedido',
@@ -221,9 +224,12 @@ ORDER_COPY = {
         'track': 'Ver mi pedido',
         'shipTo': 'Enviar a',
         'ruo': 'Uso exclusivo en investigacion (RUO). No es un medicamento ni un suplemento; no esta destinado a consumo humano ni animal.',
-        'help': 'Cualquier duda, responde a este correo o escribenos a hola@exygenlabs.com.',
+        'help': 'Cualquier duda, responde a este correo o escribenos a',
     },
     'en': {
+        'heading': 'We received your order',
+        'preheader': 'Your order {number} is registered. Here is the detail.',
+        'trustShipping': 'Nationwide shipping',
         'greet': 'Hi {name},',
         'intro': 'We received your order and it is now registered. Here is the detail for your records.',
         'orderLabel': 'Order number',
@@ -238,9 +244,12 @@ ORDER_COPY = {
         'track': 'View my order',
         'shipTo': 'Ship to',
         'ruo': 'Research use only (RUO). Not a medicine or a supplement; not intended for human or animal consumption.',
-        'help': 'Any questions, reply to this email or write to hola@exygenlabs.com.',
+        'help': 'Any questions, reply to this email or write to',
     },
     'pt': {
+        'heading': 'Recebemos seu pedido',
+        'preheader': 'Seu pedido {number} foi registrado. Aqui esta o detalhe.',
+        'trustShipping': 'Envio nacional',
         'greet': 'Ola, {name}:',
         'intro': 'Recebemos seu pedido e ele ja esta registrado. Aqui esta o detalhe para o seu controle.',
         'orderLabel': 'Numero do pedido',
@@ -255,7 +264,7 @@ ORDER_COPY = {
         'track': 'Ver meu pedido',
         'shipTo': 'Enviar para',
         'ruo': 'Uso exclusivo em pesquisa (RUO). Nao e medicamento nem suplemento; nao se destina ao consumo humano ou animal.',
-        'help': 'Qualquer duvida, responda a este e-mail ou escreva para hola@exygenlabs.com.',
+        'help': 'Qualquer duvida, responda a este e-mail ou escreva para',
     },
 }
 
@@ -269,28 +278,37 @@ def _money(value):
 
 
 def _order_email_html(order, copy, link):
+    """Mismo lenguaje visual que el correo de bienvenida: tarjeta blanca sobre
+    fondo gris, tablas anidadas y estilos en linea, que es lo unico que rinde
+    parejo en Gmail, Outlook y Apple Mail."""
     esc = html.escape
+    INK, BODY, MUTED, LINE, BG = '#132763', '#3D4657', '#8A93A8', '#E4E8F0', '#FBFCFE'
+    FONT = 'Helvetica,Arial,sans-serif'
+
     rows = []
     for item in order.get('items', []):
-        name = esc(str(item.get('name', '')))
         qty = int(item.get('quantity', 1) or 1)
-        line = float(item.get('price', 0) or 0) * qty
+        line_total = float(item.get('price', 0) or 0) * qty
         rows.append(
             f'<tr>'
-            f'<td style="padding:10px 0;font-size:14px;color:#3D4657;border-bottom:1px solid #ECEEF3;">{name}'
-            f'<span style="color:#8A93A8;"> &times;{qty}</span></td>'
-            f'<td style="padding:10px 0;font-size:14px;color:#3D4657;text-align:right;white-space:nowrap;'
-            f'border-bottom:1px solid #ECEEF3;">{_money(line)}</td>'
+            f'<td style="padding:10px 0;border-bottom:1px solid {LINE};font-family:{FONT};'
+            f'font-size:14px;line-height:1.5;color:{BODY};">{esc(str(item.get("name", "")))}'
+            f'<span style="color:{MUTED};">&nbsp;&times;{qty}</span></td>'
+            f'<td align="right" style="padding:10px 0;border-bottom:1px solid {LINE};font-family:{FONT};'
+            f'font-size:14px;color:{BODY};white-space:nowrap;">{_money(line_total)}</td>'
             f'</tr>'
         )
 
     def total_row(label, value, strong=False):
-        weight = 'bold' if strong else 'normal'
+        color = INK if strong else MUTED
         size = '16px' if strong else '14px'
-        color = '#132763' if strong else '#8A93A8'
-        return (f'<tr><td style="padding:6px 0;font-size:{size};color:{color};font-weight:{weight};">{label}</td>'
-                f'<td style="padding:6px 0;font-size:{size};color:{color};font-weight:{weight};text-align:right;'
-                f'white-space:nowrap;">{value}</td></tr>')
+        weight = 'bold' if strong else 'normal'
+        pad = '12px 0 0 0' if strong else '6px 0 0 0'
+        return (f'<tr>'
+                f'<td style="padding:{pad};font-family:{FONT};font-size:{size};color:{color};font-weight:{weight};">{label}</td>'
+                f'<td align="right" style="padding:{pad};font-family:{FONT};font-size:{size};color:{color};'
+                f'font-weight:{weight};white-space:nowrap;">{value}</td>'
+                f'</tr>')
 
     totals = [total_row(copy['subtotal'], _money(order.get('subtotal', 0)))]
     if float(order.get('discount', 0) or 0) > 0:
@@ -299,51 +317,98 @@ def _order_email_html(order, copy, link):
     totals.append(total_row(copy['total'], _money(order.get('total', 0)), strong=True))
 
     customer = order.get('customer', {}) or {}
-    address_bits = [customer.get('address', ''), customer.get('city', ''),
-                    customer.get('state', ''), customer.get('postal_code', '')]
-    address = esc(', '.join(b for b in address_bits if b))
+    address = esc(', '.join(b for b in [customer.get('address', ''), customer.get('city', ''),
+                                        customer.get('state', ''), customer.get('postal_code', '')] if b))
+    next_text = copy['nextSpei'] if (order.get('payment_method') or '') == 'spei' else copy['nextCard']
+    number = esc(str(order.get('order_number', '')))
 
-    is_spei = (order.get('payment_method') or '') == 'spei'
-    next_text = copy['nextSpei'] if is_spei else copy['nextCard']
+    return f"""<!DOCTYPE html>
+<html lang="es-MX">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0; padding:0; background-color:{BG};">
+  <div style="display:none; max-height:0; overflow:hidden; mso-hide:all;">{copy['preheader'].format(number=number)}</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:{BG};">
+    <tr>
+      <td align="center" style="padding:32px 16px;">
+        <table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px; width:100%; background-color:#FFFFFF; border:1px solid {LINE}; border-radius:14px;">
 
-    # Fondo blanco explicito: varios clientes de correo tienen modo oscuro y sin
-    # esto el texto gris queda ilegible sobre su fondo negro.
-    return f"""
-    <div style="background-color:#FFFFFF;padding:8px 0;">
-    <div style="max-width:560px;margin:0 auto;background-color:#FFFFFF;font-family:Helvetica,Arial,sans-serif;padding:32px 24px;">
-      <div style="text-align:center;font-size:20px;letter-spacing:3px;color:#132763;font-weight:bold;">EXYGEN&nbsp;LABS</div>
-      <div style="text-align:center;font-size:11px;letter-spacing:2px;color:#8A93A8;padding-top:4px;">RESEARCH PEPTIDES</div>
+          <tr>
+            <td align="center" style="padding:36px 40px 8px 40px;">
+              <div style="font-family:{FONT}; font-size:20px; letter-spacing:3px; color:{INK}; font-weight:bold;">EXYGEN&nbsp;LABS</div>
+              <div style="font-family:{FONT}; font-size:11px; letter-spacing:2px; color:{MUTED}; padding-top:4px;">RESEARCH PEPTIDES</div>
+            </td>
+          </tr>
 
-      <p style="font-size:15px;color:#3D4657;margin-top:28px;">{copy['greet'].format(name=esc(str(order.get('customer', {}).get('full_name', ''))))}</p>
-      <p style="font-size:15px;color:#3D4657;line-height:1.6;">{copy['intro']}</p>
+          <tr>
+            <td style="padding:28px 40px 0 40px; font-family:{FONT};">
+              <h1 style="margin:0; font-size:26px; line-height:1.25; color:{INK}; font-weight:bold;">{copy['heading']}</h1>
+              <p style="margin:16px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{copy['greet'].format(name=esc(str(customer.get('full_name', ''))))}</p>
+              <p style="margin:12px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{copy['intro']}</p>
+            </td>
+          </tr>
 
-      <div style="background-color:#F5F6FA;border-radius:12px;padding:16px 20px;margin:24px 0;">
-        <div style="font-size:11px;letter-spacing:1.5px;color:#8A93A8;text-transform:uppercase;">{copy['orderLabel']}</div>
-        <div style="font-size:20px;color:#132763;font-weight:bold;letter-spacing:1px;padding-top:4px;">{esc(str(order.get('order_number', '')))}</div>
-      </div>
+          <tr>
+            <td style="padding:22px 40px 0 40px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:{BG}; border:1px solid {LINE}; border-radius:10px;">
+                <tr><td align="center" style="padding:14px 20px; font-family:{FONT};">
+                  <div style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase;">{copy['orderLabel']}</div>
+                  <div style="font-size:20px; color:{INK}; font-weight:bold; letter-spacing:1px; padding-top:5px;">{number}</div>
+                </td></tr>
+              </table>
+            </td>
+          </tr>
 
-      <div style="font-size:11px;letter-spacing:1.5px;color:#8A93A8;text-transform:uppercase;padding-bottom:6px;">{copy['items']}</div>
-      <table style="width:100%;border-collapse:collapse;">{''.join(rows)}</table>
-      <table style="width:100%;border-collapse:collapse;margin-top:12px;">{''.join(totals)}</table>
+          <tr>
+            <td style="padding:26px 40px 0 40px; font-family:{FONT};">
+              <div style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase; padding-bottom:4px;">{copy['items']}</div>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{''.join(rows)}</table>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{''.join(totals)}</table>
+            </td>
+          </tr>
 
-      <div style="background-color:#F5F6FA;border-radius:12px;padding:16px 20px;margin:24px 0;">
-        <div style="font-size:11px;letter-spacing:1.5px;color:#8A93A8;text-transform:uppercase;">{copy['nextTitle']}</div>
-        <p style="font-size:14px;color:#3D4657;line-height:1.6;margin:8px 0 0;">{next_text}</p>
-      </div>
+          <tr>
+            <td style="padding:24px 40px 0 40px; font-family:{FONT};">
+              <div style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase;">{copy['nextTitle']}</div>
+              <p style="margin:8px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{next_text}</p>
+              <p style="margin:14px 0 0 0; font-size:14px; line-height:1.6; color:{MUTED};">
+                <strong style="color:{BODY};">{copy['shipTo']}:</strong> {address}
+              </p>
+            </td>
+          </tr>
 
-      <p style="font-size:13px;color:#8A93A8;line-height:1.6;">
-        <strong style="color:#3D4657;">{copy['shipTo']}:</strong> {address}
-      </p>
+          <tr>
+            <td align="center" style="padding:28px 40px 8px 40px;">
+              <a href="{link}" style="display:inline-block; background-color:{INK}; color:#FFFFFF; font-family:{FONT}; font-size:15px; font-weight:bold; text-decoration:none; padding:14px 36px; border-radius:999px;">{copy['track']}</a>
+            </td>
+          </tr>
 
-      <p style="text-align:center;margin:28px 0;">
-        <a href="{link}" style="display:inline-block;background-color:#132763;color:#FFFFFF;font-size:15px;font-weight:bold;text-decoration:none;padding:14px 36px;border-radius:999px;">{copy['track']}</a>
-      </p>
+          <tr>
+            <td align="center" style="padding:20px 40px 28px 40px; font-family:{FONT}; font-size:12px; color:{MUTED}; letter-spacing:0.5px;">
+              Pureza HPLC &ge;99% &nbsp;&middot;&nbsp; {copy['trustShipping']}
+            </td>
+          </tr>
 
-      <p style="font-size:12px;color:#8A93A8;line-height:1.6;border-top:1px solid #ECEEF3;padding-top:16px;">{copy['ruo']}</p>
-      <p style="font-size:13px;color:#8A93A8;line-height:1.6;">{copy['help']}</p>
-    </div>
-    </div>
-    """
+          <tr><td style="padding:0 40px;"><div style="border-top:1px solid {LINE};"></div></td></tr>
+
+          <tr>
+            <td style="padding:20px 40px 8px 40px; font-family:{FONT}; font-size:13px; line-height:1.6; color:{MUTED};">
+              {copy['help']} <a href="mailto:hola@exygenlabs.com" style="color:{INK};">hola@exygenlabs.com</a>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:12px 40px 28px 40px; font-family:{FONT}; font-size:11px; line-height:1.6; color:#A6ADBE;">
+              {copy['ruo']}<br><br>
+              &copy; 2026 Exygen Labs &middot; <a href="https://exygenlabs.com" style="color:{MUTED};">exygenlabs.com</a>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
 
 
 async def send_order_email(order, language=None):
