@@ -282,3 +282,10 @@ class ChatInput(BaseModel):
     # Idioma elegido por el usuario en el sitio (es-MX, en-US, pt-BR, fr-CA).
     # El asistente responde en ese idioma, no siempre en espanol.
     language: Optional[str] = None
+
+
+class GoogleAuthInput(BaseModel):
+    """Credencial de Google Identity Services (el ID token del boton)."""
+    credential: str
+    language: Optional[str] = None
+    distributor_code: Optional[str] = None

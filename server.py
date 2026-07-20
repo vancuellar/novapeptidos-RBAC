@@ -18,7 +18,7 @@ from models import (
     OrderCreate, Order, OrderStatusUpdate, OrderShippingUpdate,
     ProtocolInput, ProtocolUpdate, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput,
-    ChatInput, DistributorCreate, now_iso,
+    ChatInput, DistributorCreate, GoogleAuthInput, now_iso,
 )
 from auth import (
     hash_password, verify_password, create_token,
@@ -26,6 +26,7 @@ from auth import (
 )
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
 import coa_store
+from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
 from lab_reference import (
     MARKERS_BY_KEY, range_for, evaluate, families_for_products, relevant_markers,
 )
@@ -142,6 +143,69 @@ async def login(payload: LoginInput):
     return {
         'token': token,
         'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
+    }
+
+
+@api_router.get('/auth/google/config')
+async def google_config():
+    """El sitio pregunta si Google Sign-In esta encendido y con que client id.
+    Si no hay client id configurado, el boton no se muestra."""
+    return {'enabled': google_enabled(), 'client_id': GOOGLE_CLIENT_ID if google_enabled() else ''}
+
+
+@api_router.post('/auth/google')
+async def google_login(payload: GoogleAuthInput):
+    """Entra o crea la cuenta con una credencial de Google.
+
+    Google ya verifico el correo, asi que la cuenta nace confirmada: no tiene
+    sentido mandar un correo de confirmacion a una direccion que Google acaba
+    de validar. Si el correo ya existe con contrasena, se vincula y entra: es
+    la misma persona.
+    """
+    try:
+        info = await verify_google_token(payload.credential)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+
+    user = await db.users.find_one({'email': info['email']})
+    if user:
+        # Cuenta existente: se vincula con Google y se da por confirmada.
+        await db.users.update_one(
+            {'id': user['id']},
+            {'$set': {'google_sub': info['google_sub'], 'email_verified': True}},
+        )
+    else:
+        referrer = await resolve_distributor(payload.distributor_code)
+        consented_at = now_iso()
+        user = {
+            'id': str(uuid.uuid4()),
+            'name': info['name'],
+            'email': info['email'],
+            # Sin contrasena: solo entra por Google hasta que use "recuperar
+            # contrasena" para ponerse una.
+            'password_hash': '',
+            'role': 'user',
+            'language': normalize_language(payload.language),
+            'referred_by': referrer['id'] if referrer else None,
+            'google_sub': info['google_sub'],
+            'email_verified': True,
+            'consents': {
+                'age_confirmed': True,
+                'privacy_accepted': True,
+                'marketing_email': False,
+                'marketing_sms': False,
+                'promos': False,
+                'accepted_at': consented_at,
+                'source': 'google',
+            },
+            'created_at': consented_at,
+        }
+        await db.users.insert_one(user)
+        asyncio.create_task(send_welcome_email(user['name'], user['email'], user['language']))
+
+    return {
+        'token': create_token(user['id']),
+        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user.get('role', 'user')},
     }
 
 
