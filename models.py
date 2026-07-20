@@ -61,6 +61,22 @@ class ResetPasswordInput(BaseModel):
     password: str = Field(min_length=6)
 
 
+class TokenInput(BaseModel):
+    token: str
+
+
+class ActivateInput(BaseModel):
+    """Activación desde una invitación: el usuario elige su propia contraseña.
+    Nunca mandamos una contraseña por correo."""
+    token: str
+    password: str = Field(min_length=6)
+
+
+class ResendVerificationInput(BaseModel):
+    email: EmailStr
+    language: str = 'es'
+
+
 # ---------- Products ----------
 class PriceTier(BaseModel):
     min_qty: int

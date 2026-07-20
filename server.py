@@ -17,6 +17,7 @@ from models import (
     ProductCreate, ProductUpdate, Product, Category,
     OrderCreate, Order, OrderStatusUpdate, OrderShippingUpdate,
     ProtocolInput, ProtocolUpdate, LabReportInput,
+    TokenInput, ActivateInput, ResendVerificationInput,
     ChatInput, DistributorCreate, now_iso,
 )
 from auth import (
@@ -27,7 +28,10 @@ from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret
 from lab_reference import (
     MARKERS_BY_KEY, range_for, evaluate, families_for_products, relevant_markers,
 )
-from emails import send_welcome_email, send_reset_email, normalize_language
+from emails import (
+    send_welcome_email, send_reset_email, send_verification_email,
+    send_invitation_email, normalize_language,
+)
 from datetime import timedelta
 import asyncio
 from seed_data import CATEGORIES, PRODUCTS
@@ -100,12 +104,13 @@ async def register(payload: RegisterInput):
         },
         'created_at': consented_at,
     }
+    user['email_verified'] = False
     await db.users.insert_one(user)
-    asyncio.create_task(send_welcome_email(user['name'], user['email'], user['language']))
-    token = create_token(user['id'])
+    await _send_verification(user)
     return {
-        'token': token,
-        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
+        'pending_verification': True,
+        'email': user['email'],
+        'message': 'Te mandamos un correo para confirmar tu cuenta. Revisa tambien la carpeta de spam.',
     }
 
 
@@ -114,6 +119,13 @@ async def login(payload: LoginInput):
     user = await db.users.find_one({'email': payload.email.lower()})
     if not user or not verify_password(payload.password, user.get('password_hash', '')):
         raise HTTPException(status_code=401, detail='Correo o contrasena incorrectos')
+    # Las cuentas viejas no tienen el campo: se dan por confirmadas para no dejar
+    # a nadie fuera. Solo las nuevas nacen sin confirmar.
+    if user.get('email_verified') is False:
+        raise HTTPException(
+            status_code=403,
+            detail='Confirma tu correo antes de entrar. Te mandamos el enlace cuando creaste la cuenta.',
+        )
     token = create_token(user['id'])
     return {
         'token': token,
@@ -122,6 +134,95 @@ async def login(payload: LoginInput):
 
 
 SITE_URL = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+
+VERIFY_TTL_HOURS = 24
+INVITE_TTL_DAYS = 7
+
+
+async def _issue_token(user_id: str, purpose: str, expires_at: str) -> str:
+    token = uuid.uuid4().hex
+    await db.account_tokens.insert_one({
+        'token': token, 'user_id': user_id, 'purpose': purpose,
+        'expires_at': expires_at, 'used': False, 'created_at': now_iso(),
+    })
+    return token
+
+
+async def _consume_token(token: str, purpose: str):
+    """Devuelve el usuario de un token válido y lo marca usado. Un token sirve una vez."""
+    rec = await db.account_tokens.find_one({'token': token, 'purpose': purpose, 'used': False}, {'_id': 0})
+    if not rec or rec.get('expires_at', '') < now_iso():
+        raise HTTPException(status_code=400, detail='El enlace no es valido o ya expiro. Solicita uno nuevo.')
+    user = await db.users.find_one({'id': rec['user_id']})
+    if not user:
+        raise HTTPException(status_code=400, detail='El enlace no es valido o ya expiro. Solicita uno nuevo.')
+    await db.account_tokens.update_one({'token': token}, {'$set': {'used': True}})
+    return user
+
+
+async def _send_verification(user: dict):
+    expires = (datetime.now(timezone.utc) + timedelta(hours=VERIFY_TTL_HOURS)).isoformat()
+    token = await _issue_token(user['id'], 'verify', expires)
+    link = f'{SITE_URL}/confirmar?token={token}'
+    asyncio.create_task(send_verification_email(user['name'], user['email'], link, user.get('language')))
+
+
+async def _send_invitation(user: dict):
+    expires = (datetime.now(timezone.utc) + timedelta(days=INVITE_TTL_DAYS)).isoformat()
+    token = await _issue_token(user['id'], 'invite', expires)
+    link = f'{SITE_URL}/activar?token={token}'
+    asyncio.create_task(send_invitation_email(user['name'], user['email'], link, user.get('language')))
+
+
+@api_router.post('/auth/verify-email')
+async def verify_email(payload: TokenInput):
+    """Confirma el correo y deja la sesion iniciada: sin fricción extra."""
+    user = await _consume_token(payload.token, 'verify')
+    if not user.get('email_verified'):
+        await db.users.update_one({'id': user['id']}, {'$set': {'email_verified': True, 'verified_at': now_iso()}})
+        asyncio.create_task(send_welcome_email(user['name'], user['email'], user.get('language')))
+    return {
+        'token': create_token(user['id']),
+        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
+    }
+
+
+@api_router.post('/auth/resend-verification')
+async def resend_verification(payload: ResendVerificationInput):
+    """Siempre responde ok: no revelamos si el correo existe."""
+    user = await db.users.find_one({'email': payload.email.lower()})
+    if user and user.get('email_verified') is False:
+        user['language'] = payload.language or user.get('language')
+        await _send_verification(user)
+    return {'ok': True}
+
+
+@api_router.get('/auth/invitation/{token}')
+async def read_invitation(token: str):
+    """Datos mínimos para pintar la pantalla de activación. No consume el token."""
+    rec = await db.account_tokens.find_one({'token': token, 'purpose': 'invite', 'used': False}, {'_id': 0})
+    if not rec or rec.get('expires_at', '') < now_iso():
+        raise HTTPException(status_code=400, detail='Esta invitacion ya no es valida. Pide una nueva.')
+    user = await db.users.find_one({'id': rec['user_id']}, {'_id': 0, 'password_hash': 0})
+    if not user:
+        raise HTTPException(status_code=400, detail='Esta invitacion ya no es valida. Pide una nueva.')
+    return {'name': user['name'], 'email': user['email'], 'role': user.get('role', 'user')}
+
+
+@api_router.post('/auth/activate')
+async def activate_account(payload: ActivateInput):
+    """El invitado elige su contraseña; eso mismo confirma su correo."""
+    user = await _consume_token(payload.token, 'invite')
+    await db.users.update_one({'id': user['id']}, {'$set': {
+        'password_hash': hash_password(payload.password),
+        'email_verified': True,
+        'verified_at': now_iso(),
+    }})
+    asyncio.create_task(send_welcome_email(user['name'], user['email'], user.get('language')))
+    return {
+        'token': create_token(user['id']),
+        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user.get('role', 'user')},
+    }
 
 
 @api_router.post('/auth/forgot-password')
@@ -542,23 +643,26 @@ async def check_discount_code(code: str):
 # ----------------- Admin: Invite customers -----------------
 @api_router.post('/admin/customers/invite')
 async def invite_customer(payload: DistributorCreate, admin=Depends(get_current_admin)):
-    """Invita a un cliente: crea la cuenta con contrasena temporal y manda bienvenida."""
+    """Invita a un cliente: crea la cuenta y le manda un enlace para que elija su contrasena."""
     existing = await db.users.find_one({'email': payload.email.lower()})
     if existing:
         raise HTTPException(status_code=400, detail='Este correo ya esta registrado')
-    temp_password = uuid.uuid4().hex[:12]
     user = {
         'id': str(uuid.uuid4()),
         'name': payload.name,
         'email': payload.email.lower(),
-        'password_hash': hash_password(temp_password),
+        # Contrasena imposible de adivinar y que nadie conoce: la cuenta solo se
+        # abre por el enlace de invitacion.
+        'password_hash': hash_password(uuid.uuid4().hex + uuid.uuid4().hex),
         'role': 'user',
         'language': 'es',
+        'email_verified': False,
+        'invited_at': now_iso(),
         'created_at': now_iso(),
     }
     await db.users.insert_one(user)
-    asyncio.create_task(send_welcome_email(user['name'], user['email'], 'es'))
-    return {'id': user['id'], 'name': user['name'], 'email': user['email'], 'temp_password': temp_password}
+    await _send_invitation(user)
+    return {'id': user['id'], 'name': user['name'], 'email': user['email'], 'invitation_sent': True}
 
 
 # ----------------- Admin: Distributors -----------------
@@ -601,25 +705,28 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
     code = gen_distributor_code(payload.name)
     while await db.users.find_one({'distributor_code': code}):
         code = gen_distributor_code(payload.name)
-    temp_password = uuid.uuid4().hex[:12]
     dist = {
         'id': str(uuid.uuid4()),
         'name': payload.name,
         'email': payload.email.lower(),
-        'password_hash': hash_password(temp_password),
+        # Igual que con los clientes: nadie conoce esta contrasena. El distribuidor
+        # elige la suya con el enlace de invitacion, y eso confirma su correo.
+        'password_hash': hash_password(uuid.uuid4().hex + uuid.uuid4().hex),
         'role': 'distributor',
         'distributor_code': code,
         'commission_rate': max(0.0, min(1.0, payload.commission_rate)),
         'customer_discount_rate': max(0.05, min(0.50, payload.customer_discount_rate)),
         'language': 'es',
+        'email_verified': False,
+        'invited_at': now_iso(),
         'created_at': now_iso(),
     }
     await db.users.insert_one(dist)
-    # temp_password se entrega al admin para compartir; el distribuidor la cambia al entrar.
+    await _send_invitation(dist)
     return {'id': dist['id'], 'name': dist['name'], 'email': dist['email'],
             'distributor_code': code, 'commission_rate': dist['commission_rate'],
             'customer_discount_rate': dist['customer_discount_rate'],
-            'temp_password': temp_password}
+            'invitation_sent': True}
 
 
 # ----------------- Distributor portal -----------------
