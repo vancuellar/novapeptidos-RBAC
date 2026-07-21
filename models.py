@@ -20,7 +20,6 @@ class RegisterInput(BaseModel):
     age_confirmed: bool = False      # 18+ y acepta Términos y Condiciones
     privacy_accepted: bool = False   # acepta la Política de privacidad
     marketing_email: bool = False
-    marketing_sms: bool = False
     promos: bool = False             # bonos y campañas
 
 
@@ -291,7 +290,15 @@ class ChatInput(BaseModel):
 
 
 class GoogleAuthInput(BaseModel):
-    """Credencial de Google Identity Services (el ID token del boton)."""
+    """Credencial de Google Identity Services (el ID token del boton).
+
+    Los consentimientos solo aplican cuando la cuenta es NUEVA: Google avala
+    el correo, pero aceptar 18+/Terminos y Privacidad es decision del usuario
+    y nadie la puede marcar por el."""
     credential: str
     language: Optional[str] = None
     distributor_code: Optional[str] = None
+    age_confirmed: bool = False
+    privacy_accepted: bool = False
+    marketing_email: bool = False
+    promos: bool = False

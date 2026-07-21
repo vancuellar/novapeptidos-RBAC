@@ -101,7 +101,6 @@ async def register(payload: RegisterInput):
             'age_confirmed': True,
             'privacy_accepted': True,
             'marketing_email': bool(payload.marketing_email),
-            'marketing_sms': bool(payload.marketing_sms),
             'promos': bool(payload.promos),
             'accepted_at': consented_at,
         },
@@ -171,11 +170,17 @@ async def google_login(payload: GoogleAuthInput):
     user = await db.users.find_one({'email': info['email']})
     if user:
         # Cuenta existente: se vincula con Google y se da por confirmada.
+        # No se piden consentimientos: ya los dio al registrarse.
         await db.users.update_one(
             {'id': user['id']},
             {'$set': {'google_sub': info['google_sub'], 'email_verified': True}},
         )
     else:
+        # Cuenta NUEVA: Google avala el correo, pero 18+/Terminos y Privacidad
+        # los tiene que aceptar la persona. Sin eso, el sitio pide las casillas
+        # y reintenta con la misma credencial.
+        if not (payload.age_confirmed and payload.privacy_accepted):
+            return {'needs_consent': True, 'name': info['name'], 'email': info['email']}
         referrer = await resolve_distributor(payload.distributor_code)
         consented_at = now_iso()
         user = {
@@ -193,9 +198,8 @@ async def google_login(payload: GoogleAuthInput):
             'consents': {
                 'age_confirmed': True,
                 'privacy_accepted': True,
-                'marketing_email': False,
-                'marketing_sms': False,
-                'promos': False,
+                'marketing_email': bool(payload.marketing_email),
+                'promos': bool(payload.promos),
                 'accepted_at': consented_at,
                 'source': 'google',
             },
