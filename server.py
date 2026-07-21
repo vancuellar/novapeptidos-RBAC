@@ -914,7 +914,6 @@ async def my_orders(user=Depends(get_current_user)):
     return orders
 
 
-@api_router.get('/orders/{order_number}')
 def spei_details():
     """Datos de la cuenta SPEI donde el cliente deposita. Config por env; NUNCA
     en el repo. Se muestran solo en un pedido SPEI ya hecho, no en páginas públicas."""
@@ -928,6 +927,7 @@ def spei_details():
     }
 
 
+@api_router.get('/orders/{order_number}')
 async def get_order(order_number: str):
     order = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
     if not order:

@@ -548,3 +548,13 @@ def test_order_email_shows_spei_clabe():
     # Un pedido con tarjeta NO lleva CLABE
     card = dict(order, payment_method='tarjeta'); card.pop('spei')
     assert '012790001244916613' not in _order_email_html(card, ORDER_COPY['es'], 'https://x/y')
+
+
+# ---------- Ruteo: que los decoradores no se peguen a la funcion equivocada ----------
+def test_orders_route_maps_to_get_order():
+    """Regresion: un helper metido entre el decorador y la funcion robaba la ruta,
+    haciendo que GET /orders/{n} devolviera la CLABE en vez del pedido."""
+    import server
+    hits = [r.endpoint.__name__ for r in server.app.routes
+            if getattr(r, 'path', '') == '/api/orders/{order_number}' and 'GET' in getattr(r, 'methods', set())]
+    assert hits and all(name == 'get_order' for name in hits), hits
