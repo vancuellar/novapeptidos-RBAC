@@ -500,3 +500,33 @@ def test_btcpay_webhook_failclosed_without_secret(monkeypatch):
     monkeypatch.delenv('BTCPAY_WEBHOOK_SECRET', raising=False)
     # Sin secreto configurado, NINGÚN webhook se acepta.
     assert not btcpay.verify_webhook(b'{}', 'sha256=whatever')
+
+
+# ---------- Cripto (NOWPayments) ----------
+import nowpayments
+
+
+def test_nowpayments_disabled_without_env(monkeypatch):
+    monkeypatch.delenv('NOWPAYMENTS_API_KEY', raising=False)
+    assert not nowpayments.enabled()
+
+
+def test_nowpayments_enabled_with_env(monkeypatch):
+    monkeypatch.setenv('NOWPAYMENTS_API_KEY', 'key_abc')
+    assert nowpayments.enabled()
+
+
+def test_nowpayments_ipn_signature(monkeypatch):
+    import hashlib, hmac, json
+    monkeypatch.setenv('NOWPAYMENTS_IPN_SECRET', 'ipnsecret')
+    body = b'{"payment_status":"finished","order_id":"EX-9","price_amount":100}'
+    ordered = json.dumps(json.loads(body), sort_keys=True, separators=(',', ':'))
+    good = hmac.new(b'ipnsecret', ordered.encode(), hashlib.sha512).hexdigest()
+    assert nowpayments.verify_ipn(body, good)
+    assert not nowpayments.verify_ipn(body, 'deadbeef')   # firma falsa
+    assert not nowpayments.verify_ipn(body, '')           # sin firma
+
+
+def test_nowpayments_ipn_failclosed_without_secret(monkeypatch):
+    monkeypatch.delenv('NOWPAYMENTS_IPN_SECRET', raising=False)
+    assert not nowpayments.verify_ipn(b'{}', 'whatever')

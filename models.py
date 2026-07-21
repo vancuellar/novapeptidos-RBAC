@@ -194,8 +194,9 @@ class Order(BaseModel):
     points_earned: int = 0
     points_awarded: bool = False
     points_refunded: bool = False
-    # Cripto (BTCPay): factura y momento de pago confirmado por webhook
-    btcpay_invoice_id: str = ''
+    # Cripto: factura del proveedor (NOWPayments/BTCPay) y momento de pago
+    crypto_provider: str = ''
+    crypto_invoice_id: str = ''
     paid_at: Optional[str] = None
     # Envío / rastreo
     carrier: str = ''                   # FedEx, Estafeta, DHL...
