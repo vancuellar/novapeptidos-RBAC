@@ -30,7 +30,13 @@ from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
 import loyalty
 import auth_factors
 import btcpay
+import nowpayments
 from fastapi import Request
+
+
+def crypto_enabled() -> bool:
+    """Hay vía cripto si CUALQUIER proveedor está encendido."""
+    return nowpayments.enabled() or btcpay.enabled()
 from urllib.parse import urlparse
 from webauthn import (
     generate_registration_options, verify_registration_response,
@@ -253,6 +259,8 @@ async def google_login(payload: GoogleAuthInput):
 
 
 SITE_URL = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+# URL pública del API, para los webhooks que le mandan los proveedores de pago.
+API_BASE_URL = os.environ.get('API_BASE_URL', 'https://api.exygenlabs.com')
 
 VERIFY_TTL_HOURS = 24
 INVITE_TTL_DAYS = 7
@@ -748,7 +756,7 @@ async def my_points(user=Depends(get_current_user)):
 async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     if not payload.items:
         raise HTTPException(status_code=400, detail='El carrito esta vacio')
-    allowed_methods = ['tarjeta', 'spei'] + (['cripto'] if btcpay.enabled() else [])
+    allowed_methods = ['tarjeta', 'spei'] + (['cripto'] if crypto_enabled() else [])
     if payload.payment_method not in allowed_methods:
         raise HTTPException(status_code=400, detail='Metodo de pago no disponible')
     subtotal = sum(item.price * item.quantity for item in payload.items)
@@ -804,26 +812,58 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # esperando al proveedor de correo ni fallar si esta caido.
     asyncio.create_task(send_order_email(order.model_dump(), user.get('language') if user else None))
     result = clean(order.model_dump())
-    # Cripto: creamos la factura de BTCPay y devolvemos su enlace de pago. El
-    # pedido queda 'pendiente' hasta que el webhook confirme que llegó el dinero.
-    if payload.payment_method == 'cripto' and btcpay.enabled():
+    # Cripto: creamos la factura del proveedor encendido y devolvemos su enlace.
+    # El pedido queda 'pendiente' hasta que su webhook confirme que llegó el
+    # dinero. NOWPayments primero (más simple); BTCPay como respaldo.
+    if payload.payment_method == 'cripto':
+        order_url = f"{SITE_URL}/pedido/{order.order_number}"
         try:
-            inv = btcpay.create_invoice(
-                order.order_number, total,
-                redirect_url=f"{SITE_URL}/pedido/{order.order_number}",
-                buyer_email=payload.customer.email or '',
-            )
-            await db.orders.update_one({'id': order.id}, {'$set': {'btcpay_invoice_id': inv['invoice_id']}})
-            result['crypto_checkout_url'] = inv['checkout_url']
+            if nowpayments.enabled():
+                inv = nowpayments.create_invoice(
+                    order.order_number, total,
+                    success_url=order_url, cancel_url=f"{SITE_URL}/carrito",
+                    ipn_url=f"{API_BASE_URL}/api/payments/nowpayments/webhook",
+                )
+                await db.orders.update_one({'id': order.id}, {'$set': {'crypto_invoice_id': inv['invoice_id'], 'crypto_provider': 'nowpayments'}})
+                result['crypto_checkout_url'] = inv['checkout_url']
+            elif btcpay.enabled():
+                inv = btcpay.create_invoice(
+                    order.order_number, total,
+                    redirect_url=order_url, buyer_email=payload.customer.email or '',
+                )
+                await db.orders.update_one({'id': order.id}, {'$set': {'crypto_invoice_id': inv['invoice_id'], 'crypto_provider': 'btcpay'}})
+                result['crypto_checkout_url'] = inv['checkout_url']
         except Exception:
-            logger.exception('BTCPay invoice failed for %s', order.order_number)
+            logger.exception('Crypto invoice failed for %s', order.order_number)
     return result
+
+
+async def _confirm_crypto_order(order_number: str):
+    """Marca pagado un pedido de cripto y deposita puntos. Idempotente."""
+    order = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
+    if order and order.get('status') == 'pendiente':
+        await db.orders.update_one({'id': order['id']}, {'$set': {'status': 'confirmado', 'paid_at': now_iso()}})
+        fresh = await db.orders.find_one({'id': order['id']}, {'_id': 0})
+        await award_order_points(fresh)
 
 
 @api_router.get('/payments/config')
 async def payments_config():
     """El checkout pregunta qué métodos están encendidos hoy."""
-    return {'crypto_enabled': btcpay.enabled()}
+    return {'crypto_enabled': crypto_enabled()}
+
+
+@api_router.post('/payments/nowpayments/webhook')
+async def nowpayments_webhook(request: Request):
+    """NOWPayments avisa aquí (IPN). Verificamos la firma HMAC-SHA512 y, si el
+    pago quedó 'finished', confirmamos el pedido. Nunca confía sin firma válida."""
+    raw = await request.body()
+    if not nowpayments.verify_ipn(raw, request.headers.get('x-nowpayments-sig', '')):
+        raise HTTPException(status_code=401, detail='firma invalida')
+    event = json.loads(raw.decode() or '{}')
+    if event.get('payment_status') in nowpayments.SETTLED_STATUSES:
+        await _confirm_crypto_order(event.get('order_id') or '')
+    return {'ok': True}
 
 
 @api_router.post('/payments/btcpay/webhook')
@@ -837,12 +877,7 @@ async def btcpay_webhook(request: Request):
     event = json.loads(raw.decode() or '{}')
     if event.get('type') not in btcpay.SETTLED_EVENTS:
         return {'ok': True}
-    order_number = (event.get('metadata') or {}).get('orderId') or ''
-    order = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
-    if order and order.get('status') == 'pendiente':
-        await db.orders.update_one({'id': order['id']}, {'$set': {'status': 'confirmado', 'paid_at': now_iso()}})
-        fresh = await db.orders.find_one({'id': order['id']}, {'_id': 0})
-        await award_order_points(fresh)
+    await _confirm_crypto_order((event.get('metadata') or {}).get('orderId') or '')
     return {'ok': True}
 
 
