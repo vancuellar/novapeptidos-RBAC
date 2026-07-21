@@ -45,7 +45,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Token invalido')
 
-    user = await db.users.find_one({'id': user_id}, {'_id': 0, 'password_hash': 0})
+    user = await db.users.find_one({'id': user_id}, {'_id': 0, 'password_hash': 0, 'totp_secret': 0, 'totp_secret_pending': 0})
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Usuario no encontrado')
     return user
@@ -56,7 +56,7 @@ async def get_optional_user(credentials: HTTPAuthorizationCredentials = Depends(
         return None
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user = await db.users.find_one({'id': payload.get('sub')}, {'_id': 0, 'password_hash': 0})
+        user = await db.users.find_one({'id': payload.get('sub')}, {'_id': 0, 'password_hash': 0, 'totp_secret': 0, 'totp_secret_pending': 0})
         return user
     except Exception:
         return None

@@ -28,6 +28,17 @@ from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret
 import coa_store
 from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
 import loyalty
+import auth_factors
+from urllib.parse import urlparse
+from webauthn import (
+    generate_registration_options, verify_registration_response,
+    generate_authentication_options, verify_authentication_response, options_to_json,
+)
+from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
+from webauthn.helpers.structs import (
+    AuthenticatorSelectionCriteria, ResidentKeyRequirement,
+    UserVerificationRequirement, PublicKeyCredentialDescriptor,
+)
 from lab_reference import (
     MARKERS_BY_KEY, range_for, evaluate, families_for_products, relevant_markers,
 )
@@ -139,9 +150,34 @@ async def login(payload: LoginInput):
             status_code=403,
             detail='Confirma tu correo antes de entrar. Te mandamos el enlace cuando creaste la cuenta.',
         )
+    # Segundo factor: si la cuenta lo tiene encendido (solo admins), la
+    # contrasena sola no basta. Se entrega un pase corto y se pide el codigo.
+    if user.get('totp_enabled'):
+        pre = await _issue_token(user['id'], 'totp',
+                                 (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
+        return {'needs_totp': True, 'pre_token': pre}
     token = create_token(user['id'])
     return {
         'token': token,
+        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
+    }
+
+
+@api_router.post('/auth/totp')
+async def totp_login(payload: dict):
+    """Segundo paso del login con 2FA: pase corto + codigo de la app.
+
+    El pase NO se consume si el codigo es incorrecto: equivocarse tecleando
+    no debe obligar a re-escribir la contrasena (el pase vive 5 minutos)."""
+    rec = await db.account_tokens.find_one({'token': payload.get('pre_token', ''), 'purpose': 'totp', 'used': False})
+    if not rec or rec.get('expires_at', '') < now_iso():
+        raise HTTPException(status_code=401, detail='La sesion expiro. Vuelve a entrar con tu contrasena.')
+    user = await db.users.find_one({'id': rec['user_id']})
+    if not user or not auth_factors.verify_totp(user.get('totp_secret', ''), payload.get('code', '')):
+        raise HTTPException(status_code=401, detail='Codigo incorrecto. Revisa tu app autenticadora.')
+    await db.account_tokens.update_one({'token': rec['token']}, {'$set': {'used': True}})
+    return {
+        'token': create_token(user['id']),
         'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
     }
 
@@ -239,6 +275,179 @@ async def _consume_token(token: str, purpose: str):
         raise HTTPException(status_code=400, detail='El enlace no es valido o ya expiro. Solicita uno nuevo.')
     await db.account_tokens.update_one({'token': token}, {'$set': {'used': True}})
     return user
+
+
+# ----------------- Llaves de acceso (passkeys) y 2FA -----------------
+# El RP ID es el dominio del sitio: las llaves creadas en exygenlabs.com solo
+# sirven en exygenlabs.com. Configurable por env para pruebas locales.
+PASSKEY_RP_ID = os.environ.get('PASSKEY_RP_ID') or (urlparse(SITE_URL).hostname or 'localhost')
+PASSKEY_ORIGIN = os.environ.get('PASSKEY_ORIGIN', SITE_URL)
+CHALLENGE_TTL_MINUTES = 5
+
+
+async def _store_challenge(challenge: bytes, purpose: str, user_id=None) -> str:
+    cid = uuid.uuid4().hex
+    await db.webauthn_challenges.insert_one({
+        'id': cid, 'challenge': bytes_to_base64url(challenge), 'purpose': purpose,
+        'user_id': user_id,
+        'expires_at': (datetime.now(timezone.utc) + timedelta(minutes=CHALLENGE_TTL_MINUTES)).isoformat(),
+    })
+    return cid
+
+
+async def _take_challenge(cid: str, purpose: str):
+    """Un reto se usa UNA vez: se borra al leerlo (evita repeticion)."""
+    rec = await db.webauthn_challenges.find_one_and_delete({'id': cid or '', 'purpose': purpose})
+    if not rec or rec.get('expires_at', '') < now_iso():
+        raise HTTPException(status_code=400, detail='La solicitud expiro. Intenta de nuevo.')
+    return rec
+
+
+def _passkey_public(row: dict) -> dict:
+    return {'id': row['id'], 'name': row.get('name', ''), 'created_at': row.get('created_at', '')}
+
+
+@api_router.post('/me/passkeys/options')
+async def passkey_register_options(user=Depends(get_current_user)):
+    existing = await db.passkeys.find({'user_id': user['id']}, {'_id': 0}).to_list(50)
+    options = generate_registration_options(
+        rp_id=PASSKEY_RP_ID,
+        rp_name='Exygen Labs',
+        user_id=user['id'].encode(),
+        user_name=user['email'],
+        user_display_name=user.get('name') or user['email'],
+        exclude_credentials=[
+            PublicKeyCredentialDescriptor(id=base64url_to_bytes(c['credential_id'])) for c in existing
+        ],
+        # resident_key REQUIRED = la llave se puede usar sin escribir el correo.
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            resident_key=ResidentKeyRequirement.REQUIRED,
+            user_verification=UserVerificationRequirement.PREFERRED,
+        ),
+    )
+    cid = await _store_challenge(options.challenge, 'register', user['id'])
+    return {'challenge_id': cid, 'options': json.loads(options_to_json(options))}
+
+
+@api_router.post('/me/passkeys/verify')
+async def passkey_register_verify(payload: dict, user=Depends(get_current_user)):
+    rec = await _take_challenge(payload.get('challenge_id'), 'register')
+    if rec.get('user_id') != user['id']:
+        raise HTTPException(status_code=400, detail='La solicitud expiro. Intenta de nuevo.')
+    try:
+        verified = verify_registration_response(
+            credential=payload.get('credential'),
+            expected_challenge=base64url_to_bytes(rec['challenge']),
+            expected_rp_id=PASSKEY_RP_ID,
+            expected_origin=PASSKEY_ORIGIN,
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail='No se pudo registrar la llave de acceso.')
+    await db.passkeys.insert_one({
+        'id': str(uuid.uuid4()), 'user_id': user['id'],
+        'credential_id': bytes_to_base64url(verified.credential_id),
+        'public_key': bytes_to_base64url(verified.credential_public_key),
+        'sign_count': verified.sign_count,
+        'name': str(payload.get('name') or 'Llave de acceso')[:60],
+        'created_at': now_iso(),
+    })
+    rows = await db.passkeys.find({'user_id': user['id']}, {'_id': 0}).to_list(50)
+    return [_passkey_public(r) for r in rows]
+
+
+@api_router.get('/me/passkeys')
+async def passkey_list(user=Depends(get_current_user)):
+    rows = await db.passkeys.find({'user_id': user['id']}, {'_id': 0}).to_list(50)
+    return [_passkey_public(r) for r in rows]
+
+
+@api_router.delete('/me/passkeys/{passkey_id}')
+async def passkey_delete(passkey_id: str, user=Depends(get_current_user)):
+    result = await db.passkeys.delete_one({'id': passkey_id, 'user_id': user['id']})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail='Llave no encontrada')
+    rows = await db.passkeys.find({'user_id': user['id']}, {'_id': 0}).to_list(50)
+    return [_passkey_public(r) for r in rows]
+
+
+@api_router.post('/auth/passkey/options')
+async def passkey_login_options():
+    """Publico y sin usuario: la llave descubrible dice quien es."""
+    options = generate_authentication_options(
+        rp_id=PASSKEY_RP_ID,
+        user_verification=UserVerificationRequirement.PREFERRED,
+    )
+    cid = await _store_challenge(options.challenge, 'login')
+    return {'challenge_id': cid, 'options': json.loads(options_to_json(options))}
+
+
+@api_router.post('/auth/passkey/verify')
+async def passkey_login_verify(payload: dict):
+    rec = await _take_challenge(payload.get('challenge_id'), 'login')
+    credential = payload.get('credential') or {}
+    row = await db.passkeys.find_one({'credential_id': credential.get('id', '')}, {'_id': 0})
+    if not row:
+        raise HTTPException(status_code=401, detail='Llave de acceso no reconocida.')
+    try:
+        verified = verify_authentication_response(
+            credential=credential,
+            expected_challenge=base64url_to_bytes(rec['challenge']),
+            expected_rp_id=PASSKEY_RP_ID,
+            expected_origin=PASSKEY_ORIGIN,
+            credential_public_key=base64url_to_bytes(row['public_key']),
+            credential_current_sign_count=int(row.get('sign_count', 0) or 0),
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail='No se pudo verificar la llave de acceso.')
+    await db.passkeys.update_one({'id': row['id']}, {'$set': {'sign_count': verified.new_sign_count}})
+    user = await db.users.find_one({'id': row['user_id']}, {'_id': 0, 'password_hash': 0})
+    if not user:
+        raise HTTPException(status_code=401, detail='La cuenta ya no existe.')
+    # La llave de acceso ya es un factor fuerte y resistente a phishing:
+    # no se pide TOTP encima.
+    return {
+        'token': create_token(user['id']),
+        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user.get('role', 'user')},
+    }
+
+
+@api_router.post('/me/totp/setup')
+async def totp_setup(user=Depends(get_current_user)):
+    """Genera el secreto y el QR. Solo admins: para clientes la via segura y
+    sencilla es Google o una llave de acceso (decision de Christian)."""
+    if user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail='El codigo 2FA es solo para administradores.')
+    secret = auth_factors.new_totp_secret()
+    await db.users.update_one({'id': user['id']}, {'$set': {'totp_secret_pending': secret}})
+    uri = auth_factors.totp_uri(secret, user['email'])
+    return {'otpauth': uri, 'qr': auth_factors.qr_data_uri(uri), 'secret': secret}
+
+
+@api_router.post('/me/totp/enable')
+async def totp_enable(payload: dict, user=Depends(get_current_user)):
+    """Enciende el 2FA solo despues de comprobar un codigo real: si el QR no
+    se escaneo bien, encenderlo dejaria al admin fuera de su propia cuenta."""
+    fresh = await db.users.find_one({'id': user['id']}, {'_id': 0, 'totp_secret_pending': 1})
+    secret = (fresh or {}).get('totp_secret_pending', '')
+    if not auth_factors.verify_totp(secret, payload.get('code', '')):
+        raise HTTPException(status_code=400, detail='Codigo incorrecto. Escanea el QR y prueba de nuevo.')
+    await db.users.update_one(
+        {'id': user['id']},
+        {'$set': {'totp_secret': secret, 'totp_enabled': True}, '$unset': {'totp_secret_pending': ''}},
+    )
+    return {'totp_enabled': True}
+
+
+@api_router.post('/me/totp/disable')
+async def totp_disable(payload: dict, user=Depends(get_current_user)):
+    fresh = await db.users.find_one({'id': user['id']}, {'_id': 0, 'totp_secret': 1})
+    if not auth_factors.verify_totp((fresh or {}).get('totp_secret', ''), payload.get('code', '')):
+        raise HTTPException(status_code=400, detail='Codigo incorrecto.')
+    await db.users.update_one(
+        {'id': user['id']},
+        {'$set': {'totp_enabled': False}, '$unset': {'totp_secret': ''}},
+    )
+    return {'totp_enabled': False}
 
 
 async def _send_verification(user: dict):

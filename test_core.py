@@ -410,3 +410,29 @@ def test_order_email_ticket_elements():
     assert 'AHORRASTE' not in html_plain
     assert 'GANAS' not in html_plain
     assert 'Puntos canjeados' not in html_plain
+
+
+# ---------- Segundo factor (TOTP) ----------
+import pyotp
+import auth_factors
+
+
+def test_totp_roundtrip():
+    secret = auth_factors.new_totp_secret()
+    code = pyotp.TOTP(secret).now()
+    assert auth_factors.verify_totp(secret, code)
+    assert auth_factors.verify_totp(secret, f'  {code[:3]} {code[3:]} ')   # con espacios
+    assert not auth_factors.verify_totp(secret, '000000') or code == '000000'
+    assert not auth_factors.verify_totp(secret, '')
+    assert not auth_factors.verify_totp('', code)
+    assert not auth_factors.verify_totp(secret, 'abcdef')
+
+
+def test_totp_uri_and_qr():
+    secret = auth_factors.new_totp_secret()
+    uri = auth_factors.totp_uri(secret, 'admin@exygenlabs.com')
+    assert uri.startswith('otpauth://totp/')
+    assert 'Exygen%20Labs' in uri
+    qr = auth_factors.qr_data_uri(uri)
+    assert qr.startswith('data:image/png;base64,')
+    assert len(qr) > 500
