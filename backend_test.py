@@ -69,7 +69,8 @@ class NovaPeptidesAPITester:
             "POST",
             "/auth/login",
             200,
-            data={"email": "admin@exygenlabs.com", "password": "Admin123!"}
+            data={"email": os.environ.get("ADMIN_EMAIL", "admin@exygenlabs.com"),
+                  "password": os.environ.get("ADMIN_PASSWORD", "Admin123!")}
         )
         if success and 'token' in response:
             self.admin_token = response['token']
@@ -103,7 +104,8 @@ class NovaPeptidesAPITester:
             "POST",
             "/auth/register",
             200,
-            data={"name": "Test User", "email": test_email, "password": "Test123!"}
+            data={"name": "Test User", "email": test_email, "password": "Test123!",
+                  "age_confirmed": True, "privacy_accepted": True}
         )
 
     def test_categories(self):
@@ -217,7 +219,7 @@ class NovaPeptidesAPITester:
                 "postal_code": "01000",
                 "notes": "Test order"
             },
-            "payment_method": "mercado_pago",
+            "payment_method": "spei",
             "shipping": 199
         }
         
