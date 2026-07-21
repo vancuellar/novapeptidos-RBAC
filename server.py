@@ -2,6 +2,7 @@ from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, UploadFil
 from fastapi.responses import StreamingResponse, FileResponse
 from starlette.middleware.cors import CORSMiddleware
 import os
+import base64
 import logging
 import uuid
 import random
@@ -936,6 +937,58 @@ async def get_order(order_number: str):
     if (order.get('payment_method') or '') == 'spei':
         order['spei'] = spei_details()
     return order
+
+
+# Comprobante de transferencia SPEI que sube el cliente (para que el admin lo
+# muestre a quien administra la cuenta). Se guarda en Mongo (persiste), no en disco.
+RECEIPT_MIME = {'application/pdf', 'image/jpeg', 'image/png', 'image/webp'}
+RECEIPT_MAX_BYTES = 8 * 1024 * 1024
+
+
+@api_router.post('/orders/{order_number}/spei-receipt')
+async def upload_spei_receipt(order_number: str, file: UploadFile = File(...)):
+    """El cliente sube su comprobante. Permitido por número de pedido (el que
+    compró como invitado no tiene sesión). Se valida tipo y tamaño."""
+    order = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    if (order.get('payment_method') or '') != 'spei':
+        raise HTTPException(status_code=400, detail='Este pedido no es por transferencia SPEI')
+    if file.content_type not in RECEIPT_MIME:
+        raise HTTPException(status_code=400, detail='Solo aceptamos PDF, JPG, PNG o WEBP')
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail='El archivo esta vacio')
+    if len(data) > RECEIPT_MAX_BYTES:
+        raise HTTPException(status_code=400, detail='El archivo pesa mas de 8 MB')
+    await db.spei_receipts.update_one(
+        {'order_id': order['id']},
+        {'$set': {
+            'order_id': order['id'], 'order_number': order_number,
+            'filename': (file.filename or 'comprobante')[:120],
+            'content_type': file.content_type,
+            'data': base64.b64encode(data).decode(),
+            'uploaded_at': now_iso(),
+        }},
+        upsert=True,
+    )
+    # Marcamos que el cliente ya reportó su pago (el admin aún debe verificarlo).
+    await db.orders.update_one({'id': order['id']}, {'$set': {'spei_receipt_at': now_iso()}})
+    return {'ok': True}
+
+
+@api_router.get('/admin/orders/{order_id}/spei-receipt')
+async def download_spei_receipt(order_id: str, admin=Depends(get_current_admin)):
+    """Solo el admin descarga el comprobante (para mostrarlo a la cuenta receptora)."""
+    rec = await db.spei_receipts.find_one({'order_id': order_id}, {'_id': 0})
+    if not rec:
+        raise HTTPException(status_code=404, detail='Sin comprobante')
+    from fastapi.responses import Response
+    return Response(
+        content=base64.b64decode(rec['data']),
+        media_type=rec.get('content_type', 'application/octet-stream'),
+        headers={'Content-Disposition': f'inline; filename="{rec.get("filename", "comprobante")}"'},
+    )
 
 
 # ----------------- Admin: Orders -----------------
