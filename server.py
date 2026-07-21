@@ -810,7 +810,10 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         await db.stock.update_one({'key': item.product_id}, {'$inc': {'qty': -item.quantity}})
     # Confirmacion por correo, en segundo plano: la compra no debe quedarse
     # esperando al proveedor de correo ni fallar si esta caido.
-    asyncio.create_task(send_order_email(order.model_dump(), user.get('language') if user else None))
+    email_order = order.model_dump()
+    if payload.payment_method == 'spei':
+        email_order['spei'] = spei_details()   # la CLABE también va en el correo
+    asyncio.create_task(send_order_email(email_order, user.get('language') if user else None))
     result = clean(order.model_dump())
     # Cripto: creamos la factura del proveedor encendido y devolvemos su enlace.
     # El pedido queda 'pendiente' hasta que su webhook confirme que llegó el
@@ -912,10 +915,26 @@ async def my_orders(user=Depends(get_current_user)):
 
 
 @api_router.get('/orders/{order_number}')
+def spei_details():
+    """Datos de la cuenta SPEI donde el cliente deposita. Config por env; NUNCA
+    en el repo. Se muestran solo en un pedido SPEI ya hecho, no en páginas públicas."""
+    clabe = os.environ.get('SPEI_CLABE', '')
+    if not clabe:
+        return None
+    return {
+        'beneficiary': os.environ.get('SPEI_BENEFICIARY', 'Exygen Labs'),
+        'bank': os.environ.get('SPEI_BANK', ''),
+        'clabe': clabe,
+    }
+
+
 async def get_order(order_number: str):
     order = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    # Solo un pedido SPEI (y solo ese) lleva la CLABE; la referencia es el número de pedido.
+    if (order.get('payment_method') or '') == 'spei':
+        order['spei'] = spei_details()
     return order
 
 

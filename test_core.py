@@ -530,3 +530,21 @@ def test_nowpayments_ipn_signature(monkeypatch):
 def test_nowpayments_ipn_failclosed_without_secret(monkeypatch):
     monkeypatch.delenv('NOWPAYMENTS_IPN_SECRET', raising=False)
     assert not nowpayments.verify_ipn(b'{}', 'whatever')
+
+
+# ---------- SPEI: datos de la cuenta en el correo ----------
+def test_order_email_shows_spei_clabe():
+    order = {
+        'order_number': 'EX-20260721-0007',
+        'items': [{'name': 'Sema 10 mg', 'quantity': 1, 'price': 2049}],
+        'subtotal': 2049, 'discount': 205, 'shipping': 0, 'total': 1844,
+        'payment_method': 'spei',
+        'spei': {'beneficiary': 'Servicios Profesionales Quimimid SA de CV', 'bank': 'BBVA', 'clabe': '012790001244916613'},
+        'customer': {'full_name': 'Cliente Prueba', 'email': 'x@y.z', 'address': 'Calle 1'},
+    }
+    html_out = _order_email_html(order, ORDER_COPY['es'], 'https://exygenlabs.com/pedido/x')
+    assert '012790001244916613' in html_out
+    assert 'Quimimid' in html_out
+    # Un pedido con tarjeta NO lleva CLABE
+    card = dict(order, payment_method='tarjeta'); card.pop('spei')
+    assert '012790001244916613' not in _order_email_html(card, ORDER_COPY['es'], 'https://x/y')

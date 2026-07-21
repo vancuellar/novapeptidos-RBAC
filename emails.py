@@ -224,6 +224,10 @@ ORDER_COPY = {
         'shipping': 'Envio',
         'total': 'Total',
         'nextTitle': 'Que sigue',
+        'speiTitle': 'Datos para tu transferencia SPEI',
+        'speiBeneficiary': 'Beneficiario',
+        'speiBank': 'Banco',
+        'speiReference': 'Referencia / concepto',
         'nextCard': 'Verificamos el pago y preparamos tu pedido. En cuanto salga te mandamos el numero de guia por correo.',
         'nextSpei': 'Tu pedido queda apartado en cuanto se refleje la transferencia. En horario bancario suele tardar minutos; de noche o en fin de semana puede pasar al siguiente dia habil.',
         'track': 'Ver mi pedido',
@@ -248,6 +252,10 @@ ORDER_COPY = {
         'shipping': 'Shipping',
         'total': 'Total',
         'nextTitle': "What's next",
+        'speiTitle': 'Details for your SPEI transfer',
+        'speiBeneficiary': 'Beneficiary',
+        'speiBank': 'Bank',
+        'speiReference': 'Reference / memo',
         'nextCard': 'We verify the payment and prepare your order. As soon as it ships we will email you the tracking number.',
         'nextSpei': 'Your order is reserved as soon as the transfer clears. During banking hours that usually takes minutes; at night or on weekends it may roll to the next business day.',
         'track': 'View my order',
@@ -272,6 +280,10 @@ ORDER_COPY = {
         'shipping': 'Frete',
         'total': 'Total',
         'nextTitle': 'Proximos passos',
+        'speiTitle': 'Dados para sua transferencia SPEI',
+        'speiBeneficiary': 'Beneficiario',
+        'speiBank': 'Banco',
+        'speiReference': 'Referencia',
         'nextCard': 'Verificamos o pagamento e preparamos seu pedido. Assim que for enviado, mandamos o codigo de rastreio por e-mail.',
         'nextSpei': 'Seu pedido fica reservado assim que a transferencia for compensada. Em horario bancario costuma levar minutos; a noite ou no fim de semana pode passar para o proximo dia util.',
         'track': 'Ver meu pedido',
@@ -367,7 +379,27 @@ def _order_email_html(order, copy, link):
     customer = order.get('customer', {}) or {}
     address = esc(', '.join(b for b in [customer.get('address', ''), customer.get('city', ''),
                                         customer.get('state', ''), customer.get('postal_code', '')] if b))
-    next_text = copy['nextSpei'] if (order.get('payment_method') or '') == 'spei' else copy['nextCard']
+    is_spei = (order.get('payment_method') or '') == 'spei'
+    next_text = copy['nextSpei'] if is_spei else copy['nextCard']
+    spei = order.get('spei') if is_spei else None
+    spei_html = ''
+    if spei and spei.get('clabe'):
+        line = ('<tr><td style="padding:3px 0;font-family:{f};font-size:13px;color:{m};">{k}</td>'
+                '<td align="right" style="padding:3px 0;font-family:{f};font-size:13px;color:{b};font-weight:bold;">{v}</td></tr>')
+        rows_spei = ''.join(line.format(f=FONT, m=MUTED, b=BODY, k=k, v=esc(str(v))) for k, v in [
+            (copy.get('speiBeneficiary', 'Beneficiario'), spei.get('beneficiary', '')),
+            (copy.get('speiBank', 'Banco'), spei.get('bank', '')),
+            ('CLABE', spei.get('clabe', '')),
+            (copy.get('speiReference', 'Referencia'), order.get('order_number', '')),
+        ] if v)
+        spei_html = (
+            f'<tr><td style="padding:18px 40px 0 40px;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-box" '
+            f'style="background-color:{BG};border:1px solid {LINE};border-radius:10px;"><tr><td style="padding:14px 18px;">'
+            f'<div class="em-ink" style="font-family:{FONT};font-size:13px;font-weight:bold;color:{INK};padding-bottom:6px;">{copy.get("speiTitle", "Datos para tu transferencia SPEI")}</div>'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows_spei}</table>'
+            f'</td></tr></table></td></tr>'
+        )
     number = esc(str(order.get('order_number', '')))
 
     # Estilo ticket de super: ahorro y puntos en cajas punteadas, solo si aplican.
@@ -433,6 +465,7 @@ def _order_email_html(order, copy, link):
             </td>
           </tr>
           {ticket_html}
+          {spei_html}
           <tr>
             <td style="padding:24px 40px 0 40px; font-family:{FONT};">
               <div class="em-muted" style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase;">{copy['nextTitle']}</div>
