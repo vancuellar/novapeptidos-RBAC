@@ -467,3 +467,36 @@ def test_rollup_uses_stored_commission_not_current_rate():
     users = [{'id': 'u1', 'referred_by': 'd1', 'name': 'C', 'email': 'c@x.y'}]
     roll = _distributor_rollup(dist, users, orders)
     assert roll['earnings'] == 500   # 400 congelados + 100 nuevos; la cancelada fuera
+
+
+# ---------- Cripto (BTCPay) ----------
+import btcpay
+
+
+def test_btcpay_disabled_without_env(monkeypatch):
+    for k in ('BTCPAY_URL', 'BTCPAY_STORE_ID', 'BTCPAY_API_KEY'):
+        monkeypatch.delenv(k, raising=False)
+    assert not btcpay.enabled()
+
+
+def test_btcpay_enabled_with_env(monkeypatch):
+    monkeypatch.setenv('BTCPAY_URL', 'https://pay.exygenlabs.com')
+    monkeypatch.setenv('BTCPAY_STORE_ID', 'store123')
+    monkeypatch.setenv('BTCPAY_API_KEY', 'key123')
+    assert btcpay.enabled()
+
+
+def test_btcpay_webhook_signature(monkeypatch):
+    import hashlib, hmac
+    monkeypatch.setenv('BTCPAY_WEBHOOK_SECRET', 'topsecret')
+    body = b'{"type":"InvoiceSettled","metadata":{"orderId":"EX-1"}}'
+    good = 'sha256=' + hmac.new(b'topsecret', body, hashlib.sha256).hexdigest()
+    assert btcpay.verify_webhook(body, good)
+    assert not btcpay.verify_webhook(body, 'sha256=deadbeef')   # firma falsa
+    assert not btcpay.verify_webhook(body, '')                  # sin firma
+
+
+def test_btcpay_webhook_failclosed_without_secret(monkeypatch):
+    monkeypatch.delenv('BTCPAY_WEBHOOK_SECRET', raising=False)
+    # Sin secreto configurado, NINGÚN webhook se acepta.
+    assert not btcpay.verify_webhook(b'{}', 'sha256=whatever')
