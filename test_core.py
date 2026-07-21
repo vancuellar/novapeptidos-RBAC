@@ -558,3 +558,19 @@ def test_orders_route_maps_to_get_order():
     hits = [r.endpoint.__name__ for r in server.app.routes
             if getattr(r, 'path', '') == '/api/orders/{order_number}' and 'GET' in getattr(r, 'methods', set())]
     assert hits and all(name == 'get_order' for name in hits), hits
+
+
+# ---------- Correo de pago confirmado ----------
+import asyncio as _asyncio
+def test_payment_confirmed_email_renders(monkeypatch):
+    import emails
+    monkeypatch.setenv('EMAIL_ENABLED', 'true')
+    sent = {}
+    def fake_send(to, subject, html_body):
+        sent['to'] = to; sent['subject'] = subject; sent['html'] = html_body
+    monkeypatch.setattr(emails, '_send_email_sync', fake_send)
+    order = {'order_number': 'EX-20260721-0009', 'customer': {'full_name': 'Ana', 'email': 'ana@x.y'}}
+    _asyncio.run(emails.send_payment_confirmed_email(order, 'es'))
+    assert sent['to'] == 'ana@x.y'
+    assert 'EX-20260721-0009' in sent['subject']
+    assert 'EX-20260721-0009' in sent['html'] and 'Ana' in sent['html']

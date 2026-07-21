@@ -187,6 +187,48 @@ async def send_invitation_email(name, email, link, language=None):
     await _send_action_email(name, email, link, language, INVITE_SUBJECTS, INVITE_BODIES, 'invitation')
 
 
+PAID_SUBJECTS = {
+    'es': 'Confirmamos tu pago — pedido {number}',
+    'en': 'Payment confirmed — order {number}',
+    'pt': 'Pagamento confirmado — pedido {number}',
+}
+# (greet, body, cta, footer) para _action_email_html.
+PAID_BODIES = {
+    'es': ('Hola, {name}:', 'Recibimos y confirmamos tu pago del pedido <strong>{number}</strong>. '
+           'Ya lo estamos preparando; en cuanto salga te mandamos el numero de guia.',
+           'Ver mi pedido', 'Gracias por tu compra. Cualquier duda, responde a este correo.'),
+    'en': ('Hi {name},', 'We received and confirmed your payment for order <strong>{number}</strong>. '
+           'We are preparing it now; we will email you the tracking number as soon as it ships.',
+           'View my order', 'Thank you for your purchase. Any questions, just reply to this email.'),
+    'pt': ('Ola, {name}:', 'Recebemos e confirmamos seu pagamento do pedido <strong>{number}</strong>. '
+           'Ja estamos preparando; enviaremos o codigo de rastreio assim que for despachado.',
+           'Ver meu pedido', 'Obrigado pela sua compra. Qualquer duvida, responda a este e-mail.'),
+}
+
+
+async def send_payment_confirmed_email(order, language=None):
+    """Aviso al cliente de que su pago quedo confirmado (SPEI verificado por el
+    admin, o cripto liquidada). Nunca lanza."""
+    if not email_enabled():
+        return
+    customer = order.get('customer', {}) or {}
+    to = customer.get('email')
+    if not to:
+        return
+    lang = normalize_language(language)
+    number = str(order.get('order_number', ''))
+    greet, body, cta, footer = PAID_BODIES[lang]
+    site = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+    html_body = _action_email_html(
+        greet, body.replace('{number}', html.escape(number)), cta, footer,
+        name=customer.get('full_name', ''), email='', link=f'{site}/pedido/{number}')
+    try:
+        await asyncio.to_thread(_send_email_sync, to, PAID_SUBJECTS[lang].format(number=number), html_body)
+        logger.info('Payment-confirmed email sent to %s (order=%s)', to, number)
+    except Exception:
+        logger.exception('Failed to send payment-confirmed email for %s', number)
+
+
 async def send_welcome_email(name, email, language=None):
     """Send the account-confirmation email. Never raises: registration must
     succeed even if the email provider is down or unconfigured."""

@@ -53,7 +53,7 @@ from lab_reference import (
 )
 from emails import (
     send_welcome_email, send_reset_email, send_verification_email,
-    send_invitation_email, send_order_email, normalize_language, email_enabled,
+    send_invitation_email, send_order_email, send_payment_confirmed_email, normalize_language, email_enabled,
 )
 from datetime import timedelta
 import asyncio
@@ -849,6 +849,7 @@ async def _confirm_crypto_order(order_number: str):
         await db.orders.update_one({'id': order['id']}, {'$set': {'status': 'confirmado', 'paid_at': now_iso()}})
         fresh = await db.orders.find_one({'id': order['id']}, {'_id': 0})
         await award_order_points(fresh)
+        asyncio.create_task(send_payment_confirmed_email(fresh))
 
 
 @api_router.get('/payments/config')
@@ -1001,20 +1002,28 @@ async def admin_orders(admin=Depends(get_current_admin)):
 
 @api_router.put('/admin/orders/{order_id}/status')
 async def update_order_status(order_id: str, payload: OrderStatusUpdate, admin=Depends(get_current_admin)):
+    prev = await db.orders.find_one({'id': order_id}, {'_id': 0, 'status': 1})
+    if not prev:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
     update = {'status': payload.status}
     if payload.status == 'enviado':
         update['shipped_at'] = now_iso()
     elif payload.status == 'entregado':
         update['delivered_at'] = now_iso()
-    result = await db.orders.update_one({'id': order_id}, {'$set': update})
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    await db.orders.update_one({'id': order_id}, {'$set': update})
     order = await db.orders.find_one({'id': order_id}, {'_id': 0})
     # Lealtad: pago verificado deposita puntos; cancelacion los revierte.
     if payload.status in loyalty.PAID_STATUSES:
         await award_order_points(order)
     elif payload.status == 'cancelado':
         await revoke_order_points(order)
+    # Aviso de pago confirmado al cliente, solo al ENTRAR a 'confirmado'.
+    if payload.status == 'confirmado' and (prev.get('status') or '') != 'confirmado':
+        lang = None
+        if order.get('user_id'):
+            u = await db.users.find_one({'id': order['user_id']}, {'_id': 0, 'language': 1})
+            lang = (u or {}).get('language')
+        asyncio.create_task(send_payment_confirmed_email(order, lang))
     return await db.orders.find_one({'id': order_id}, {'_id': 0})
 
 
