@@ -194,6 +194,9 @@ class Order(BaseModel):
     points_earned: int = 0
     points_awarded: bool = False
     points_refunded: bool = False
+    # Cripto (BTCPay): factura y momento de pago confirmado por webhook
+    btcpay_invoice_id: str = ''
+    paid_at: Optional[str] = None
     # Envío / rastreo
     carrier: str = ''                   # FedEx, Estafeta, DHL...
     tracking_number: str = ''
