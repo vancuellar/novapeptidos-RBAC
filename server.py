@@ -681,6 +681,9 @@ async def delete_product(product_id: str, admin=Depends(get_current_admin)):
 
 
 # ----------------- Orders -----------------
+# Tope duro de comision de distribuidores (regla de Christian, 2026-07-21).
+COMMISSION_CAP = 0.50
+
 # ----------------- Lealtad (puntos) -----------------
 async def _points_entry(user_id, order, kind, points):
     await db.points.insert_one({
@@ -1094,7 +1097,9 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
         'password_hash': hash_password(uuid.uuid4().hex + uuid.uuid4().hex),
         'role': 'distributor',
         'distributor_code': code,
-        'commission_rate': max(0.0, min(1.0, payload.commission_rate)),
+        # Tope duro de Christian (2026-07-21): ningun distribuidor comisiona
+        # arriba del 50%. El servidor lo exige; el navegador no basta.
+        'commission_rate': max(0.0, min(COMMISSION_CAP, payload.commission_rate)),
         'customer_discount_rate': max(0.05, min(0.50, payload.customer_discount_rate)),
         'language': 'es',
         'email_verified': False,
@@ -1108,6 +1113,30 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
             'distributor_code': code, 'commission_rate': dist['commission_rate'],
             'customer_discount_rate': dist['customer_discount_rate'],
             'invitation_sent': sent, 'invitation_link': None if sent else link}
+
+
+@api_router.put('/admin/distributors/{dist_id}/rates')
+async def update_distributor_rates(dist_id: str, payload: dict, admin=Depends(get_current_admin)):
+    """Ajusta la comision y/o el descuento de UN distribuidor, hacia adelante.
+
+    Las ventas ya hechas NO se tocan: cada orden guardo su comision en pesos
+    al momento de crearse, y los reportes suman lo guardado. Cambiar la tasa
+    hoy solo afecta ordenes futuras (regla de Christian, 2026-07-21)."""
+    dist = await db.users.find_one({'id': dist_id, 'role': 'distributor'}, {'_id': 0})
+    if not dist:
+        raise HTTPException(status_code=404, detail='Distribuidor no encontrado')
+    update = {}
+    if payload.get('commission_rate') is not None:
+        update['commission_rate'] = max(0.0, min(COMMISSION_CAP, float(payload['commission_rate'])))
+    if payload.get('customer_discount_rate') is not None:
+        update['customer_discount_rate'] = max(0.05, min(0.50, float(payload['customer_discount_rate'])))
+    if not update:
+        raise HTTPException(status_code=400, detail='Nada que actualizar')
+    await db.users.update_one({'id': dist_id}, {'$set': update})
+    fresh = await db.users.find_one({'id': dist_id}, {'_id': 0, 'password_hash': 0})
+    return {'id': fresh['id'], 'name': fresh['name'],
+            'commission_rate': fresh['commission_rate'],
+            'customer_discount_rate': fresh['customer_discount_rate']}
 
 
 # ----------------- Distributor portal -----------------

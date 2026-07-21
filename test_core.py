@@ -436,3 +436,34 @@ def test_totp_uri_and_qr():
     qr = auth_factors.qr_data_uri(uri)
     assert qr.startswith('data:image/png;base64,')
     assert len(qr) > 500
+
+
+# ---------- Comisiones: tope y candado historico ----------
+from server import COMMISSION_CAP
+
+
+def test_commission_cap_is_50_percent():
+    assert COMMISSION_CAP == 0.50
+
+
+def test_rollup_uses_stored_commission_not_current_rate():
+    """La comision de una venta hecha queda CONGELADA en la orden (en pesos).
+    Cambiar la tasa del distribuidor o el precio del producto despues NO debe
+    mover lo ya ganado: el rollup suma order['commission'], nunca recalcula."""
+    dist = {'id': 'd1', 'name': 'Dist', 'email': 'd@x.y', 'distributor_code': 'EX-D1',
+            'commission_rate': 0.10,   # tasa ACTUAL, recien bajada
+            'customer_discount_rate': 0.10, 'created_at': '2026-07-01T00:00:00+00:00'}
+    orders = [
+        # venta vieja, cuando comisionaba 40% de $1,000
+        {'id': 'o1', 'user_id': 'u1', 'referred_by': 'd1', 'status': 'entregado',
+         'total': 1000, 'commission': 400, 'created_at': '2026-07-10T00:00:00+00:00'},
+        # venta nueva con la tasa nueva
+        {'id': 'o2', 'user_id': 'u1', 'referred_by': 'd1', 'status': 'confirmado',
+         'total': 1000, 'commission': 100, 'created_at': '2026-07-20T00:00:00+00:00'},
+        # cancelada: no cuenta
+        {'id': 'o3', 'user_id': 'u1', 'referred_by': 'd1', 'status': 'cancelado',
+         'total': 1000, 'commission': 400, 'created_at': '2026-07-11T00:00:00+00:00'},
+    ]
+    users = [{'id': 'u1', 'referred_by': 'd1', 'name': 'C', 'email': 'c@x.y'}]
+    roll = _distributor_rollup(dist, users, orders)
+    assert roll['earnings'] == 500   # 400 congelados + 100 nuevos; la cancelada fuera
