@@ -357,3 +357,56 @@ def test_coa_access_is_scoped_to_purchased_products(tmp_path, monkeypatch):
     assert coa_store.public_entry()['lot'] == 'EX-MUESTRA-1'
     # Lo que se manda al navegador nunca incluye la ruta del archivo.
     assert 'file' not in solo_bpc[0]
+
+
+# ---------- Lealtad (puntos) ----------
+import loyalty
+from emails import _order_email_html, ORDER_COPY
+
+
+def test_loyalty_eligibility():
+    assert loyalty.eligible({'role': 'user'})
+    assert loyalty.eligible({'role': 'admin'})
+    assert not loyalty.eligible({'role': 'distributor'})   # regla de Christian
+    assert not loyalty.eligible(None)                      # invitado sin cuenta
+
+
+def test_loyalty_clamp_redeem():
+    # Nunca mas que el saldo ni mas que la mercancia; nunca negativo.
+    assert loyalty.clamp_redeem(500, 300, 10000) == 300
+    assert loyalty.clamp_redeem(500, 800, 400) == 400
+    assert loyalty.clamp_redeem(200, 800, 10000) == 200
+    assert loyalty.clamp_redeem(-50, 800, 10000) == 0
+    assert loyalty.clamp_redeem(None, 800, 10000) == 0
+    assert loyalty.clamp_redeem('abc', 800, 10000) == 0
+
+
+def test_loyalty_earn():
+    # 5% de lo pagado en mercancia, entero hacia abajo.
+    assert loyalty.earn(1070, True) == 53
+    assert loyalty.earn(19.9, True) == 0
+    assert loyalty.earn(0, True) == 0
+    assert loyalty.earn(1070, False) == 0
+    assert loyalty.earn(None, True) == 0
+
+
+def test_order_email_ticket_elements():
+    order = {
+        'order_number': 'EX-20260720-0001',
+        'items': [{'name': 'Retatrutida 5 mg', 'quantity': 1, 'price': 1189}],
+        'subtotal': 1189, 'discount': 119, 'shipping': 0, 'total': 1070,
+        'points_used': 100, 'points_earned': 53, 'payment_method': 'spei',
+        'customer': {'full_name': 'Christian Cuellar', 'email': 'x@y.z', 'address': 'Calle 1'},
+    }
+    html_out = _order_email_html(order, ORDER_COPY['es'], 'https://exygenlabs.com/pedido/x')
+    assert 'Apreciable CHRISTIAN CUELLAR:' in html_out       # saludo estilo ticket
+    assert 'AHORRASTE $119 MXN' in html_out                  # caja de ahorro
+    assert 'GANAS 53 PUNTOS' in html_out                     # puntos de la compra
+    assert 'Puntos canjeados' in html_out                    # renglon del canje
+    assert 'GRACIAS POR TU COMPRA' in html_out               # despedida
+    # Sin descuento, sin puntos: las cajas del ticket no aparecen.
+    plain = dict(order, discount=0, points_used=0, points_earned=0)
+    html_plain = _order_email_html(plain, ORDER_COPY['es'], 'https://exygenlabs.com/pedido/x')
+    assert 'AHORRASTE' not in html_plain
+    assert 'GANAS' not in html_plain
+    assert 'Puntos canjeados' not in html_plain

@@ -171,6 +171,7 @@ class OrderCreate(BaseModel):
     shipping: float = 0
     discount: float = 0                      # informativo; el servidor recalcula con su propia regla
     distributor_code: Optional[str] = None   # referido por un distribuidor (atribuye la venta)
+    points_to_use: int = 0                   # puntos de lealtad a canjear; el servidor valida saldo
 
 
 class Order(BaseModel):
@@ -189,6 +190,11 @@ class Order(BaseModel):
     status: str = 'pendiente'   # pendiente | confirmado | enviado | entregado | cancelado
     referred_by: Optional[str] = None   # id del distribuidor que refirió (si aplica)
     commission: float = 0               # ganancia del distribuidor en esta orden (MXN)
+    # Lealtad: canje descontado al crear; los ganados se depositan al confirmarse el pago
+    points_used: int = 0
+    points_earned: int = 0
+    points_awarded: bool = False
+    points_refunded: bool = False
     # Envío / rastreo
     carrier: str = ''                   # FedEx, Estafeta, DHL...
     tracking_number: str = ''

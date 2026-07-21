@@ -215,7 +215,7 @@ ORDER_COPY = {
         'heading': 'Recibimos tu pedido',
         'preheader': 'Tu pedido {number} quedo registrado. Aqui esta el detalle.',
         'trustShipping': 'Envio nacional',
-        'greet': 'Hola, {name}:',
+        'greet': 'Apreciable {name}:',
         'intro': 'Recibimos tu pedido y ya quedo registrado. Aqui esta el detalle para que lo tengas por escrito.',
         'orderLabel': 'Numero de pedido',
         'items': 'Lo que pediste',
@@ -230,12 +230,16 @@ ORDER_COPY = {
         'shipTo': 'Enviar a',
         'ruo': 'Uso exclusivo en investigacion (RUO). No es un medicamento ni un suplemento; no esta destinado a consumo humano ni animal.',
         'help': 'Cualquier duda, responde a este correo o escribenos a',
+        'savings': 'AHORRASTE {amount}',
+        'points': 'GANAS {points} PUNTOS CON ESTA COMPRA',
+        'pointsUsed': 'Puntos canjeados',
+        'thanks': 'GRACIAS POR TU COMPRA',
     },
     'en': {
         'heading': 'We received your order',
         'preheader': 'Your order {number} is registered. Here is the detail.',
         'trustShipping': 'Nationwide shipping',
-        'greet': 'Hi {name},',
+        'greet': 'Dear {name},',
         'intro': 'We received your order and it is now registered. Here is the detail for your records.',
         'orderLabel': 'Order number',
         'items': 'What you ordered',
@@ -250,12 +254,16 @@ ORDER_COPY = {
         'shipTo': 'Ship to',
         'ruo': 'Research use only (RUO). Not a medicine or a supplement; not intended for human or animal consumption.',
         'help': 'Any questions, reply to this email or write to',
+        'savings': 'YOU SAVED {amount}',
+        'points': 'YOU EARN {points} POINTS WITH THIS ORDER',
+        'pointsUsed': 'Points redeemed',
+        'thanks': 'THANK YOU FOR YOUR ORDER',
     },
     'pt': {
         'heading': 'Recebemos seu pedido',
         'preheader': 'Seu pedido {number} foi registrado. Aqui esta o detalhe.',
         'trustShipping': 'Envio nacional',
-        'greet': 'Ola, {name}:',
+        'greet': 'Prezado(a) {name}:',
         'intro': 'Recebemos seu pedido e ele ja esta registrado. Aqui esta o detalhe para o seu controle.',
         'orderLabel': 'Numero do pedido',
         'items': 'O que voce pediu',
@@ -270,6 +278,10 @@ ORDER_COPY = {
         'shipTo': 'Enviar para',
         'ruo': 'Uso exclusivo em pesquisa (RUO). Nao e medicamento nem suplemento; nao se destina ao consumo humano ou animal.',
         'help': 'Qualquer duvida, responda a este e-mail ou escreva para',
+        'savings': 'VOCE ECONOMIZOU {amount}',
+        'points': 'VOCE GANHA {points} PONTOS COM ESTA COMPRA',
+        'pointsUsed': 'Pontos resgatados',
+        'thanks': 'OBRIGADO PELA SUA COMPRA',
     },
 }
 
@@ -303,6 +315,7 @@ DARK_EMAIL_STYLE = """
       .em-footer { color: #8C8C8C !important; }
       .em-btn { background-color: #4E73E8 !important; color: #FFFFFF !important; }
       .em-link { color: #93AAF0 !important; }
+      .em-save { background-color: #0A0A0A !important; border-color: #93AAF0 !important; }
     }
   </style>
 """
@@ -346,6 +359,8 @@ def _order_email_html(order, copy, link):
     totals = [total_row(copy['subtotal'], _money(order.get('subtotal', 0)))]
     if float(order.get('discount', 0) or 0) > 0:
         totals.append(total_row(copy['discount'], '-' + _money(order.get('discount', 0))))
+    if int(order.get('points_used', 0) or 0) > 0:
+        totals.append(total_row(copy['pointsUsed'], '-' + _money(order.get('points_used', 0))))
     totals.append(total_row(copy['shipping'], _money(order.get('shipping', 0))))
     totals.append(total_row(copy['total'], _money(order.get('total', 0)), strong=True))
 
@@ -354,6 +369,25 @@ def _order_email_html(order, copy, link):
                                         customer.get('state', ''), customer.get('postal_code', '')] if b))
     next_text = copy['nextSpei'] if (order.get('payment_method') or '') == 'spei' else copy['nextCard']
     number = esc(str(order.get('order_number', '')))
+
+    # Estilo ticket de super: ahorro y puntos en cajas punteadas, solo si aplican.
+    ticket_lines = []
+    if float(order.get('discount', 0) or 0) > 0:
+        ticket_lines.append(copy['savings'].format(amount=_money(order.get('discount', 0))))
+    if int(order.get('points_earned', 0) or 0) > 0:
+        ticket_lines.append(copy['points'].format(points=int(order['points_earned'])))
+    ticket_html = ''
+    if ticket_lines:
+        rows_html = ''.join(
+            f'<tr><td align="center" class="em-ink" style="padding:4px 20px; font-family:{FONT}; '
+            f'font-size:15px; font-weight:bold; letter-spacing:1.5px; color:{INK};">{line}</td></tr>'
+            for line in ticket_lines
+        )
+        ticket_html = (f'<tr><td style="padding:18px 40px 0 40px;">'
+                       f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-save" '
+                       f'style="background-color:{BG}; border:2px dashed {INK}; border-radius:10px;">'
+                       f'<tr><td style="padding:8px 0;"><table role="presentation" width="100%" cellpadding="0" '
+                       f'cellspacing="0">{rows_html}</table></td></tr></table></td></tr>')
 
     return f"""<!DOCTYPE html>
 <html lang="es-MX">
@@ -375,7 +409,7 @@ def _order_email_html(order, copy, link):
           <tr>
             <td style="padding:28px 40px 0 40px; font-family:{FONT};">
               <h1 class="em-ink" style="margin:0; font-size:26px; line-height:1.25; color:{INK}; font-weight:bold;">{copy['heading']}</h1>
-              <p class="em-body" style="margin:16px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{copy['greet'].format(name=esc(str(customer.get('full_name', ''))))}</p>
+              <p class="em-body" style="margin:16px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{copy['greet'].format(name=esc(str(customer.get('full_name', '')).upper()))}</p>
               <p class="em-body" style="margin:12px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{copy['intro']}</p>
             </td>
           </tr>
@@ -398,7 +432,7 @@ def _order_email_html(order, copy, link):
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{''.join(totals)}</table>
             </td>
           </tr>
-
+          {ticket_html}
           <tr>
             <td style="padding:24px 40px 0 40px; font-family:{FONT};">
               <div class="em-muted" style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase;">{copy['nextTitle']}</div>
@@ -416,7 +450,13 @@ def _order_email_html(order, copy, link):
           </tr>
 
           <tr>
-            <td align="center" class="em-muted" style="padding:20px 40px 28px 40px; font-family:{FONT}; font-size:12px; color:{MUTED}; letter-spacing:0.5px;">
+            <td align="center" class="em-ink" style="padding:20px 40px 4px 40px; font-family:{FONT}; font-size:14px; font-weight:bold; letter-spacing:2px; color:{INK};">
+              {copy['thanks']}
+            </td>
+          </tr>
+
+          <tr>
+            <td align="center" class="em-muted" style="padding:10px 40px 28px 40px; font-family:{FONT}; font-size:12px; color:{MUTED}; letter-spacing:0.5px;">
               Pureza HPLC &ge;99% &nbsp;&middot;&nbsp; {copy['trustShipping']}
             </td>
           </tr>

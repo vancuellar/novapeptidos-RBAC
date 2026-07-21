@@ -27,6 +27,7 @@ from auth import (
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
 import coa_store
 from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
+import loyalty
 from lab_reference import (
     MARKERS_BY_KEY, range_for, evaluate, families_for_products, relevant_markers,
 )
@@ -467,6 +468,64 @@ async def delete_product(product_id: str, admin=Depends(get_current_admin)):
 
 
 # ----------------- Orders -----------------
+# ----------------- Lealtad (puntos) -----------------
+async def _points_entry(user_id, order, kind, points):
+    await db.points.insert_one({
+        'id': str(uuid.uuid4()), 'user_id': user_id, 'order_id': order['id'],
+        'order_number': order.get('order_number', ''), 'type': kind,
+        'points': int(points), 'created_at': now_iso(),
+    })
+
+
+async def award_order_points(order):
+    """Deposita los puntos de una orden pagada. Idempotente: el flag
+    points_awarded se toma con una sola actualizacion condicional."""
+    if not order.get('user_id') or int(order.get('points_earned', 0) or 0) <= 0:
+        return
+    res = await db.orders.update_one(
+        {'id': order['id'], 'points_awarded': {'$ne': True}},
+        {'$set': {'points_awarded': True}},
+    )
+    if res.modified_count == 0:
+        return
+    await db.users.update_one({'id': order['user_id']}, {'$inc': {'points_balance': int(order['points_earned'])}})
+    await _points_entry(order['user_id'], order, 'earn', order['points_earned'])
+
+
+async def revoke_order_points(order):
+    """Al cancelar: quita lo depositado y devuelve lo canjeado. Idempotente."""
+    if not order.get('user_id'):
+        return
+    if order.get('points_awarded'):
+        res = await db.orders.update_one(
+            {'id': order['id'], 'points_awarded': True},
+            {'$set': {'points_awarded': False}},
+        )
+        if res.modified_count:
+            await db.users.update_one({'id': order['user_id']}, {'$inc': {'points_balance': -int(order.get('points_earned', 0))}})
+            await _points_entry(order['user_id'], order, 'revoke', -int(order.get('points_earned', 0)))
+    if int(order.get('points_used', 0) or 0) > 0 and not order.get('points_refunded'):
+        res = await db.orders.update_one(
+            {'id': order['id'], 'points_refunded': {'$ne': True}},
+            {'$set': {'points_refunded': True}},
+        )
+        if res.modified_count:
+            await db.users.update_one({'id': order['user_id']}, {'$inc': {'points_balance': int(order['points_used'])}})
+            await _points_entry(order['user_id'], order, 'refund', order['points_used'])
+
+
+@api_router.get('/me/points')
+async def my_points(user=Depends(get_current_user)):
+    """Saldo y movimientos de puntos. Los distribuidores no participan."""
+    if not loyalty.eligible(user):
+        return {'eligible': False, 'balance': 0, 'ledger': []}
+    fresh = await db.users.find_one({'id': user['id']}, {'_id': 0, 'points_balance': 1})
+    ledger = await db.points.find({'user_id': user['id']}, {'_id': 0}).to_list(200)
+    ledger.sort(key=lambda e: e.get('created_at', ''), reverse=True)
+    return {'eligible': True, 'balance': int((fresh or {}).get('points_balance', 0) or 0),
+            'earn_rate': loyalty.EARN_RATE, 'ledger': ledger[:100]}
+
+
 @api_router.post('/orders')
 async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     if not payload.items:
@@ -485,9 +544,17 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     discount_rate = max(auto_rate, code_rate)
     discount = round(subtotal * discount_rate)
     after_discount = subtotal - discount
+    # Lealtad: el canje se limita al saldo real y a la mercancia (el envio va en dinero).
+    points_used = 0
+    if payload.points_to_use and user and loyalty.eligible(user):
+        fresh = await db.users.find_one({'id': user['id']}, {'_id': 0, 'points_balance': 1})
+        balance = int((fresh or {}).get('points_balance', 0) or 0)
+        points_used = loyalty.clamp_redeem(payload.points_to_use, balance, after_discount)
+    paid_merchandise = after_discount - points_used
     shipping = payload.shipping if payload.shipping else 0   # el envio se cotiza por separado
-    total = after_discount + shipping
-    commission = round(after_discount * referrer.get('commission_rate', 0.25)) if referrer else 0
+    total = paid_merchandise + shipping
+    points_earned = loyalty.earn(paid_merchandise, user is not None and loyalty.eligible(user))
+    commission = round(paid_merchandise * referrer.get('commission_rate', 0.25)) if referrer else 0
     order = Order(
         order_number=gen_order_number(),
         user_id=user['id'] if user else None,
@@ -501,8 +568,15 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         total=total,
         referred_by=referrer['id'] if referrer else None,
         commission=commission,
+        points_used=points_used,
+        points_earned=points_earned,
     )
     await db.orders.insert_one(order.model_dump())
+    if points_used:
+        # El canje se descuenta de inmediato: si no, dos pedidos seguidos
+        # podrian gastar el mismo saldo.
+        await db.users.update_one({'id': user['id']}, {'$inc': {'points_balance': -points_used}})
+        await _points_entry(user['id'], order.model_dump(), 'redeem', -points_used)
     for item in payload.items:
         await db.products.update_one({'id': item.product_id}, {'$inc': {'stock': -item.quantity}})
         # Inventario vivo por presentacion (key = product_id del carrito, ya incluye ::presentacion)
@@ -570,7 +644,12 @@ async def update_order_status(order_id: str, payload: OrderStatusUpdate, admin=D
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail='Pedido no encontrado')
     order = await db.orders.find_one({'id': order_id}, {'_id': 0})
-    return order
+    # Lealtad: pago verificado deposita puntos; cancelacion los revierte.
+    if payload.status in loyalty.PAID_STATUSES:
+        await award_order_points(order)
+    elif payload.status == 'cancelado':
+        await revoke_order_points(order)
+    return await db.orders.find_one({'id': order_id}, {'_id': 0})
 
 
 CARRIER_TRACKING_URLS = {
@@ -625,7 +704,11 @@ async def update_order_shipping(order_id: str, payload: OrderShippingUpdate, adm
         update.setdefault('shipped_at', now_iso())
     if update:
         await db.orders.update_one({'id': order_id}, {'$set': update})
-    return await db.orders.find_one({'id': order_id}, {'_id': 0})
+    result = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    if result.get('status') in loyalty.PAID_STATUSES:
+        await award_order_points(result)
+        result = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    return result
 
 
 @api_router.get('/admin/stats')
