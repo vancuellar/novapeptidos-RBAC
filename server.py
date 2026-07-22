@@ -54,6 +54,7 @@ from lab_reference import (
 from emails import (
     send_welcome_email, send_reset_email, send_verification_email,
     send_invitation_email, send_order_email, send_payment_confirmed_email, normalize_language, email_enabled,
+    send_admin_notification,
 )
 from datetime import timedelta
 import asyncio
@@ -152,6 +153,8 @@ async def login(payload: LoginInput):
     user = await db.users.find_one({'email': payload.email.lower()})
     if not user or not verify_password(payload.password, user.get('password_hash', '')):
         raise HTTPException(status_code=401, detail='Correo o contrasena incorrectos')
+    if user.get('blocked'):
+        raise HTTPException(status_code=403, detail='Esta cuenta esta deshabilitada')
     # Las cuentas viejas no tienen el campo: se dan por confirmadas para no dejar
     # a nadie fuera. Solo las nuevas nacen sin confirmar.
     if user.get('email_verified') is False and email_enabled():
@@ -213,6 +216,8 @@ async def google_login(payload: GoogleAuthInput):
         raise HTTPException(status_code=401, detail=str(exc))
 
     user = await db.users.find_one({'email': info['email']})
+    if user and user.get('blocked'):
+        raise HTTPException(status_code=403, detail='Esta cuenta esta deshabilitada')
     if user:
         # Cuenta existente: se vincula con Google y se da por confirmada.
         # No se piden consentimientos: ya los dio al registrarse.
@@ -761,6 +766,12 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     if payload.payment_method not in allowed_methods:
         raise HTTPException(status_code=400, detail='Metodo de pago no disponible')
     subtotal = sum(item.price * item.quantity for item in payload.items)
+    # Familia HGH (no el Fragment): precio neto SIEMPRE — su margen no aguanta
+    # ningún descuento (Christian, 2026-07-22). El resto del carrito sí descuenta.
+    discountable = sum(
+        item.price * item.quantity for item in payload.items
+        if not ('hgh' in item.product_id.lower() and 'fragment' not in item.product_id.lower())
+    )
     # Atribucion a distribuidor: por codigo explicito o por el que refirio al usuario.
     referrer = await resolve_distributor(payload.distributor_code)
     if not referrer and user and user.get('referred_by'):
@@ -768,10 +779,10 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # Descuento: automatico por volumen (10% base, 15% desde $35,000 — Christian
     # quitó el 20% el 2026-07-21 para no competir con sus distribuidores) O el
     # del codigo del distribuidor — NUNCA se acumulan; aplica el MAYOR. Manda el servidor.
-    auto_rate = 0.15 if subtotal >= 35000 else 0.10
+    auto_rate = 0.15 if discountable >= 35000 else 0.10
     code_rate = referrer.get('customer_discount_rate', 0) if referrer else 0
     discount_rate = max(auto_rate, code_rate)
-    discount = round(subtotal * discount_rate)
+    discount = round(discountable * discount_rate)
     after_discount = subtotal - discount
     # Lealtad: el canje se limita al saldo real y a la mercancia (el envio va en dinero).
     points_used = 0
@@ -1275,6 +1286,105 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
             'distributor_code': code, 'commission_rate': dist['commission_rate'],
             'customer_discount_rate': dist['customer_discount_rate'],
             'invitation_sent': sent, 'invitation_link': None if sent else link}
+
+
+@api_router.post('/distributor-applications')
+async def create_distributor_application(payload: dict):
+    """Solicitud pública 'Quiero ser distribuidor' (sección Mayoreo del home).
+    Nada se aprueba solo: queda pendiente hasta que Christian decida en el Admin."""
+    name = str(payload.get('name') or '').strip()[:120]
+    email = str(payload.get('email') or '').strip().lower()[:200]
+    phone = str(payload.get('phone') or '').strip()[:40]
+    kind = str(payload.get('kind') or '').strip()[:40]
+    message = str(payload.get('message') or '').strip()[:2000]
+    if not name or '@' not in email or '.' not in email.split('@')[-1]:
+        raise HTTPException(status_code=400, detail='Nombre y correo válido son obligatorios')
+    # Una solicitud pendiente por correo: reintentos no duplican.
+    if await db.distributor_applications.find_one({'email': email, 'status': 'pendiente'}):
+        return {'ok': True}
+    await db.distributor_applications.insert_one({
+        'id': str(uuid.uuid4()), 'name': name, 'email': email, 'phone': phone,
+        'kind': kind, 'message': message, 'status': 'pendiente', 'created_at': now_iso(),
+    })
+    asyncio.create_task(send_admin_notification(
+        f'Nueva solicitud de distribuidor: {name}',
+        f'<p><strong>{name}</strong> · {email} · {phone or "sin teléfono"} · {kind or "sin tipo"}</p>'
+        f'<p>{message or "(sin mensaje)"}</p><p>Apruébala o recházala en el Admin &gt; Distribuidores.</p>',
+    ))
+    return {'ok': True}
+
+
+@api_router.get('/admin/distributor-applications')
+async def list_distributor_applications(admin=Depends(get_current_admin)):
+    apps = await db.distributor_applications.find({}, {'_id': 0}).to_list(1000)
+    apps.sort(key=lambda a: (a.get('status') != 'pendiente', a.get('created_at', '')), reverse=False)
+    return apps
+
+
+@api_router.put('/admin/distributor-applications/{app_id}')
+async def resolve_distributor_application(app_id: str, payload: dict, admin=Depends(get_current_admin)):
+    """Aprobar convierte la cuenta existente o crea la invitación (mismas rutas
+    de siempre); rechazar solo marca la solicitud. Christian decide, nunca el sitio."""
+    app_doc = await db.distributor_applications.find_one({'id': app_id})
+    if not app_doc:
+        raise HTTPException(status_code=404, detail='Solicitud no encontrada')
+    action = payload.get('action')
+    if action == 'rechazar':
+        await db.distributor_applications.update_one({'id': app_id}, {'$set': {'status': 'rechazada', 'resolved_at': now_iso()}})
+        return {'id': app_id, 'status': 'rechazada'}
+    if action != 'aprobar':
+        raise HTTPException(status_code=400, detail='Acción inválida')
+    commission = max(0.0, min(COMMISSION_CAP, float(payload.get('commission_rate', 0.25) or 0)))
+    discount = max(0.05, min(0.50, float(payload.get('customer_discount_rate', 0.10) or 0.10)))
+    existing = await db.users.find_one({'email': app_doc['email']})
+    if existing and existing.get('role') == 'distributor':
+        result = {'already': True}
+    elif existing:
+        # Cliente existente: misma conversión que el botón "Hacer distribuidor".
+        code = gen_distributor_code(existing.get('name') or existing['email'])
+        while await db.users.find_one({'distributor_code': code}):
+            code = gen_distributor_code(existing.get('name') or existing['email'])
+        await db.users.update_one({'id': existing['id']}, {'$set': {
+            'role': 'distributor', 'distributor_code': code, 'commission_rate': commission,
+            'customer_discount_rate': discount, 'converted_from_customer_at': now_iso(),
+        }})
+        result = {'converted': True, 'distributor_code': code}
+    else:
+        # Correo nuevo: invitación como la de "Nuevo distribuidor".
+        code = gen_distributor_code(app_doc['name'])
+        while await db.users.find_one({'distributor_code': code}):
+            code = gen_distributor_code(app_doc['name'])
+        dist = {
+            'id': str(uuid.uuid4()), 'name': app_doc['name'], 'email': app_doc['email'],
+            'password_hash': hash_password(uuid.uuid4().hex + uuid.uuid4().hex),
+            'role': 'distributor', 'distributor_code': code,
+            'commission_rate': commission, 'customer_discount_rate': discount,
+            'language': 'es', 'email_verified': False, 'invited_at': now_iso(), 'created_at': now_iso(),
+        }
+        await db.users.insert_one(dist)
+        link = await _send_invitation(dist)
+        result = {'invited': True, 'distributor_code': code,
+                  'invitation_sent': email_enabled(), 'invitation_link': None if email_enabled() else link}
+    await db.distributor_applications.update_one({'id': app_id}, {'$set': {'status': 'aprobada', 'resolved_at': now_iso()}})
+    return {'id': app_id, 'status': 'aprobada', **result}
+
+
+@api_router.put('/admin/customers/{user_id}/blocked')
+async def set_customer_blocked(user_id: str, payload: dict, admin=Depends(get_current_admin)):
+    """Bloquea o desbloquea una cuenta (Christian, 2026-07-22: cuentas curiosas
+    creadas 'solo para ver'). Bloqueada: no entra ni con contraseña, ni con
+    Google, ni con un token vigente. Sus datos y pedidos no se tocan."""
+    user = await db.users.find_one({'id': user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail='Cliente no encontrado')
+    if user.get('role') == 'admin':
+        raise HTTPException(status_code=400, detail='Una cuenta admin no se puede bloquear')
+    blocked = bool(payload.get('blocked'))
+    await db.users.update_one({'id': user_id}, {'$set': {
+        'blocked': blocked,
+        'blocked_at': now_iso() if blocked else None,
+    }})
+    return {'id': user_id, 'blocked': blocked}
 
 
 @api_router.post('/admin/customers/{user_id}/make-distributor')
