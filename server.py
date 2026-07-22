@@ -54,7 +54,7 @@ from lab_reference import (
 from emails import (
     send_welcome_email, send_reset_email, send_verification_email,
     send_invitation_email, send_order_email, send_payment_confirmed_email, normalize_language, email_enabled,
-    send_admin_notification,
+    send_admin_notification, send_distributor_welcome_email,
 )
 from datetime import timedelta
 import asyncio
@@ -483,6 +483,19 @@ async def _send_invitation(user: dict) -> str:
     return link
 
 
+async def _send_distributor_invitation(dist: dict) -> str:
+    """Como _send_invitation, pero manda el correo PROPIO del distribuidor (con
+    su código de referido y la bienvenida al programa). Devuelve el enlace de
+    activación (o para que el admin lo comparta si el correo está apagado)."""
+    expires = (datetime.now(timezone.utc) + timedelta(days=INVITE_TTL_DAYS)).isoformat()
+    token = await _issue_token(dist['id'], 'invite', expires)
+    link = f'{SITE_URL}/activar?token={token}'
+    asyncio.create_task(send_distributor_welcome_email(
+        dist['name'], dist['email'], dist.get('distributor_code', ''), link,
+        dist.get('language'), needs_activation=True))
+    return link
+
+
 @api_router.post('/auth/verify-email')
 async def verify_email(payload: TokenInput):
     """Confirma el correo y deja la sesion iniciada: sin fricción extra."""
@@ -775,10 +788,12 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     discountable = sum(
         item.price * item.quantity for item in payload.items if not _is_hgh_net(item)
     )
-    # Atribucion a distribuidor: por codigo explicito o por el que refirio al usuario.
+    # Atribucion a distribuidor: SOLO si esta venta usa un codigo de distribuidor.
+    # Regla de Christian (2026-07-22): si el cliente NO pone un codigo, la venta NO
+    # cuenta para ningun distribuidor — aunque ese cliente haya comprado antes con
+    # el codigo de alguien. El vinculo 'referred_by' del usuario NO genera comision
+    # por si solo; cada orden se atribuye por el codigo usado en ESA compra.
     referrer = await resolve_distributor(payload.distributor_code)
-    if not referrer and user and user.get('referred_by'):
-        referrer = await db.users.find_one({'id': user['referred_by'], 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
     # Descuento: automatico por volumen (10% base, 15% desde $35,000 — Christian
     # quitó el 20% el 2026-07-21 para no competir con sus distribuidores) O el
     # del codigo del distribuidor — NUNCA se acumulan; aplica el MAYOR. Manda el servidor.
@@ -1226,10 +1241,14 @@ async def invite_customer(payload: DistributorCreate, admin=Depends(get_current_
 
 # ----------------- Admin: Distributors -----------------
 def _distributor_rollup(dist, users, orders):
-    """Arma el resumen de un distribuidor: sus clientes y sus ventas atribuidas."""
+    """Arma el resumen de un distribuidor: sus clientes y sus ventas atribuidas.
+
+    Regla de Christian (2026-07-22): una VENTA cuenta solo si se hizo con el codigo
+    del distribuidor (order.referred_by == su id). Los pedidos sin codigo de un
+    cliente NO cuentan, aunque el cliente este ligado a el. 'clients' sigue siendo
+    la relacion (quien uso su codigo/registro), solo para listarlos."""
     clients = [u for u in users if u.get('referred_by') == dist['id']]
-    client_ids = {u['id'] for u in clients}
-    sales = [o for o in orders if o.get('referred_by') == dist['id'] or o.get('user_id') in client_ids]
+    sales = [o for o in orders if o.get('referred_by') == dist['id']]
     valid = [o for o in sales if o.get('status') != 'cancelado']
     return {
         'id': dist['id'],
@@ -1283,7 +1302,7 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
         'created_at': now_iso(),
     }
     await db.users.insert_one(dist)
-    link = await _send_invitation(dist)
+    link = await _send_distributor_invitation(dist)
     sent = email_enabled()
     return {'id': dist['id'], 'name': dist['name'], 'email': dist['email'],
             'distributor_code': code, 'commission_rate': dist['commission_rate'],
@@ -1365,7 +1384,7 @@ async def resolve_distributor_application(app_id: str, payload: dict, admin=Depe
             'language': 'es', 'email_verified': False, 'invited_at': now_iso(), 'created_at': now_iso(),
         }
         await db.users.insert_one(dist)
-        link = await _send_invitation(dist)
+        link = await _send_distributor_invitation(dist)
         result = {'invited': True, 'distributor_code': code,
                   'invitation_sent': email_enabled(), 'invitation_link': None if email_enabled() else link}
     await db.distributor_applications.update_one({'id': app_id}, {'$set': {'status': 'aprobada', 'resolved_at': now_iso()}})
@@ -1425,6 +1444,10 @@ async def convert_customer_to_distributor(user_id: str, payload: dict, admin=Dep
         'customer_discount_rate': discount,
         'converted_from_customer_at': now_iso(),
     }})
+    # Ya tiene contraseña: la bienvenida lleva a su panel, no a activar.
+    asyncio.create_task(send_distributor_welcome_email(
+        user.get('name') or user['email'], user['email'], code,
+        f'{SITE_URL}/distribuidor', user.get('language'), needs_activation=False))
     return {'id': user_id, 'name': user.get('name'), 'email': user['email'],
             'distributor_code': code, 'commission_rate': commission,
             'customer_discount_rate': discount}
@@ -1457,11 +1480,10 @@ async def update_distributor_rates(dist_id: str, payload: dict, admin=Depends(ge
 # ----------------- Distributor portal -----------------
 @api_router.get('/distributor/summary')
 async def distributor_summary(dist=Depends(get_current_distributor)):
+    # Ventas atribuidas = solo pedidos hechos con SU código (regla Christian
+    # 2026-07-22). Los clientes se listan aparte por la relación 'referred_by'.
     users = await db.users.find({'referred_by': dist['id']}, {'_id': 0, 'password_hash': 0}).to_list(5000)
-    client_ids = {u['id'] for u in users}
-    orders = await db.orders.find(
-        {'$or': [{'referred_by': dist['id']}, {'user_id': {'$in': list(client_ids)}}]}, {'_id': 0}
-    ).to_list(10000)
+    orders = await db.orders.find({'referred_by': dist['id']}, {'_id': 0}).to_list(10000)
     valid = [o for o in orders if o.get('status') != 'cancelado']
     by_month = {}
     for o in valid:
@@ -1484,7 +1506,8 @@ async def distributor_summary(dist=Depends(get_current_distributor)):
 @api_router.get('/distributor/clients')
 async def distributor_clients(dist=Depends(get_current_distributor)):
     users = await db.users.find({'referred_by': dist['id']}, {'_id': 0, 'password_hash': 0}).to_list(5000)
-    orders = await db.orders.find({}, {'_id': 0}).to_list(10000)
+    # Solo pedidos hechos con SU código cuentan (no todo lo que compró el cliente).
+    orders = await db.orders.find({'referred_by': dist['id']}, {'_id': 0}).to_list(10000)
     by_user = {}
     for o in orders:
         if o.get('user_id'):
@@ -1503,12 +1526,9 @@ async def distributor_clients(dist=Depends(get_current_distributor)):
 
 
 async def _distributor_orders(dist):
-    """Órdenes atribuidas al distribuidor: por código o por cliente referido."""
-    users = await db.users.find({'referred_by': dist['id']}, {'_id': 0}).to_list(5000)
-    client_ids = {u['id'] for u in users}
-    orders = await db.orders.find(
-        {'$or': [{'referred_by': dist['id']}, {'user_id': {'$in': list(client_ids)}}]}, {'_id': 0}
-    ).to_list(10000)
+    """Órdenes atribuidas al distribuidor: SOLO las hechas con su código
+    (regla Christian 2026-07-22). Un pedido sin código no le pertenece."""
+    orders = await db.orders.find({'referred_by': dist['id']}, {'_id': 0}).to_list(10000)
     orders.sort(key=lambda o: o.get('created_at', ''), reverse=True)
     return orders
 

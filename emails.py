@@ -198,6 +198,112 @@ async def send_invitation_email(name, email, link, language=None):
     await _send_action_email(name, email, link, language, INVITE_SUBJECTS, INVITE_BODIES, 'invitation')
 
 
+# ---------- Bienvenida al programa de distribuidores ----------
+DIST_SUBJECTS = {
+    'es': 'Bienvenido al programa de distribuidores de Exygen Labs',
+    'en': 'Welcome to the Exygen Labs distributor program',
+    'pt': 'Bem-vindo ao programa de distribuidores da Exygen Labs',
+}
+
+# (saludo, intro, como_funciona[3 puntos], etiqueta_codigo, cta_activar, cta_panel,
+#  nota_activar, nota_panel, cierre). Nunca ponemos el % de comision aqui: se ve
+# en el panel y Christian la ajusta a mano.
+DIST_COPY = {
+    'es': {
+        'greet': 'Hola, {name}:',
+        'intro': 'Ya eres parte del programa de distribuidores de <strong>Exygen Labs</strong>. '
+                 'Este es tu código de referido: compártelo con tus clientes.',
+        'how': ['Tus clientes usan tu código al comprar y reciben su descuento.',
+                'Cada venta hecha con tu código te genera comisión.',
+                'En tu panel ves tu comisión, tus ventas, tus clientes y tus materiales.'],
+        'code_label': 'TU CÓDIGO DE REFERIDO',
+        'cta_activate': 'Activar mi cuenta',
+        'cta_panel': 'Entrar a mi panel',
+        'note_activate': 'Primero elige tu contraseña con el botón de arriba; con eso activas tu cuenta. El enlace vence en 7 días.',
+        'note_panel': 'Entra a tu panel de distribuidor con el botón de arriba.',
+        'close': 'Cualquier duda, escríbenos a hola@exygenlabs.com.',
+    },
+    'en': {
+        'greet': 'Hi {name},',
+        'intro': "You're now part of the <strong>Exygen Labs</strong> distributor program. "
+                 'This is your referral code — share it with your clients.',
+        'how': ['Your clients use your code at checkout and get their discount.',
+                'Every sale made with your code earns you commission.',
+                'Your dashboard shows your commission, sales, clients and materials.'],
+        'code_label': 'YOUR REFERRAL CODE',
+        'cta_activate': 'Activate my account',
+        'cta_panel': 'Go to my dashboard',
+        'note_activate': 'First choose your password with the button above; that activates your account. The link expires in 7 days.',
+        'note_panel': 'Open your distributor dashboard with the button above.',
+        'close': 'Any questions, write to hola@exygenlabs.com.',
+    },
+    'pt': {
+        'greet': 'Olá, {name}:',
+        'intro': 'Agora você faz parte do programa de distribuidores da <strong>Exygen Labs</strong>. '
+                 'Este é o seu código de indicação — compartilhe com seus clientes.',
+        'how': ['Seus clientes usam seu código na compra e recebem o desconto.',
+                'Cada venda feita com seu código gera comissão para você.',
+                'No seu painel você vê sua comissão, vendas, clientes e materiais.'],
+        'code_label': 'SEU CÓDIGO DE INDICAÇÃO',
+        'cta_activate': 'Ativar minha conta',
+        'cta_panel': 'Entrar no meu painel',
+        'note_activate': 'Primeiro escolha sua senha no botão acima; isso ativa sua conta. O link expira em 7 dias.',
+        'note_panel': 'Acesse seu painel de distribuidor no botão acima.',
+        'close': 'Qualquer dúvida, escreva para hola@exygenlabs.com.',
+    },
+}
+
+
+def _distributor_email_html(copy, name, code, link, needs_activation):
+    """Correo propio del distribuidor: bienvenida + su código de referido en una
+    caja destacada + botón (activar cuenta nueva, o entrar al panel si ya existe)."""
+    how_items = ''.join(
+        f'<li style="margin-bottom:8px;">{h}</li>' for h in copy['how']
+    )
+    cta = copy['cta_activate'] if needs_activation else copy['cta_panel']
+    note = copy['note_activate'] if needs_activation else copy['note_panel']
+    return f"""<!DOCTYPE html>
+<html lang="es-MX">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{DARK_EMAIL_STYLE}</head>
+<body class="em-bg" style="margin:0;padding:0;background-color:#FFFFFF;">
+    <div style="max-width:560px;margin:0 auto;font-family:Helvetica,Arial,sans-serif;padding:32px 24px;">
+      <div class="em-ink" style="text-align:center;font-size:20px;letter-spacing:3px;color:#132763;font-weight:bold;">EXYGEN&nbsp;LABS</div>
+      <div class="em-muted" style="text-align:center;font-size:11px;letter-spacing:2px;color:#8A93A8;padding-top:4px;">RESEARCH PEPTIDES</div>
+      <p class="em-body" style="font-size:15px;color:#3D4657;margin-top:28px;">{copy['greet'].format(name=html.escape(name))}</p>
+      <p class="em-body" style="font-size:15px;color:#3D4657;line-height:1.6;">{copy['intro']}</p>
+      <div class="em-card" style="margin:24px 0;padding:20px;border:2px solid #132763;border-radius:12px;text-align:center;background-color:#F5F7FC;">
+        <div class="em-muted" style="font-size:11px;letter-spacing:2px;color:#8A93A8;">{copy['code_label']}</div>
+        <div class="em-ink" style="font-size:28px;font-weight:bold;letter-spacing:2px;color:#132763;padding-top:6px;">{html.escape(code)}</div>
+      </div>
+      <ul class="em-body" style="font-size:15px;color:#3D4657;line-height:1.6;padding-left:20px;">{how_items}</ul>
+      <p style="text-align:center;margin:28px 0;">
+        <a href="{link}" class="em-btn" style="display:inline-block;background-color:#132763;color:#FFFFFF;font-size:15px;font-weight:bold;text-decoration:none;padding:14px 36px;border-radius:999px;">{cta}</a>
+      </p>
+      <p class="em-muted" style="font-size:13px;color:#8A93A8;line-height:1.6;word-break:break-all;">
+        {note}<br>{html.escape(link)}
+      </p>
+      <p class="em-muted" style="font-size:13px;color:#8A93A8;line-height:1.6;">{copy['close']}</p>
+    </div>
+</body>
+</html>"""
+
+
+async def send_distributor_welcome_email(name, email, code, link, language=None, needs_activation=True):
+    """Bienvenida propia del distribuidor con su código de referido. `needs_activation`
+    True = cuenta nueva (el botón activa y elige contraseña); False = cliente convertido
+    (el botón lleva a su panel, ya tiene contraseña). Nunca lanza."""
+    if os.environ.get('EMAIL_ENABLED', 'false').lower() != 'true':
+        logger.info('EMAIL_ENABLED != true, skipping distributor email to %s', email)
+        return
+    lang = normalize_language(language)
+    body_html = _distributor_email_html(DIST_COPY[lang], name=name, code=code, link=link, needs_activation=needs_activation)
+    try:
+        await asyncio.to_thread(_send_email_sync, email, DIST_SUBJECTS[lang], body_html)
+        logger.info('distributor welcome email sent to %s (lang=%s)', email, lang)
+    except Exception:
+        logger.exception('Failed to send distributor welcome email to %s', email)
+
+
 PAID_SUBJECTS = {
     'es': 'Confirmamos tu pago — pedido {number}',
     'en': 'Payment confirmed — order {number}',

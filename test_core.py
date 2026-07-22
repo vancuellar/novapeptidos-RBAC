@@ -27,10 +27,35 @@ from server import (
 from lab_reference import (
     MARKERS, MARKERS_BY_KEY, evaluate, range_for, families_for_products, relevant_markers,
 )
+from emails import _distributor_email_html, DIST_COPY
 
 
 def days_ago(n):
     return (datetime.now(timezone.utc) - timedelta(days=n)).isoformat()
+
+
+# ---------- Correo de bienvenida de distribuidor ----------
+def test_distributor_email_shows_code_and_activation_cta():
+    html = _distributor_email_html(DIST_COPY['es'], name='María', code='MARI-4821',
+                                   link='https://exygenlabs.com/activar?token=x', needs_activation=True)
+    assert 'MARI-4821' in html                 # su código de referido, visible
+    assert 'Activar mi cuenta' in html         # cuenta nueva → botón de activar
+    assert 'Entrar a mi panel' not in html
+    assert 'programa de distribuidores' in html.lower() or 'distribuidores' in html.lower()
+
+
+def test_distributor_email_for_converted_client_links_to_panel():
+    html = _distributor_email_html(DIST_COPY['es'], name='María', code='MARI-4821',
+                                   link='https://exygenlabs.com/distribuidor', needs_activation=False)
+    assert 'MARI-4821' in html
+    assert 'Entrar a mi panel' in html         # ya tiene contraseña → botón al panel
+    assert 'Activar mi cuenta' not in html
+
+
+def test_distributor_email_escapes_the_name():
+    html = _distributor_email_html(DIST_COPY['es'], name='<b>x</b>', code='C-1',
+                                   link='https://exygenlabs.com/x', needs_activation=True)
+    assert '<b>x</b>' not in html and '&lt;b&gt;' in html
 
 
 # ---------- Numero de pedido ----------
@@ -190,18 +215,33 @@ def test_distributor_code_falls_back_when_the_name_has_no_letters():
 
 
 def test_distributor_rollup_excludes_cancelled_orders():
-    dist = {'id': 'd1', 'name': 'Ana', 'email': 'a@x.com', 'commission_rate': 0.25}
+    # Regla Christian 2026-07-22: una venta cuenta solo si trae el codigo del
+    # distribuidor (order.referred_by == su id). Un pedido de su cliente SIN
+    # codigo NO cuenta, aunque el cliente este ligado a el.
+    dist = {'id': 'd1', 'name': 'Ana', 'email': 'a@x.com', 'commission_rate': 0.30}
     users = [{'id': 'u1', 'referred_by': 'd1'}, {'id': 'u2', 'referred_by': 'otro'}]
     orders = [
-        {'user_id': 'u1', 'status': 'entregado', 'total': 1000, 'commission': 250},
-        {'user_id': 'u1', 'status': 'cancelado', 'total': 5000, 'commission': 1250},
-        {'user_id': 'u2', 'status': 'entregado', 'total': 9000, 'commission': 2250},
+        {'referred_by': 'd1', 'user_id': 'u1', 'status': 'entregado', 'total': 1000, 'commission': 300},
+        {'referred_by': 'd1', 'user_id': 'u1', 'status': 'cancelado', 'total': 5000, 'commission': 1500},
+        {'user_id': 'u1', 'status': 'entregado', 'total': 8000, 'commission': 0},   # SIN codigo → no cuenta
+        {'referred_by': 'otro', 'user_id': 'u2', 'status': 'entregado', 'total': 9000, 'commission': 2700},
     ]
     r = _distributor_rollup(dist, users, orders)
     assert r['clients_count'] == 1
     assert r['sales_count'] == 1
     assert r['sales_total'] == 1000        # la cancelada no cuenta
-    assert r['earnings'] == 250            # la del cliente ajeno tampoco
+    assert r['earnings'] == 300            # la sin codigo y la ajena tampoco
+
+
+def test_distributor_rollup_ignores_codeless_orders_from_linked_client():
+    # Un cliente ligado que compra SIN el codigo: cero para el distribuidor.
+    dist = {'id': 'd1', 'name': 'Ana', 'email': 'a@x.com', 'commission_rate': 0.30}
+    users = [{'id': 'u1', 'referred_by': 'd1'}]
+    orders = [{'user_id': 'u1', 'status': 'entregado', 'total': 4000, 'commission': 0}]
+    r = _distributor_rollup(dist, users, orders)
+    assert r['clients_count'] == 1     # sigue siendo su cliente (relacion)
+    assert r['sales_count'] == 0       # pero la venta sin codigo no cuenta
+    assert r['earnings'] == 0
 
 
 def test_distributor_rollup_counts_orders_attributed_by_code():
