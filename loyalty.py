@@ -3,14 +3,14 @@
 Reglas de negocio (Christian, 2026-07-20):
 - Cada compra PAGADA genera puntos; se canjean como dinero en compras futuras.
 - Los distribuidores NO participan: ni ganan ni canjean.
-- Tasa: 5% de la mercancía realmente pagada (después de descuentos y de puntos
+- Tasa: 3% de la mercancía realmente pagada (bajó de 5% por orden de Christian, 2026-07-21) (después de descuentos y de puntos
   canjeados, sin contar el envío). 1 punto = 1 peso al canjear.
 - Los puntos se DEPOSITAN cuando el pago se verifica (confirmado/enviado/
   entregado), no al crear el pedido: si no, un pedido SPEI que nunca se paga
   regalaría puntos.
 """
 
-EARN_RATE = 0.05
+EARN_RATE = 0.03
 PAID_STATUSES = ('confirmado', 'enviado', 'entregado')
 
 
@@ -31,7 +31,7 @@ def clamp_redeem(requested, balance, merchandise_total) -> int:
 
 
 def earn(paid_amount, is_eligible) -> int:
-    """Puntos que genera una compra: 5% de lo pagado en mercancía, entero
+    """Puntos que genera una compra: 3% de lo pagado en mercancía, entero
     hacia abajo. Cero si el monto es cero o la cuenta no participa."""
     if not is_eligible:
         return 0
