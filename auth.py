@@ -48,6 +48,9 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     user = await db.users.find_one({'id': user_id}, {'_id': 0, 'password_hash': 0, 'totp_secret': 0, 'totp_secret_pending': 0})
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Usuario no encontrado')
+    # Cuentas bloqueadas por el admin: fuera, aunque el token siga vigente.
+    if user.get('blocked'):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Esta cuenta esta deshabilitada')
     return user
 
 
@@ -57,7 +60,7 @@ async def get_optional_user(credentials: HTTPAuthorizationCredentials = Depends(
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user = await db.users.find_one({'id': payload.get('sub')}, {'_id': 0, 'password_hash': 0, 'totp_secret': 0, 'totp_secret_pending': 0})
-        return user
+        return None if (user and user.get('blocked')) else user
     except Exception:
         return None
 

@@ -172,6 +172,17 @@ async def _send_action_email(name, email, link, language, subjects, bodies, kind
         logger.exception('Failed to send %s email to %s', kind, email)
 
 
+async def send_admin_notification(subject, html_body):
+    """Aviso interno para Christian (hola@). Nunca lanza y calla si el correo
+    saliente está apagado — el flujo que avisa no debe fallar por esto."""
+    if os.environ.get('EMAIL_ENABLED', 'false').lower() != 'true':
+        return
+    try:
+        await asyncio.to_thread(_send_email_sync, 'hola@exygenlabs.com', subject, html_body)
+    except Exception:
+        logger.exception('Failed to send admin notification: %s', subject)
+
+
 async def send_reset_email(name, email, link, language=None):
     """Correo de restablecimiento de contrasena."""
     await _send_action_email(name, email, link, language, RESET_SUBJECTS, RESET_BODIES, 'reset')
