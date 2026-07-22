@@ -382,8 +382,8 @@ def test_loyalty_clamp_redeem():
 
 
 def test_loyalty_earn():
-    # 5% de lo pagado en mercancia, entero hacia abajo.
-    assert loyalty.earn(1070, True) == 53
+    # 3% de lo pagado en mercancia, entero hacia abajo.
+    assert loyalty.earn(1070, True) == 32
     assert loyalty.earn(19.9, True) == 0
     assert loyalty.earn(0, True) == 0
     assert loyalty.earn(1070, False) == 0

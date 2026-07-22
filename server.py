@@ -1274,6 +1274,46 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
             'invitation_sent': sent, 'invitation_link': None if sent else link}
 
 
+@api_router.post('/admin/customers/{user_id}/make-distributor')
+async def convert_customer_to_distributor(user_id: str, payload: dict, admin=Depends(get_current_admin)):
+    """Convierte una cuenta de cliente existente en distribuidor, conservando
+    su historial de compras y su misma contraseña/acceso.
+
+    Reglas de Christian (2026-07-21): al convertirse deja de participar en el
+    programa de lealtad (los distribuidores ni ganan ni canjean; su saldo queda
+    congelado) y aplican los topes de siempre: comisión <= 50% y descuento a
+    clientes entre 5% y 50%. Si el cliente venía referido por otro distribuidor,
+    ese vínculo se conserva.
+    """
+    user = await db.users.find_one({'id': user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail='Cliente no encontrado')
+    if user.get('role') == 'admin':
+        raise HTTPException(status_code=400, detail='Una cuenta admin no puede ser distribuidor')
+    if user.get('role') == 'distributor':
+        raise HTTPException(status_code=400, detail='Esta cuenta ya es distribuidor')
+    code = gen_distributor_code(user.get('name') or user['email'])
+    while await db.users.find_one({'distributor_code': code}):
+        code = gen_distributor_code(user.get('name') or user['email'])
+    try:
+        commission = float(payload.get('commission_rate', 0.25) or 0)
+        discount = float(payload.get('customer_discount_rate', 0.10) or 0.10)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail='Tasas inválidas')
+    commission = max(0.0, min(COMMISSION_CAP, commission))
+    discount = max(0.05, min(0.50, discount))
+    await db.users.update_one({'id': user_id}, {'$set': {
+        'role': 'distributor',
+        'distributor_code': code,
+        'commission_rate': commission,
+        'customer_discount_rate': discount,
+        'converted_from_customer_at': now_iso(),
+    }})
+    return {'id': user_id, 'name': user.get('name'), 'email': user['email'],
+            'distributor_code': code, 'commission_rate': commission,
+            'customer_discount_rate': discount}
+
+
 @api_router.put('/admin/distributors/{dist_id}/rates')
 async def update_distributor_rates(dist_id: str, payload: dict, admin=Depends(get_current_admin)):
     """Ajusta la comision y/o el descuento de UN distribuidor, hacia adelante.
