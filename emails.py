@@ -420,7 +420,9 @@ def _order_email_html(order, copy, link):
 
     customer = order.get('customer', {}) or {}
     address = esc(', '.join(b for b in [customer.get('address', ''), customer.get('city', ''),
-                                        customer.get('state', ''), customer.get('postal_code', '')] if b))
+                                        customer.get('state', ''), customer.get('postal_code', ''),
+                                        # El país solo cuando no es México (el caso normal no estorba).
+                                        customer.get('country', '') if customer.get('country') not in ('', 'MX') else ''] if b))
     is_spei = (order.get('payment_method') or '') == 'spei'
     next_text = copy['nextSpei'] if is_spei else copy['nextCard']
     spei = order.get('spei') if is_spei else None

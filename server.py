@@ -1120,7 +1120,9 @@ async def admin_customers(admin=Depends(get_current_admin)):
         addresses, phones = [], []
         for o in uo:
             c = o.get('customer') or {}
-            addr = ', '.join(x for x in [c.get('address'), c.get('city'), c.get('state'), c.get('postal_code')] if x)
+            # El país solo se muestra cuando NO es México (el caso normal no estorba).
+            country = c.get('country') if c.get('country') not in (None, '', 'MX') else None
+            addr = ', '.join(x for x in [c.get('address'), c.get('city'), c.get('state'), c.get('postal_code'), country] if x)
             if addr and addr not in addresses:
                 addresses.append(addr)
             if c.get('phone') and c['phone'] not in phones:
@@ -1430,7 +1432,8 @@ async def distributor_orders(dist=Depends(get_current_distributor)):
             'customer_name': c.get('full_name'),
             'customer_email': c.get('email'),
             'customer_phone': c.get('phone'),
-            'destination': ', '.join(x for x in [c.get('city'), c.get('state')] if x),
+            'destination': ', '.join(x for x in [c.get('city'), c.get('state'),
+                                                 c.get('country') if c.get('country') not in (None, '', 'MX') else None] if x),
             'payment_method': o.get('payment_method'),
             'items': [{'name': it.get('name'), 'quantity': it.get('quantity'),
                        'presentation': it.get('presentation', '')} for it in o.get('items', [])],

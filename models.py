@@ -38,6 +38,7 @@ class AddressInput(BaseModel):
     city: str = ''
     state: str = ''
     postal_code: str = ''
+    country: str = 'MX'  # ISO-3166 alfa-2; México por default
 
 
 class ProfileUpdate(BaseModel):
@@ -160,6 +161,7 @@ class CustomerInfo(BaseModel):
     city: str = ''
     state: str = ''
     postal_code: str = ''
+    country: str = 'MX'  # ISO-3166 alfa-2; México por default
     notes: str = ''
 
 
