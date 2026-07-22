@@ -2018,7 +2018,14 @@ async def ai_chat(payload: ChatInput, user=Depends(get_optional_user)):
                 yield chunk
         except Exception as e:
             logger.error(f'AI chat error: {e}')
-            err = 'Lo siento, ocurrio un error al procesar tu mensaje. Intenta de nuevo.'
+            # 429 = cuota de Gemini agotada (plan gratis: 20/dia). Mensaje honesto
+            # en vez de un error tecnico: el usuario sabe que es demanda, no su culpa.
+            if '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e):
+                err = ('Nuestro asistente esta recibiendo mucha demanda en este momento. '
+                       'Intenta de nuevo en unos minutos o escribenos a hola@exygenlabs.com '
+                       'y con gusto te ayudamos.')
+            else:
+                err = 'Lo siento, ocurrio un error al procesar tu mensaje. Intenta de nuevo.'
             collected = err
             yield err
         finally:
