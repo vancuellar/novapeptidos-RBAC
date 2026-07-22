@@ -765,9 +765,10 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     referrer = await resolve_distributor(payload.distributor_code)
     if not referrer and user and user.get('referred_by'):
         referrer = await db.users.find_one({'id': user['referred_by'], 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
-    # Descuento: automatico por volumen (10/15/20%) O el del codigo del distribuidor —
-    # NUNCA se acumulan; aplica el MAYOR de los dos. Manda el servidor.
-    auto_rate = 0.20 if subtotal >= 40000 else 0.15 if subtotal >= 20000 else 0.10
+    # Descuento: automatico por volumen (10% base, 15% desde $35,000 — Christian
+    # quitó el 20% el 2026-07-21 para no competir con sus distribuidores) O el
+    # del codigo del distribuidor — NUNCA se acumulan; aplica el MAYOR. Manda el servidor.
+    auto_rate = 0.15 if subtotal >= 35000 else 0.10
     code_rate = referrer.get('customer_discount_rate', 0) if referrer else 0
     discount_rate = max(auto_rate, code_rate)
     discount = round(subtotal * discount_rate)
