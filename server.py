@@ -767,10 +767,13 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         raise HTTPException(status_code=400, detail='Metodo de pago no disponible')
     subtotal = sum(item.price * item.quantity for item in payload.items)
     # Familia HGH (no el Fragment): precio neto SIEMPRE — su margen no aguanta
-    # ningún descuento (Christian, 2026-07-22). El resto del carrito sí descuenta.
+    # ningún descuento (Christian, 2026-07-22). Miramos id Y nombre porque en
+    # producción el product_id es un UUID (no dice "hgh"); el nombre sí.
+    def _is_hgh_net(item):
+        key = f"{item.product_id} {item.name}".lower()
+        return 'hgh' in key and 'fragment' not in key
     discountable = sum(
-        item.price * item.quantity for item in payload.items
-        if not ('hgh' in item.product_id.lower() and 'fragment' not in item.product_id.lower())
+        item.price * item.quantity for item in payload.items if not _is_hgh_net(item)
     )
     # Atribucion a distribuidor: por codigo explicito o por el que refirio al usuario.
     referrer = await resolve_distributor(payload.distributor_code)
