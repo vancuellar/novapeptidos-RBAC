@@ -18,7 +18,7 @@ from models import (
     RegisterInput, LoginInput, ForgotPasswordInput, ResetPasswordInput,
     ProfileUpdate, ChangePasswordInput,
     ProductCreate, ProductUpdate, Product, Category,
-    OrderCreate, Order, OrderStatusUpdate, OrderShippingUpdate,
+    OrderCreate, Order, OrderItem, CustomerInfo, OrderStatusUpdate, OrderShippingUpdate,
     ProtocolInput, ProtocolUpdate, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
@@ -2760,6 +2760,53 @@ async def tutorial_video(filename: str, request: Request, token: str = Query(...
     headers['Content-Range'] = f'bytes {start}-{end}/{size}'
     from starlette.responses import Response as _Response
     return _Response(content=chunk, status_code=206, media_type='video/mp4', headers=headers)
+
+
+# ----------------- Admin: venta directa (2026-07-23) -----------------
+class ManualOrderCreate(BaseModel):
+    user_id: str
+    items: List[OrderItem]
+    discount_rate: float = 0.0        # p. ej. 0.40 en venta directa con Christian
+    status: str = 'confirmado'
+    note: str = ''
+
+
+@api_router.post('/admin/orders')
+async def admin_create_order(payload: ManualOrderCreate, admin=Depends(get_current_admin)):
+    """Registra una VENTA DIRECTA (hecha en persona con Christian) en la cuenta
+    del cliente, para que la vea en su historial. Sin comisión de nadie."""
+    u = await db.users.find_one({'id': payload.user_id}, {'_id': 0, 'password_hash': 0})
+    if not u:
+        raise HTTPException(status_code=404, detail='Cliente no encontrado')
+    if payload.status not in ('pendiente', 'confirmado', 'enviado', 'entregado'):
+        raise HTTPException(status_code=400, detail='Estado no válido')
+    rate = max(0.0, min(0.60, payload.discount_rate))
+    subtotal = sum(i.price * i.quantity for i in payload.items)
+    discount = round(subtotal * rate)
+    total = subtotal - discount
+    points_earned = loyalty.earn(total, loyalty.eligible(u))
+    order = Order(
+        order_number=gen_order_number(),
+        user_id=u['id'],
+        items=payload.items,
+        customer=CustomerInfo(full_name=u.get('name', ''), email=u.get('email'),
+                              phone='', address='Venta directa', notes=payload.note),
+        payment_method='directa',
+        subtotal=subtotal, discount=discount, discount_rate=rate,
+        shipping=0, total=total, status=payload.status,
+        referred_by=None, commission=0, commissions=[],
+        points_used=0, points_earned=points_earned,
+    )
+    await db.orders.insert_one(order.model_dump())
+    if payload.status in loyalty.PAID_STATUSES:
+        fresh = await db.orders.find_one({'id': order.id}, {'_id': 0})
+        await award_order_points(fresh)
+    await notify(u['id'], 'direct_sale', 'Registramos tu compra',
+                 f'Tu compra directa quedó registrada (pedido {order.order_number}, total ${total:,.0f}'
+                 + (f', {round(rate*100)}% de descuento' if rate else '') + '). '
+                 + (payload.note or ''), link='/cuenta')
+    return {'order_number': order.order_number, 'total': total, 'discount': discount,
+            'points_earned': points_earned}
 
 
 # ----------------- Admin: fichas por persona (2026-07-23) -----------------
