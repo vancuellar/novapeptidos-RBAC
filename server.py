@@ -24,7 +24,7 @@ from models import (
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
 )
 from auth import (
-    hash_password, verify_password, create_token,
+    hash_password, verify_password, create_token, create_view_as_token, deny_view_as,
     get_current_user, get_optional_user, get_current_admin, get_current_distributor,
 )
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
@@ -451,6 +451,7 @@ def _passkey_public(row: dict) -> dict:
 
 @api_router.post('/me/passkeys/options')
 async def passkey_register_options(user=Depends(get_current_user)):
+    deny_view_as(user)
     existing = await db.passkeys.find({'user_id': user['id']}, {'_id': 0}).to_list(50)
     options = generate_registration_options(
         rp_id=PASSKEY_RP_ID,
@@ -473,6 +474,7 @@ async def passkey_register_options(user=Depends(get_current_user)):
 
 @api_router.post('/me/passkeys/verify')
 async def passkey_register_verify(payload: dict, user=Depends(get_current_user)):
+    deny_view_as(user)
     rec = await _take_challenge(payload.get('challenge_id'), 'register')
     if rec.get('user_id') != user['id']:
         raise HTTPException(status_code=400, detail='La solicitud expiro. Intenta de nuevo.')
@@ -505,6 +507,7 @@ async def passkey_list(user=Depends(get_current_user)):
 
 @api_router.delete('/me/passkeys/{passkey_id}')
 async def passkey_delete(passkey_id: str, user=Depends(get_current_user)):
+    deny_view_as(user)
     result = await db.passkeys.delete_one({'id': passkey_id, 'user_id': user['id']})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail='Llave no encontrada')
@@ -557,6 +560,7 @@ async def passkey_login_verify(payload: dict):
 async def totp_setup(user=Depends(get_current_user)):
     """Genera el secreto y el QR. Solo admins: para clientes la via segura y
     sencilla es Google o una llave de acceso (decision de Christian)."""
+    deny_view_as(user)
     if user.get('role') != 'admin':
         raise HTTPException(status_code=403, detail='El codigo 2FA es solo para administradores.')
     secret = auth_factors.new_totp_secret()
@@ -569,6 +573,7 @@ async def totp_setup(user=Depends(get_current_user)):
 async def totp_enable(payload: dict, user=Depends(get_current_user)):
     """Enciende el 2FA solo despues de comprobar un codigo real: si el QR no
     se escaneo bien, encenderlo dejaria al admin fuera de su propia cuenta."""
+    deny_view_as(user)
     fresh = await db.users.find_one({'id': user['id']}, {'_id': 0, 'totp_secret_pending': 1})
     secret = (fresh or {}).get('totp_secret_pending', '')
     if not auth_factors.verify_totp(secret, payload.get('code', '')):
@@ -582,6 +587,7 @@ async def totp_enable(payload: dict, user=Depends(get_current_user)):
 
 @api_router.post('/me/totp/disable')
 async def totp_disable(payload: dict, user=Depends(get_current_user)):
+    deny_view_as(user)
     fresh = await db.users.find_one({'id': user['id']}, {'_id': 0, 'totp_secret': 1})
     if not auth_factors.verify_totp((fresh or {}).get('totp_secret', ''), payload.get('code', '')):
         raise HTTPException(status_code=400, detail='Codigo incorrecto.')
@@ -706,6 +712,7 @@ async def reset_password(payload: ResetPasswordInput):
 async def update_profile(payload: ProfileUpdate, user=Depends(get_current_user)):
     """Perfil del usuario. NUNCA guardamos numeros de tarjeta — solo la preferencia
     de metodo de pago; los datos de tarjeta viven con el procesador de pagos."""
+    deny_view_as(user)
     update = {}
     if payload.name is not None and payload.name.strip():
         update['name'] = payload.name.strip()
@@ -733,6 +740,7 @@ async def update_profile(payload: ProfileUpdate, user=Depends(get_current_user))
 
 @api_router.post('/auth/change-password')
 async def change_password(payload: ChangePasswordInput, user=Depends(get_current_user)):
+    deny_view_as(user)
     full = await db.users.find_one({'id': user['id']})
     if not verify_password(payload.current_password, full['password_hash']):
         raise HTTPException(status_code=400, detail='La contrasena actual no es correcta')
@@ -899,6 +907,7 @@ async def my_points(user=Depends(get_current_user)):
 
 @api_router.post('/orders')
 async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
+    deny_view_as(user)          # en modo "ver como" no se compra nada
     if not payload.items:
         raise HTTPException(status_code=400, detail='El carrito esta vacio')
     allowed_methods = ['tarjeta', 'spei'] + (['cripto'] if crypto_enabled() else [])
@@ -1534,6 +1543,7 @@ async def my_notifications(user=Depends(get_current_user)):
 @api_router.post('/me/notifications/seen')
 async def mark_notifications_seen(user=Depends(get_current_user)):
     """Marca todo como leído (guarda la fecha)."""
+    deny_view_as(user)
     await db.users.update_one({'id': user['id']}, {'$set': {'notifications_seen_at': now_iso()}})
     return {'ok': True}
 
@@ -2295,6 +2305,7 @@ async def list_protocols(user=Depends(get_current_user)):
 
 @api_router.post('/me/protocols')
 async def create_protocol(payload: ProtocolInput, user=Depends(get_current_user)):
+    deny_view_as(user)
     doc = {
         'id': str(uuid.uuid4()),
         'user_id': user['id'],
@@ -2309,6 +2320,7 @@ async def create_protocol(payload: ProtocolInput, user=Depends(get_current_user)
 
 @api_router.put('/me/protocols/{protocol_id}')
 async def edit_protocol(protocol_id: str, payload: ProtocolUpdate, user=Depends(get_current_user)):
+    deny_view_as(user)
     update = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
     if not update:
         raise HTTPException(status_code=400, detail='Sin cambios')
@@ -2321,6 +2333,7 @@ async def edit_protocol(protocol_id: str, payload: ProtocolUpdate, user=Depends(
 
 @api_router.delete('/me/protocols/{protocol_id}')
 async def delete_protocol(protocol_id: str, user=Depends(get_current_user)):
+    deny_view_as(user)
     result = await db.protocols.delete_one({'id': protocol_id, 'user_id': user['id']})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail='Seguimiento no encontrado')
@@ -2440,6 +2453,7 @@ async def extract_lab_file(file: UploadFile = File(...), user=Depends(get_curren
     No guardamos el archivo: devolvemos los valores para que el cliente los
     revise y confirme antes de guardarlos.
     """
+    deny_view_as(user)
     if file.content_type not in LAB_MIME_TYPES:
         raise HTTPException(status_code=400, detail='Solo aceptamos PDF, JPG, PNG, WEBP o HEIC')
     data = await file.read()
@@ -2479,6 +2493,7 @@ async def extract_lab_file(file: UploadFile = File(...), user=Depends(get_curren
 
 @api_router.post('/me/labs')
 async def create_lab_report(payload: LabReportInput, user=Depends(get_current_user)):
+    deny_view_as(user)
     doc = {
         'id': str(uuid.uuid4()),
         'user_id': user['id'],
@@ -2495,6 +2510,7 @@ async def create_lab_report(payload: LabReportInput, user=Depends(get_current_us
 
 @api_router.delete('/me/labs/{report_id}')
 async def delete_lab_report(report_id: str, user=Depends(get_current_user)):
+    deny_view_as(user)
     result = await db.lab_reports.delete_one({'id': report_id, 'user_id': user['id']})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail='Estudio no encontrado')
@@ -2504,6 +2520,7 @@ async def delete_lab_report(report_id: str, user=Depends(get_current_user)):
 @api_router.post('/me/labs/{report_id}/interpret')
 async def interpret_lab(report_id: str, user=Depends(get_current_user)):
     """Explicación educativa, acotada a los compuestos del propio cliente."""
+    deny_view_as(user)
     report = await db.lab_reports.find_one({'id': report_id, 'user_id': user['id']}, {'_id': 0})
     if not report:
         raise HTTPException(status_code=404, detail='Estudio no encontrado')
@@ -2804,6 +2821,20 @@ async def tutorial_video(filename: str, request: Request, token: str = Query(...
     headers['Content-Range'] = f'bytes {start}-{end}/{size}'
     from starlette.responses import Response as _Response
     return _Response(content=chunk, status_code=206, media_type='video/mp4', headers=headers)
+
+
+# ----------------- Admin: "ver como" (solo lectura) -----------------
+@api_router.post('/admin/view-as/{user_id}')
+async def admin_view_as(user_id: str, admin=Depends(get_current_admin)):
+    """Devuelve un token TEMPORAL (30 min) para ver el panel de ese usuario tal
+    como lo ve él. Solo lectura: cualquier escritura se rechaza."""
+    u = await db.users.find_one({'id': user_id}, {'_id': 0, 'id': 1, 'name': 1, 'role': 1, 'blocked': 1})
+    if not u:
+        raise HTTPException(status_code=404, detail='Usuario no encontrado')
+    if u.get('role') == 'admin':
+        raise HTTPException(status_code=400, detail='No se puede ver como otro admin')
+    token = create_view_as_token(admin['id'], user_id)
+    return {'token': token, 'name': u.get('name'), 'role': u.get('role'), 'minutes': 30}
 
 
 # ----------------- Admin: venta directa (2026-07-23) -----------------

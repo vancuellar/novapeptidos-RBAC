@@ -24,6 +24,19 @@ def verify_password(password: str, hashed: str) -> bool:
         return False
 
 
+def create_view_as_token(admin_id: str, target_id: str, minutes: int = 30) -> str:
+    """Token de 'ver como' (solo lectura). Lleva marca `view_as` para que
+    cualquier endpoint que ESCRIBE lo rechace. Vida corta a propósito."""
+    payload = {
+        'sub': target_id,
+        'view_as': True,
+        'admin_id': admin_id,
+        'exp': datetime.now(timezone.utc) + timedelta(minutes=minutes),
+        'iat': datetime.now(timezone.utc),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
 def create_token(user_id: str) -> str:
     payload = {
         'sub': user_id,
@@ -40,6 +53,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user_id = payload.get('sub')
+        view_as = bool(payload.get('view_as'))
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Sesion expirada')
     except Exception:
@@ -51,7 +65,17 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     # Cuentas bloqueadas por el admin: fuera, aunque el token siga vigente.
     if user.get('blocked'):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Esta cuenta esta deshabilitada')
+    if view_as:
+        user['view_as'] = True
+        user['view_as_admin'] = payload.get('admin_id')
     return user
+
+
+def deny_view_as(user):
+    """Corta cualquier ESCRITURA hecha con un token de 'ver como'."""
+    if user and user.get('view_as'):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail='Modo "ver como": solo lectura')
 
 
 async def get_optional_user(credentials: HTTPAuthorizationCredentials = Depends(security)):

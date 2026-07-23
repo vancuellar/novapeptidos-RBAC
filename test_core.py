@@ -870,3 +870,27 @@ def test_cap_breakdown_zero_cap_pays_nothing():
     rows = [{'distributor_id': 'a', 'role': 'seller', 'amount': 100}]
     out = cap_breakdown(rows, 1000, 0.0)
     assert sum(r['amount'] for r in out) == 0
+
+
+# ---------- Modo "ver como" (solo lectura) ----------
+import pytest
+from fastapi import HTTPException
+from auth import create_view_as_token, deny_view_as, JWT_SECRET, JWT_ALGORITHM
+import jwt as _jwt
+
+
+def test_view_as_token_carries_target_and_admin():
+    tok = create_view_as_token('admin-1', 'cliente-9')
+    data = _jwt.decode(tok, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    assert data['sub'] == 'cliente-9'      # el token ES del usuario mirado
+    assert data['view_as'] is True
+    assert data['admin_id'] == 'admin-1'   # queda rastro de quién miró
+
+
+def test_deny_view_as_blocks_writes():
+    with pytest.raises(HTTPException) as e:
+        deny_view_as({'id': 'x', 'view_as': True})
+    assert e.value.status_code == 403
+    # un usuario normal (o anónimo) pasa sin problema
+    deny_view_as({'id': 'x'})
+    deny_view_as(None)
