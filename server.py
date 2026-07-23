@@ -1301,7 +1301,7 @@ async def admin_stats(admin=Depends(get_current_admin)):
 @api_router.get('/admin/customers')
 async def admin_customers(admin=Depends(get_current_admin)):
     """Todos los clientes con su historial de compra. Nunca expone password_hash."""
-    users = await db.users.find({'role': {'$ne': 'admin'}}, {'_id': 0, 'password_hash': 0}).to_list(2000)
+    users = await db.users.find({'role': 'user'}, {'_id': 0, 'password_hash': 0}).to_list(2000)
     orders = await db.orders.find({}, {'_id': 0}).to_list(5000)
     by_user = {}
     for o in orders:
@@ -1602,6 +1602,9 @@ def _distributor_rollup(dist, users, orders):
         'tier': dist.get('tier', pyramid.DEFAULT_TIER),
         'upline_id': dist.get('upline_id'),
         'created_at': dist.get('created_at'),
+        'email_verified': dist.get('email_verified', False),
+        'invited_at': dist.get('invited_at'),
+        'admin_notes': dist.get('admin_notes', ''),
         'clients_count': len(clients),
         'sales_count': len(valid),
         'sales_total': sum(o.get('total', 0) for o in valid),
@@ -2760,6 +2763,21 @@ async def tutorial_video(filename: str, request: Request, token: str = Query(...
 
 
 # ----------------- Admin: fichas por persona (2026-07-23) -----------------
+class AdminNotes(BaseModel):
+    notes: str
+
+
+@api_router.put('/admin/distributors/{dist_id}/notes')
+async def admin_distributor_notes(dist_id: str, payload: AdminNotes, admin=Depends(get_current_admin)):
+    """Notas internas del admin sobre un distribuidor (deudas, acuerdos, etc.).
+    Solo las ve el admin — nunca el distribuidor."""
+    res = await db.users.update_one({'id': dist_id, 'role': 'distributor'},
+                                    {'$set': {'admin_notes': payload.notes[:2000]}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail='Distribuidor no encontrado')
+    return {'ok': True}
+
+
 @api_router.get('/admin/distributors/{dist_id}/detail')
 async def admin_distributor_detail(dist_id: str, admin=Depends(get_current_admin)):
     """Ficha completa de UN distribuidor: perfil, códigos, clientes, red y ventas.
