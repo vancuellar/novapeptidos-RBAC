@@ -719,3 +719,34 @@ def test_distributor_rollup_counts_override_earnings():
     assert r['sales_total'] == 5000
     assert r['earnings'] == 1850          # 1500 venta propia + 350 sobrecomisión
     assert r['tier'] == 'master'
+
+
+# ---------- Pirámide: barra de nivel ----------
+def test_level_progress_junior_toward_senior():
+    lp = pyramid.level_progress('junior', 30000)
+    assert lp['current'] == 'junior' and lp['next'] == 'senior' and lp['kind'] == 'promotion'
+    assert lp['target'] == 100000 and lp['remaining'] == 70000
+    assert abs(lp['progress'] - 0.30) < 1e-9
+
+
+def test_level_progress_senior_toward_master():
+    lp = pyramid.level_progress('senior', 250000)
+    assert lp['next'] == 'master' and lp['target'] == 500000 and lp['remaining'] == 250000
+    assert abs(lp['progress'] - 0.5) < 1e-9
+
+
+def test_level_progress_master_at_cap_is_maxed():
+    lp = pyramid.level_progress('master', 999999, 0.40)
+    assert lp['kind'] == 'maxed' and lp['next'] is None and lp['progress'] == 1.0
+
+
+def test_level_progress_master_below_cap_steps_by_half_point():
+    lp = pyramid.level_progress('master', 600000, 0.30)
+    assert lp['kind'] == 'rate_step' and lp['rate'] == 0.30 and lp['next_rate'] == 0.305
+    assert lp['remaining'] == 400000        # 600k → dentro del 2do bloque, faltan 400k
+    assert abs(lp['progress'] - 0.2) < 1e-9
+
+
+def test_level_progress_never_exceeds_full_bar():
+    lp = pyramid.level_progress('junior', 999999)
+    assert lp['progress'] == 1.0 and lp['remaining'] == 0.0

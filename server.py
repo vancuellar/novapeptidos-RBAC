@@ -1698,6 +1698,9 @@ async def distributor_summary(dist=Depends(get_current_distributor)):
         # Desglose: cuánto es de ventas propias y cuánto de sobrecomisión del equipo.
         'own_earnings': own_earnings,
         'override_earnings': earnings_total - own_earnings,
+        # Barra de nivel: avance hacia el siguiente nivel (o al próximo +0.5% si Master).
+        'level': pyramid.level_progress(
+            dist.get('tier'), sum(o.get('total', 0) for o in own_sales), dist.get('commission_rate')),
         'monthly': sorted(by_month.values(), key=lambda e: e['month']),
     }
 

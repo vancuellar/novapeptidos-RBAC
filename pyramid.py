@@ -39,9 +39,50 @@ MAX_OVERRIDE_LEVELS = 2
 HARD_CAP = 0.50
 
 
+# Ascensos: ventas PROPIAS acumuladas para calificar al siguiente nivel. El
+# ascenso lo APRUEBA Christian (§4ter); la barra solo muestra el avance. Son
+# constantes fáciles de cambiar — valores de arranque, ajustables.
+PROMOTE_TARGETS = {'junior': 100000, 'senior': 500000}
+MASTER_STEP_SALES = 500000    # cada $500k de ventas netas → +0.5% de comisión
+MASTER_STEP_RATE = 0.005
+MASTER_MAX_RATE = 0.40        # el 45% élite lo otorga Christian a mano, fuera de la barra
+
+
 def tier_rate(tier):
     """Tasa base de un nivel dado (junior por defecto si no se reconoce)."""
     return TIER_RATES.get(tier or DEFAULT_TIER, TIER_RATES[DEFAULT_TIER])
+
+
+def level_progress(tier, lifetime_sales, commission_rate=None):
+    """Avance hacia el siguiente nivel. Junior/Senior: hacia el umbral de ventas
+    que califica al ascenso. Master: hacia el próximo +0.5% de comisión (cada
+    $500k) hasta el tope. Devuelve un dict listo para pintar la barra."""
+    tier = tier if tier in TIER_RATES else DEFAULT_TIER
+    sales = max(0.0, float(lifetime_sales or 0))
+    if tier in PROMOTE_TARGETS:
+        target = PROMOTE_TARGETS[tier]
+        return {
+            'current': tier,
+            'next': 'senior' if tier == 'junior' else 'master',
+            'kind': 'promotion',
+            'target': target,
+            'current_value': sales,
+            'progress': min(1.0, sales / target) if target else 1.0,
+            'remaining': max(0.0, target - sales),
+        }
+    # Master
+    rate = commission_rate if commission_rate is not None else TIER_RATES['master']
+    if rate >= MASTER_MAX_RATE:
+        return {'current': 'master', 'next': None, 'kind': 'maxed', 'target': None,
+                'current_value': sales, 'progress': 1.0, 'remaining': 0.0, 'rate': rate}
+    into_block = sales % MASTER_STEP_SALES
+    return {
+        'current': 'master', 'next': None, 'kind': 'rate_step',
+        'target': MASTER_STEP_SALES, 'current_value': into_block,
+        'progress': into_block / MASTER_STEP_SALES,
+        'remaining': MASTER_STEP_SALES - into_block,
+        'rate': rate, 'next_rate': round(min(MASTER_MAX_RATE, rate + MASTER_STEP_RATE), 4),
+    }
 
 
 def seller_rate(dist):
