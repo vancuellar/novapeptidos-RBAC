@@ -70,6 +70,24 @@ def max_discount(tier):
     return tier_rate(tier)
 
 
+# Descuentos que el sistema le ofrece a cada nivel (códigos auto-generados):
+# empiezan en 15% (= tope de la página) y suben de 5% en 5% hasta 5% DEBAJO de
+# su comisión. Diamond (43%) termina en 38%. Christian, 2026-07-23.
+DISCOUNT_FLOOR = 15   # %
+
+
+def discount_tiers_for(commission_rate):
+    """Lista de descuentos (fracciones) disponibles para una comisión dada.
+    Ej: 0.30 (Senior) → [0.15, 0.20, 0.25]; 0.43 (Diamond) → [0.15..0.35, 0.38]."""
+    cap = round((commission_rate or 0) * 100) - 5
+    if cap < DISCOUNT_FLOOR:
+        return [DISCOUNT_FLOOR / 100] if cap >= 0 else []
+    tiers = list(range(DISCOUNT_FLOOR, cap + 1, 5))
+    if cap not in tiers:          # Diamond: 43-5=38 no es múltiplo de 5
+        tiers.append(cap)
+    return [t / 100 for t in tiers]
+
+
 def compute_commission_breakdown(merchandise, seller, upline_chain=None, discount_rate=0.0):
     """Reparte UNA venta hecha con el código de `seller`, sobre `merchandise` (MXN).
 

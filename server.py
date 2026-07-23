@@ -92,8 +92,8 @@ async def resolve_distributor(code):
     return await db.users.find_one({'distributor_code': code, 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
 
 
-# ----------------- Códigos de descuento (varios por distribuidor) -----------------
-CODE_TTL_DAYS = 90   # rotación: los códigos caducan a los 90 días (decisión Christian)
+# ----------------- Códigos de descuento (auto-generados por nivel) -----------------
+CODE_TTL_DAYS = 30   # rotación automática: los códigos se renuevan cada 30 días
 
 
 def gen_discount_code(name, pct):
@@ -1314,69 +1314,76 @@ async def check_discount_code(code: str):
     return {'code': code.strip().upper(), 'discount_rate': discount}
 
 
-# ----------------- Distribuidor: sus códigos de descuento -----------------
+# ----------------- Distribuidor: sus códigos de descuento (auto) -----------------
 def _code_projection(doc):
     return {
-        'id': doc['id'], 'code': doc['code'], 'label': doc.get('label', ''),
-        'discount_rate': doc.get('discount_rate', 0), 'active': doc.get('active', True),
+        'id': doc['id'], 'code': doc['code'], 'discount_rate': doc.get('discount_rate', 0),
         'created_at': doc.get('created_at'), 'expires_at': doc.get('expires_at'),
-        'expired': bool(doc.get('expires_at') and doc['expires_at'] < now_iso()),
     }
+
+
+async def _new_code_string(name, rate):
+    code = gen_discount_code(name, rate)
+    while await db.discount_codes.find_one({'code': code}):
+        code = gen_discount_code(name, rate)
+    return code
+
+
+async def _ensure_distributor_codes(dist, force_rotate=False):
+    """Mantiene el set de códigos AUTO del distribuidor: uno por cada nivel de
+    descuento de su comisión (15%, 20%… hasta 5% debajo de su comisión). Crea los
+    que falten, ROTA los caducados (nuevo texto, el viejo muere), y desactiva los
+    que ya no correspondan a su nivel. Devuelve los códigos vigentes ordenados."""
+    rate_basis = dist.get('commission_rate', pyramid.tier_rate(dist.get('tier')))
+    tiers = pyramid.discount_tiers_for(rate_basis)
+    tierset = {round(r, 4) for r in tiers}
+    existing = await db.discount_codes.find({'distributor_id': dist['id']}).to_list(300)
+    by_rate = {}
+    for c in existing:
+        by_rate.setdefault(round(c.get('discount_rate', 0), 4), c)
+    now = now_iso()
+    new_exp = (datetime.now(timezone.utc) + timedelta(days=CODE_TTL_DAYS)).isoformat()
+    out = []
+    for rate in tiers:
+        c = by_rate.get(round(rate, 4))
+        expired = bool(c and c.get('expires_at') and c['expires_at'] < now)
+        if not c:
+            doc = {'id': str(uuid.uuid4()), 'distributor_id': dist['id'],
+                   'code': await _new_code_string(dist.get('name'), rate),
+                   'discount_rate': rate, 'active': True, 'created_at': now, 'expires_at': new_exp}
+            await db.discount_codes.insert_one(doc)
+            out.append(doc)
+        elif force_rotate or expired or not c.get('active', True):
+            new_code = await _new_code_string(dist.get('name'), rate)
+            await db.discount_codes.update_one({'id': c['id']}, {'$set': {
+                'code': new_code, 'active': True, 'created_at': now, 'expires_at': new_exp}})
+            c.update({'code': new_code, 'active': True, 'created_at': now, 'expires_at': new_exp})
+            out.append(c)
+        else:
+            out.append(c)
+    # Desactiva códigos de niveles que ya no aplican (p.ej. tras cambiar de nivel).
+    for c in existing:
+        if round(c.get('discount_rate', 0), 4) not in tierset and c.get('active', True):
+            await db.discount_codes.update_one({'id': c['id']}, {'$set': {'active': False}})
+    out.sort(key=lambda c: c.get('discount_rate', 0))
+    return out
 
 
 @api_router.get('/distributor/codes')
 async def list_discount_codes(dist=Depends(get_current_distributor)):
-    """Los códigos del distribuidor, con su % y caducidad (rotan a 90 días)."""
-    codes = await db.discount_codes.find({'distributor_id': dist['id']}, {'_id': 0}).to_list(200)
-    codes.sort(key=lambda c: c.get('created_at', ''), reverse=True)
+    """Los códigos AUTO del distribuidor (uno por nivel de descuento). Se generan
+    y rotan solos cada 30 días; el distribuidor solo elige cuál da a cada cliente."""
+    codes = await _ensure_distributor_codes(dist)
     return {'max_discount': pyramid.tier_rate(dist.get('tier')),
+            'rotate_days': CODE_TTL_DAYS,
             'codes': [_code_projection(c) for c in codes]}
 
 
-@api_router.post('/distributor/codes')
-async def create_discount_code(payload: DiscountCodeCreate, dist=Depends(get_current_distributor)):
-    """Crea un código nuevo. El descuento se acota a la comisión del nivel."""
-    cap = pyramid.tier_rate(dist.get('tier'))
-    rate = max(0.0, min(cap, float(payload.discount_rate or 0)))
-    code = gen_discount_code(dist.get('name'), rate)
-    while await db.discount_codes.find_one({'code': code}):
-        code = gen_discount_code(dist.get('name'), rate)
-    doc = {
-        'id': str(uuid.uuid4()), 'distributor_id': dist['id'], 'code': code,
-        'label': str(payload.label or '')[:60], 'discount_rate': rate, 'active': True,
-        'created_at': now_iso(),
-        'expires_at': (datetime.now(timezone.utc) + timedelta(days=CODE_TTL_DAYS)).isoformat(),
-    }
-    await db.discount_codes.insert_one(doc)
-    return _code_projection(doc)
-
-
-@api_router.post('/distributor/codes/{code_id}/renew')
-async def renew_discount_code(code_id: str, dist=Depends(get_current_distributor)):
-    """Rota el código: nuevo texto (mismo % y etiqueta) y caducidad reiniciada.
-    El texto viejo deja de servir → un código filtrado no dura para siempre."""
-    doc = await db.discount_codes.find_one({'id': code_id, 'distributor_id': dist['id']})
-    if not doc:
-        raise HTTPException(status_code=404, detail='Código no encontrado')
-    new_code = gen_discount_code(dist.get('name'), doc.get('discount_rate', 0))
-    while await db.discount_codes.find_one({'code': new_code}):
-        new_code = gen_discount_code(dist.get('name'), doc.get('discount_rate', 0))
-    await db.discount_codes.update_one({'id': code_id}, {'$set': {
-        'code': new_code, 'active': True, 'created_at': now_iso(),
-        'expires_at': (datetime.now(timezone.utc) + timedelta(days=CODE_TTL_DAYS)).isoformat(),
-    }})
-    fresh = await db.discount_codes.find_one({'id': code_id}, {'_id': 0})
-    return _code_projection(fresh)
-
-
-@api_router.delete('/distributor/codes/{code_id}')
-async def deactivate_discount_code(code_id: str, dist=Depends(get_current_distributor)):
-    """Desactiva un código (deja de dar descuento). No se borra, por historial."""
-    res = await db.discount_codes.update_one(
-        {'id': code_id, 'distributor_id': dist['id']}, {'$set': {'active': False}})
-    if not res.matched_count:
-        raise HTTPException(status_code=404, detail='Código no encontrado')
-    return {'id': code_id, 'active': False}
+@api_router.post('/distributor/codes/rotate')
+async def rotate_discount_codes(dist=Depends(get_current_distributor)):
+    """Renueva YA todos los códigos (nuevos textos). Los viejos dejan de servir."""
+    codes = await _ensure_distributor_codes(dist, force_rotate=True)
+    return {'rotated': True, 'codes': [_code_projection(c) for c in codes]}
 
 
 # ----------------- Admin: Invite customers -----------------
@@ -1580,6 +1587,10 @@ async def seed_demo(admin=Depends(get_current_admin), clear: bool = False):
         ('seed-rosa', 'Rosa Demo', 'seed-maria', 550000, ['reta'], 'confirmado', 2026, 7, 4),
     ]
     await db.orders.insert_many([_order(*s) for s in specs])
+    # Códigos de descuento AUTO por nivel para cada distribuidor demo.
+    await db.discount_codes.delete_many({'distributor_id': {'$in': [d['id'] for d in dist_docs]}})
+    for d in dist_docs:
+        await _ensure_distributor_codes(d)
     return {
         'distributors': await db.users.count_documents({'seed': True, 'role': 'distributor'}),
         'clients': await db.users.count_documents({'seed': True, 'role': 'user'}),
@@ -1621,6 +1632,7 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
         'created_at': now_iso(),
     }
     await db.users.insert_one(dist)
+    await _ensure_distributor_codes(dist)   # códigos AUTO por su nivel
     link = await _send_distributor_invitation(dist)
     sent = email_enabled()
     return {'id': dist['id'], 'name': dist['name'], 'email': dist['email'],

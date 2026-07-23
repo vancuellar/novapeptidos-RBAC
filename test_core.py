@@ -794,3 +794,16 @@ def test_discount_codes_differ_each_time():
 
 def test_discount_code_falls_back_prefix_when_no_letters():
     assert gen_discount_code('!!!', 0.20).startswith('DIST-20-')
+
+
+# ---------- Niveles de descuento auto por comisión ----------
+def test_discount_tiers_start_at_15_and_step_5_below_commission():
+    assert pyramid.discount_tiers_for(0.20) == [0.15]                          # Junior 0
+    assert pyramid.discount_tiers_for(0.25) == [0.15, 0.20]                    # Junior 1
+    assert pyramid.discount_tiers_for(0.30) == [0.15, 0.20, 0.25]             # Senior
+    assert pyramid.discount_tiers_for(0.35) == [0.15, 0.20, 0.25, 0.30]      # Master
+    assert pyramid.discount_tiers_for(0.40) == [0.15, 0.20, 0.25, 0.30, 0.35]  # Elite
+
+
+def test_discount_tiers_diamond_ends_at_38():
+    assert pyramid.discount_tiers_for(0.43) == [0.15, 0.20, 0.25, 0.30, 0.35, 0.38]
