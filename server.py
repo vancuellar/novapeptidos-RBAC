@@ -911,8 +911,24 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     def _is_hgh_net(item):
         key = f"{item.product_id} {item.name}".lower()
         return 'hgh' in key and 'fragment' not in key
+    # Tope de comisión y elegibilidad POR PRODUCTO (regla Christian 2026-07-23):
+    # si un producto no deja 5x neto, no participa del canal de distribuidores
+    # (ni descuento de código, ni promo, ni comisión) — solo venta directa.
+    _ids = [it.product_id for it in payload.items]
+    _pdocs = await db.products.find({'id': {'$in': _ids}},
+                                    {'_id': 0, 'id': 1, 'commission_cap': 1, 'distributor_eligible': 1}).to_list(500)
+    _pflags = {d['id']: d for d in _pdocs}
+
+    def _cap_of(item):
+        d = _pflags.get(item.product_id, {})
+        return max(0.0, min(0.50, float(d.get('commission_cap', 0.50) or 0.50)))
+
+    def _eligible(item):
+        d = _pflags.get(item.product_id, {})
+        return bool(d.get('distributor_eligible', True)) and not _is_hgh_net(item)
+
     discountable = sum(
-        item.price * item.quantity for item in payload.items if not _is_hgh_net(item)
+        item.price * item.quantity for item in payload.items if _eligible(item)
     )
     # Atribucion a distribuidor: SOLO si esta venta usa un codigo de distribuidor.
     # Regla de Christian (2026-07-22): si el cliente NO pone un codigo, la venta NO
@@ -937,7 +953,13 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         discount_rate = code_discount
     else:
         discount_rate = 0.15 if discountable >= 35000 else 0.10
-    discount = round(discountable * discount_rate)
+    if referrer:
+        # Un producto solo acepta el descuento del código si su tope lo aguanta.
+        _take = [it for it in payload.items if _eligible(it) and _cap_of(it) >= discount_rate]
+        _base_desc = sum(it.price * it.quantity for it in _take)
+        discount = round(_base_desc * discount_rate)
+    else:
+        discount = round(discountable * discount_rate)
     after_discount = subtotal - discount
     # Lealtad: el canje se limita al saldo real y a la mercancia (el envio va en dinero).
     points_used = 0
@@ -956,8 +978,30 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     commission = 0
     if referrer:
         upline = await _upline_chain(referrer)
-        commissions = pyramid.compute_commission_breakdown(
-            discountable, referrer, upline, discount_rate=discount_rate)
+        # El reparto se calcula POR TOPE de producto: descuento + comisiones
+        # nunca rebasan el tope (así la casa conserva su 5x).
+        groups = {}
+        for it in payload.items:
+            if not _eligible(it):
+                continue
+            cap = _cap_of(it)
+            amt = it.price * it.quantity
+            if cap >= discount_rate:
+                key = (round(max(0.0, cap - discount_rate), 4), discount_rate)
+            else:
+                key = (round(cap, 4), 0.0)   # sin descuento: el tope entero es comisión
+            groups[key] = groups.get(key, 0) + amt
+        merged = {}
+        for (allowed, disc), amount in groups.items():
+            rows = pyramid.compute_commission_breakdown(amount, referrer, upline, discount_rate=disc)
+            rows = pyramid.cap_breakdown(rows, amount, allowed)
+            for r in rows:
+                k = (r['distributor_id'], r.get('role'))
+                if k in merged:
+                    merged[k]['amount'] += r['amount']
+                else:
+                    merged[k] = dict(r)
+        commissions = list(merged.values())
         commission = pyramid.seller_amount(commissions)
     order = Order(
         order_number=gen_order_number(),

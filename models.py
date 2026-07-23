@@ -101,6 +101,10 @@ class ProductBase(BaseModel):
     storage: str = 'Conservar a -20 C, protegido de la luz.'
     featured: bool = False
     is_new: bool = False
+    # Tope de comisión por producto (escalera ROI de la maestra) y si el producto
+    # puede venderse por distribuidores. Si no deja 5x neto: SOLO venta directa.
+    commission_cap: float = 0.50
+    distributor_eligible: bool = True
 
 
 class ProductCreate(ProductBase):
@@ -114,6 +118,8 @@ class Product(ProductBase):
 
 
 class ProductUpdate(BaseModel):
+    commission_cap: Optional[float] = None
+    distributor_eligible: Optional[bool] = None
     name: Optional[str] = None
     slug: Optional[str] = None
     category: Optional[str] = None

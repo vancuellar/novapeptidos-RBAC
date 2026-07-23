@@ -842,3 +842,31 @@ def test_parse_range_header_variants():
     assert parse_range_header('bytes=900-100', 1000) is None        # rango invertido
     assert parse_range_header('bytes=1000-', 1000) is None          # fuera de rango
     assert parse_range_header('chars=0-99', 1000) is None           # unidad desconocida
+
+
+# ---------- Tope de comisión por producto (regla 2026-07-23) ----------
+from pyramid import cap_breakdown
+
+
+def test_cap_breakdown_scales_when_over_cap():
+    rows = [
+        {'distributor_id': 'a', 'role': 'seller', 'amount': 300},
+        {'distributor_id': 'b', 'role': 'upline', 'amount': 100},
+    ]
+    # tope 20% de $1,000 = $200; se pedían $400 → todos a la mitad
+    out = cap_breakdown(rows, 1000, 0.20)
+    assert sum(r['amount'] for r in out) == 200
+    assert out[0]['amount'] == 150 and out[1]['amount'] == 50   # prorrata
+    assert all(r.get('capped') for r in out)
+
+
+def test_cap_breakdown_leaves_room_untouched():
+    rows = [{'distributor_id': 'a', 'role': 'seller', 'amount': 100}]
+    out = cap_breakdown(rows, 1000, 0.20)                        # tope $200, pedían $100
+    assert out[0]['amount'] == 100 and 'capped' not in out[0]    # no se toca
+
+
+def test_cap_breakdown_zero_cap_pays_nothing():
+    rows = [{'distributor_id': 'a', 'role': 'seller', 'amount': 100}]
+    out = cap_breakdown(rows, 1000, 0.0)
+    assert sum(r['amount'] for r in out) == 0

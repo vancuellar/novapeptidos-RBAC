@@ -193,3 +193,25 @@ def level_progress(tier, personal_sales, team_sales, active_recruits):
         'qualifies': sales['done'] and recruits['done'],
         'manual': step['manual'],   # diamond requiere aprobación a mano
     }
+
+
+def cap_breakdown(rows, merchandise, cap_rate):
+    """Escala TODO el reparto para que la suma no pase de cap_rate*merchandise.
+
+    Regla de Christian (2026-07-23): cada producto aguanta una comisión máxima
+    (escalera por ROI, guardada en el producto). Si la estructura de pirámide
+    pide más, todos los participantes se reparten el tope a prorrata."""
+    if not rows or merchandise <= 0:
+        return rows
+    tope = max(0.0, float(cap_rate)) * float(merchandise)
+    total = sum(r.get('amount', 0) for r in rows)
+    if total <= tope or total <= 0:
+        return rows
+    escala = tope / total
+    out = []
+    for r in rows:
+        r = dict(r)
+        r['amount'] = round(r['amount'] * escala)
+        r['capped'] = True
+        out.append(r)
+    return out
