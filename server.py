@@ -2658,7 +2658,91 @@ async def shutdown_db_client():
     client.close()
 
 
+# ---------- Videos de tutoriales (solo miembros con sesion) ----------
+from pathlib import Path as _Path
+
+TUTORIAL_DIR = _Path(__file__).parent / 'tutorial_videos'
+# Los videos del panel de distribuidor no se sirven a clientes.
+TUTORIAL_DIST_ONLY = {
+    'tutorial-1-panel-distribuidor.mp4',
+    'tutorial-2-mis-codigos.mp4',
+    'tutorial-3-mis-clientes.mp4',
+    'tutorial-4-pedidos-y-ventas.mp4',
+    'tutorial-5-novedades.mp4',
+}
+
+
+def tutorial_allowed(filename: str, role: str) -> bool:
+    """Un cliente solo ve videos de cliente; distribuidor/admin ven todo."""
+    if filename in TUTORIAL_DIST_ONLY:
+        return role in ('distributor', 'admin')
+    return True
+
+
+def parse_range_header(header, file_size: int):
+    """Devuelve (inicio, fin) inclusivos para un header Range, o None si no aplica.
+
+    Safari exige respuestas 206 para <video>; starlette 0.37 no trae soporte
+    de rangos en FileResponse, asi que lo resolvemos aqui.
+    """
+    if not header or not header.startswith('bytes=') or file_size <= 0:
+        return None
+    spec = header[6:].split(',')[0].strip()
+    if '-' not in spec:
+        return None
+    start_s, _, end_s = spec.partition('-')
+    try:
+        if start_s == '':
+            n = int(end_s)
+            if n <= 0:
+                return None
+            start, end = max(0, file_size - n), file_size - 1
+        else:
+            start = int(start_s)
+            end = int(end_s) if end_s else file_size - 1
+    except ValueError:
+        return None
+    if start > end or start >= file_size:
+        return None
+    return start, min(end, file_size - 1)
+
+
+@api_router.get('/tutorials/{filename}')
+async def tutorial_video(filename: str, request: Request, token: str = Query(...)):
+    # El token viaja como query porque la etiqueta <video> no manda headers.
+    import jwt as _jwt
+    from auth import JWT_SECRET, JWT_ALGORITHM
+    try:
+        payload = _jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get('sub')
+    except Exception:
+        raise HTTPException(status_code=401, detail='No autenticado')
+    user = await db.users.find_one({'id': user_id}, {'_id': 0, 'role': 1, 'blocked': 1})
+    if not user or user.get('blocked'):
+        raise HTTPException(status_code=401, detail='No autenticado')
+    if '/' in filename or '..' in filename or not filename.endswith('.mp4'):
+        raise HTTPException(status_code=404, detail='No encontrado')
+    if not tutorial_allowed(filename, user.get('role', 'client')):
+        raise HTTPException(status_code=403, detail='Solo para distribuidores')
+    path = TUTORIAL_DIR / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail='No encontrado')
+    size = path.stat().st_size
+    headers = {'Accept-Ranges': 'bytes', 'Cache-Control': 'private, max-age=3600'}
+    rng = parse_range_header(request.headers.get('range'), size)
+    if rng is None:
+        return FileResponse(path, media_type='video/mp4', headers=headers)
+    start, end = rng
+    with open(path, 'rb') as f:
+        f.seek(start)
+        chunk = f.read(end - start + 1)
+    headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+    from starlette.responses import Response as _Response
+    return _Response(content=chunk, status_code=206, media_type='video/mp4', headers=headers)
+
+
 app.include_router(api_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,

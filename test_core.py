@@ -817,3 +817,28 @@ def test_notification_audience_by_role():
     assert _audience_for_role('user') == ['all', 'clients']
     assert _audience_for_role('distributor') == ['all', 'distributors']
     assert set(_audience_for_role('admin')) == {'all', 'clients', 'distributors'}
+
+
+# ---------- Videos de tutoriales protegidos ----------
+from server import tutorial_allowed, parse_range_header
+
+
+def test_tutorial_videos_role_gating():
+    dist_video = 'tutorial-2-mis-codigos.mp4'
+    client_video = 'tutorial-9-calculadora.mp4'
+    assert not tutorial_allowed(dist_video, 'client')      # cliente NO ve lo de distribuidor
+    assert tutorial_allowed(dist_video, 'distributor')
+    assert tutorial_allowed(dist_video, 'admin')
+    for role in ('client', 'distributor', 'admin'):
+        assert tutorial_allowed(client_video, role)        # lo de cliente lo ven todos
+
+
+def test_parse_range_header_variants():
+    assert parse_range_header('bytes=0-99', 1000) == (0, 99)
+    assert parse_range_header('bytes=200-', 1000) == (200, 999)     # abierto al final
+    assert parse_range_header('bytes=-100', 1000) == (900, 999)     # sufijo (ultimos N)
+    assert parse_range_header('bytes=0-5000', 1000) == (0, 999)     # se recorta al tamano
+    assert parse_range_header(None, 1000) is None                   # sin header → archivo completo
+    assert parse_range_header('bytes=900-100', 1000) is None        # rango invertido
+    assert parse_range_header('bytes=1000-', 1000) is None          # fuera de rango
+    assert parse_range_header('chars=0-99', 1000) is None           # unidad desconocida
