@@ -237,6 +237,13 @@ class DistributorCreate(BaseModel):
     upline_id: Optional[str] = None        # distribuidor que lo trajo (para las sobrecomisiones)
 
 
+class DiscountCodeCreate(BaseModel):
+    # El distribuidor crea VARIOS códigos y elige cuál da a cada cliente. El
+    # descuento va de 0 hasta su comisión de nivel (el servidor lo acota).
+    label: str = ''
+    discount_rate: float = 0.0             # 0..su comisión de nivel
+
+
 # ---------- Protocolos (seguimiento de consumo / recompra) ----------
 class ProtocolInput(BaseModel):
     """Lo que el cliente registra para que calculemos cuándo se le acaba el vial.

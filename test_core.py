@@ -772,3 +772,25 @@ def test_diamond_qualifies_needs_50m_and_more_than_32():
     assert pyramid.diamond_qualifies(50000000, 32) is False    # debe ser MÁS de 32
     assert pyramid.diamond_qualifies(49999999, 40) is False    # y $50M de equipo
     assert pyramid.diamond_qualifies(60000000, 40) is True
+
+
+# ---------- Códigos de descuento (opacos, no adivinables) ----------
+from server import gen_discount_code
+
+
+def test_discount_code_is_opaque_with_random_suffix():
+    import re
+    c = gen_discount_code('Maria Lopez', 0.25)
+    assert re.fullmatch(r'MARIAL-25-[A-Z0-9]{4}', c), c   # PREFIJO-PCT-XXXX opaco
+    parts = c.split('-')
+    assert parts[0] == 'MARIAL' and parts[1] == '25' and len(parts[2]) == 4
+
+
+def test_discount_codes_differ_each_time():
+    a = gen_discount_code('Ana', 0.15)
+    b = gen_discount_code('Ana', 0.15)
+    assert a != b                            # el sufijo al azar los hace únicos
+
+
+def test_discount_code_falls_back_prefix_when_no_letters():
+    assert gen_discount_code('!!!', 0.20).startswith('DIST-20-')

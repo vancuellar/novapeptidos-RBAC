@@ -6,6 +6,7 @@ import base64
 import logging
 import uuid
 import random
+import string
 import re
 import json
 from datetime import datetime, timezone
@@ -19,7 +20,7 @@ from models import (
     OrderCreate, Order, OrderStatusUpdate, OrderShippingUpdate,
     ProtocolInput, ProtocolUpdate, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput,
-    ChatInput, DistributorCreate, GoogleAuthInput, now_iso,
+    ChatInput, DistributorCreate, DiscountCodeCreate, GoogleAuthInput, now_iso,
 )
 from auth import (
     hash_password, verify_password, create_token,
@@ -89,6 +90,42 @@ async def resolve_distributor(code):
     if not code:
         return None
     return await db.users.find_one({'distributor_code': code, 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
+
+
+# ----------------- Códigos de descuento (varios por distribuidor) -----------------
+CODE_TTL_DAYS = 90   # rotación: los códigos caducan a los 90 días (decisión Christian)
+
+
+def gen_discount_code(name, pct):
+    """Código OPAQUE, no adivinable: PREFIJO-PCT-XXXX (parte al azar). El % en el
+    texto es informativo; el descuento real SIEMPRE sale del valor guardado."""
+    allowed = string.ascii_uppercase + string.digits
+    base = ''.join(c for c in (name or '').upper() if c in allowed)[:6] or 'DIST'
+    rand = ''.join(random.choices(allowed, k=4))
+    return f'{base}-{int(round((pct or 0) * 100))}-{rand}'
+
+
+async def _resolve_code(code):
+    """Resuelve un código a (distribuidor, descuento). Busca primero en los códigos
+    múltiples (activos y no caducados); si no, cae al código único legacy del
+    distribuidor. El descuento se ACOTA a la comisión del nivel. Devuelve (None, 0)
+    si no aplica. Nunca calcula el descuento del texto del código."""
+    if not code:
+        return None, 0.0
+    c = code.strip().upper()
+    doc = await db.discount_codes.find_one({'code': c, 'active': True})
+    if doc:
+        if doc.get('expires_at') and doc['expires_at'] < now_iso():
+            return None, 0.0   # caducado
+        dist = await db.users.find_one({'id': doc['distributor_id'], 'role': 'distributor'},
+                                       {'_id': 0, 'password_hash': 0})
+        if dist:
+            return dist, max(0.0, min(pyramid.tier_rate(dist.get('tier')), doc.get('discount_rate', 0)))
+    dist = await db.users.find_one({'distributor_code': c, 'role': 'distributor'},
+                                   {'_id': 0, 'password_hash': 0})
+    if dist:
+        return dist, max(0.0, min(pyramid.tier_rate(dist.get('tier')), dist.get('customer_discount_rate', 0)))
+    return None, 0.0
 
 
 async def _upline_chain(dist, levels=len(pyramid.TIER_ORDER)):
@@ -847,14 +884,12 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # cuenta para ningun distribuidor — aunque ese cliente haya comprado antes con
     # el codigo de alguien. El vinculo 'referred_by' del usuario NO genera comision
     # por si solo; cada orden se atribuye por el codigo usado en ESA compra.
-    referrer = await resolve_distributor(payload.distributor_code)
-    # Descuento (modelo pirámide 2026-07-23): si se usa un CÓDIGO de distribuidor,
-    # el descuento lo pone él (0..su comisión de nivel) y sale de SU tajada — no se
-    # acumula con la promo automática. Sin código = venta directa con la promo
-    # automática por volumen (la paga la casa), sin comisión.
+    # El código puede ser uno de los VARIOS del distribuidor (con su propio
+    # descuento) o su código legacy. El descuento sale del código, acotado a su
+    # comisión de nivel, y de SU tajada. Sin código = promo automática (la casa).
+    referrer, code_discount = await _resolve_code(payload.distributor_code)
     if referrer:
-        discount_rate = max(0.0, min(pyramid.tier_rate(referrer.get('tier')),
-                                     referrer.get('customer_discount_rate', 0) or 0))
+        discount_rate = code_discount
     else:
         discount_rate = 0.15 if discountable >= 35000 else 0.10
     discount = round(discountable * discount_rate)
@@ -1273,10 +1308,75 @@ async def admin_analytics(admin=Depends(get_current_admin)):
 @api_router.get('/discount-code/{code}')
 async def check_discount_code(code: str):
     """Publico: valida un codigo y devuelve SOLO el % de descuento (nada personal)."""
-    dist = await resolve_distributor(code.strip().upper())
+    dist, discount = await _resolve_code(code)
     if not dist:
         raise HTTPException(status_code=404, detail='Codigo no valido')
-    return {'code': dist['distributor_code'], 'discount_rate': dist.get('customer_discount_rate', 0)}
+    return {'code': code.strip().upper(), 'discount_rate': discount}
+
+
+# ----------------- Distribuidor: sus códigos de descuento -----------------
+def _code_projection(doc):
+    return {
+        'id': doc['id'], 'code': doc['code'], 'label': doc.get('label', ''),
+        'discount_rate': doc.get('discount_rate', 0), 'active': doc.get('active', True),
+        'created_at': doc.get('created_at'), 'expires_at': doc.get('expires_at'),
+        'expired': bool(doc.get('expires_at') and doc['expires_at'] < now_iso()),
+    }
+
+
+@api_router.get('/distributor/codes')
+async def list_discount_codes(dist=Depends(get_current_distributor)):
+    """Los códigos del distribuidor, con su % y caducidad (rotan a 90 días)."""
+    codes = await db.discount_codes.find({'distributor_id': dist['id']}, {'_id': 0}).to_list(200)
+    codes.sort(key=lambda c: c.get('created_at', ''), reverse=True)
+    return {'max_discount': pyramid.tier_rate(dist.get('tier')),
+            'codes': [_code_projection(c) for c in codes]}
+
+
+@api_router.post('/distributor/codes')
+async def create_discount_code(payload: DiscountCodeCreate, dist=Depends(get_current_distributor)):
+    """Crea un código nuevo. El descuento se acota a la comisión del nivel."""
+    cap = pyramid.tier_rate(dist.get('tier'))
+    rate = max(0.0, min(cap, float(payload.discount_rate or 0)))
+    code = gen_discount_code(dist.get('name'), rate)
+    while await db.discount_codes.find_one({'code': code}):
+        code = gen_discount_code(dist.get('name'), rate)
+    doc = {
+        'id': str(uuid.uuid4()), 'distributor_id': dist['id'], 'code': code,
+        'label': str(payload.label or '')[:60], 'discount_rate': rate, 'active': True,
+        'created_at': now_iso(),
+        'expires_at': (datetime.now(timezone.utc) + timedelta(days=CODE_TTL_DAYS)).isoformat(),
+    }
+    await db.discount_codes.insert_one(doc)
+    return _code_projection(doc)
+
+
+@api_router.post('/distributor/codes/{code_id}/renew')
+async def renew_discount_code(code_id: str, dist=Depends(get_current_distributor)):
+    """Rota el código: nuevo texto (mismo % y etiqueta) y caducidad reiniciada.
+    El texto viejo deja de servir → un código filtrado no dura para siempre."""
+    doc = await db.discount_codes.find_one({'id': code_id, 'distributor_id': dist['id']})
+    if not doc:
+        raise HTTPException(status_code=404, detail='Código no encontrado')
+    new_code = gen_discount_code(dist.get('name'), doc.get('discount_rate', 0))
+    while await db.discount_codes.find_one({'code': new_code}):
+        new_code = gen_discount_code(dist.get('name'), doc.get('discount_rate', 0))
+    await db.discount_codes.update_one({'id': code_id}, {'$set': {
+        'code': new_code, 'active': True, 'created_at': now_iso(),
+        'expires_at': (datetime.now(timezone.utc) + timedelta(days=CODE_TTL_DAYS)).isoformat(),
+    }})
+    fresh = await db.discount_codes.find_one({'id': code_id}, {'_id': 0})
+    return _code_projection(fresh)
+
+
+@api_router.delete('/distributor/codes/{code_id}')
+async def deactivate_discount_code(code_id: str, dist=Depends(get_current_distributor)):
+    """Desactiva un código (deja de dar descuento). No se borra, por historial."""
+    res = await db.discount_codes.update_one(
+        {'id': code_id, 'distributor_id': dist['id']}, {'$set': {'active': False}})
+    if not res.matched_count:
+        raise HTTPException(status_code=404, detail='Código no encontrado')
+    return {'id': code_id, 'active': False}
 
 
 # ----------------- Admin: Invite customers -----------------
