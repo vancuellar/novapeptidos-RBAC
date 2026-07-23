@@ -620,133 +620,147 @@ def test_payment_confirmed_email_renders(monkeypatch):
 import pyramid
 
 
-def test_pyramid_junior_sale_splits_seller_and_two_uplines():
-    # Vende Junior (22.5%). Su Senior arriba (3.5%) y el Master de ese Senior (3.5%).
-    jr = {'id': 'jr', 'tier': 'junior'}
-    sr = {'id': 'sr', 'tier': 'senior'}
-    ma = {'id': 'ma', 'tier': 'master'}
-    b = pyramid.compute_commission_breakdown(10000, jr, [sr, ma])
+def test_pyramid_tier_rates_are_the_six_levels():
+    assert pyramid.tier_rate('junior0') == 0.20
+    assert pyramid.tier_rate('junior1') == 0.25
+    assert pyramid.tier_rate('senior') == 0.30
+    assert pyramid.tier_rate('master') == 0.35
+    assert pyramid.tier_rate('elite') == 0.40
+    assert pyramid.tier_rate('diamond') == 0.45
+
+
+def test_pyramid_differential_total_equals_top_tier():
+    # Vende junior0 (20). Senior arriba (30) y Elite (40): diferenciales 10 y 10.
+    j = {'id': 'j', 'tier': 'junior0'}
+    s = {'id': 's', 'tier': 'senior'}
+    e = {'id': 'e', 'tier': 'elite'}
+    b = pyramid.compute_commission_breakdown(10000, j, [s, e])
     amounts = {r['distributor_id']: r['amount'] for r in b}
-    assert amounts == {'jr': 2250, 'sr': 350, 'ma': 350}   # 22.5 + 3.5 + 3.5
-    assert pyramid.seller_amount(b) == 2250
-    assert pyramid.total_amount(b) == 2950                  # 29.5% total
+    assert amounts == {'j': 2000, 's': 1000, 'e': 1000}   # 20 + 10 + 10
+    assert pyramid.total_amount(b) == 4000                 # 40% total = tasa del más alto
 
 
-def test_pyramid_senior_sale_pays_only_one_upline():
-    sr = {'id': 'sr', 'tier': 'senior'}
-    ma = {'id': 'ma', 'tier': 'master'}
-    b = pyramid.compute_commission_breakdown(10000, sr, [ma])
+def test_pyramid_adjacent_levels_split_by_the_gap():
+    j1 = {'id': 'j1', 'tier': 'junior1'}      # 25
+    se = {'id': 'se', 'tier': 'senior'}        # 30
+    ma = {'id': 'ma', 'tier': 'master'}        # 35
+    b = pyramid.compute_commission_breakdown(10000, j1, [se, ma])
     amounts = {r['distributor_id']: r['amount'] for r in b}
-    assert amounts == {'sr': 2600, 'ma': 350}              # 26 + 3.5 = 29.5
+    assert amounts == {'j1': 2500, 'se': 500, 'ma': 500}   # 25 + 5 + 5 = 35
 
 
-def test_pyramid_master_sale_keeps_the_whole_bag():
+def test_pyramid_skipped_level_is_absorbed_by_the_one_above():
+    # junior0 (20) con un Master (35) directo arriba, sin nadie en medio:
+    # el Master absorbe todo el hueco → 15%. Total 35.
+    j = {'id': 'j', 'tier': 'junior0'}
     ma = {'id': 'ma', 'tier': 'master'}
-    b = pyramid.compute_commission_breakdown(10000, ma, [])
-    assert pyramid.total_amount(b) == 3000                 # 30%, sin nadie arriba
+    b = pyramid.compute_commission_breakdown(10000, j, [ma])
+    amounts = {r['distributor_id']: r['amount'] for r in b}
+    assert amounts == {'j': 2000, 'ma': 1500}              # 20 + 15 = 35
+    assert pyramid.total_amount(b) == 3500
 
 
-def test_pyramid_founding_master_rate_overrides_tier():
-    founder = {'id': 'f', 'tier': 'master', 'commission_rate': 0.40}
-    b = pyramid.compute_commission_breakdown(10000, founder, [])
-    assert pyramid.seller_amount(b) == 4000                # 40% explícito manda
+def test_pyramid_lower_upline_earns_nothing():
+    # Un upline de MENOR nivel que alguien debajo no cobra (diferencial negativo).
+    ma = {'id': 'ma', 'tier': 'master'}        # vende Master 35
+    j = {'id': 'j', 'tier': 'junior0'}          # arriba un junior0 20 (raro pero posible)
+    b = pyramid.compute_commission_breakdown(10000, ma, [j])
+    assert [r['distributor_id'] for r in b] == ['ma']       # el junior0 no cobra
+    assert pyramid.total_amount(b) == 3500
 
 
-def test_pyramid_junior_without_upline_leaves_rest_to_house():
-    # Un Junior directo de un Master (sin Senior en medio): 22.5 + 3.5, el otro
-    # 3.5 se queda con la casa (no se reparte).
-    jr = {'id': 'jr', 'tier': 'junior'}
+def test_pyramid_discount_comes_out_of_seller_slice_only():
+    # Senior (30) da 15% de descuento: se queda 15; el Master arriba cobra su 5 intacto.
+    se = {'id': 'se', 'tier': 'senior'}
     ma = {'id': 'ma', 'tier': 'master'}
-    b = pyramid.compute_commission_breakdown(10000, jr, [ma])
-    assert pyramid.total_amount(b) == 2600                 # 22.5 + 3.5, no hay 2do nivel
+    b = pyramid.compute_commission_breakdown(10000, se, [ma], discount_rate=0.15)
+    amounts = {r['distributor_id']: r['amount'] for r in b}
+    assert amounts == {'se': 1500, 'ma': 500}              # (30-15)=15 y 5 intacto
+    # El cliente recibió 15% (1500); total que da el negocio sigue siendo 35%.
+    assert 1500 + pyramid.total_amount(b) == 3500
 
 
-def test_pyramid_caps_override_levels_at_two():
-    jr = {'id': 'jr', 'tier': 'junior'}
-    chain = [{'id': 'u1'}, {'id': 'u2'}, {'id': 'u3'}]     # 3 niveles arriba
-    b = pyramid.compute_commission_breakdown(10000, jr, chain)
-    ids = [r['distributor_id'] for r in b]
-    assert ids == ['jr', 'u1', 'u2']                        # u3 no cobra (máx 2)
+def test_pyramid_discount_capped_at_sellers_rate():
+    j = {'id': 'j', 'tier': 'junior0'}         # 20
+    b = pyramid.compute_commission_breakdown(10000, j, [], discount_rate=0.50)
+    assert b[0]['discount'] == 0.20 and b[0]['amount'] == 0   # no puede dar más de su 20
+
+
+def test_pyramid_max_discount_equals_commission():
+    assert pyramid.max_discount('elite') == 0.40
+    assert pyramid.max_discount('junior0') == 0.20
 
 
 def test_pyramid_never_pays_the_same_distributor_twice():
-    jr = {'id': 'jr', 'tier': 'junior'}
-    b = pyramid.compute_commission_breakdown(10000, jr, [jr, {'id': 'sr'}])
-    ids = [r['distributor_id'] for r in b]
-    assert ids == ['jr', 'sr']                              # el vendedor no se auto-paga arriba
+    j = {'id': 'j', 'tier': 'junior0'}
+    b = pyramid.compute_commission_breakdown(10000, j, [j, {'id': 's', 'tier': 'senior'}])
+    assert [r['distributor_id'] for r in b] == ['j', 's']
 
 
 def test_pyramid_earnings_for_sums_seller_and_override_roles():
     orders = [
         {'status': 'entregado', 'commissions': [
-            {'distributor_id': 'jr', 'role': 'seller', 'amount': 2250},
-            {'distributor_id': 'sr', 'role': 'override', 'amount': 350},
-        ]},
+            {'distributor_id': 'j', 'role': 'seller', 'amount': 2000},
+            {'distributor_id': 's', 'role': 'override', 'amount': 1000}]},
         {'status': 'entregado', 'commissions': [
-            {'distributor_id': 'sr', 'role': 'seller', 'amount': 2600},
-        ]},
+            {'distributor_id': 's', 'role': 'seller', 'amount': 3000}]},
         {'status': 'cancelado', 'commissions': [
-            {'distributor_id': 'sr', 'role': 'seller', 'amount': 9999},
-        ]},
+            {'distributor_id': 's', 'role': 'seller', 'amount': 9999}]},
     ]
-    assert pyramid.earnings_for('sr', orders) == 350 + 2600   # cancelada no cuenta
-    assert pyramid.earnings_for('jr', orders) == 2250
+    assert pyramid.earnings_for('s', orders) == 1000 + 3000
+    assert pyramid.earnings_for('j', orders) == 2000
 
 
 def test_pyramid_earnings_for_reads_legacy_commission_field():
-    # Órdenes viejas sin `commissions`: cuenta `commission` si fue su venta directa.
     orders = [{'status': 'entregado', 'referred_by': 'd1', 'commission': 500}]
     assert pyramid.earnings_for('d1', orders) == 500
     assert pyramid.earnings_for('otro', orders) == 0
 
 
 def test_pyramid_zero_merchandise_pays_nothing():
-    assert pyramid.compute_commission_breakdown(0, {'id': 'x', 'tier': 'master'}, []) == []
+    assert pyramid.compute_commission_breakdown(0, {'id': 'x', 'tier': 'elite'}, []) == []
 
 
 def test_distributor_rollup_counts_override_earnings():
-    # Un Master gana su venta directa + sobrecomisión de la venta de su Junior.
     ma = {'id': 'ma', 'name': 'M', 'email': 'm@x', 'tier': 'master'}
     orders = [
         {'referred_by': 'ma', 'status': 'entregado', 'total': 5000, 'commissions': [
             {'distributor_id': 'ma', 'role': 'seller', 'amount': 1500}]},
-        {'referred_by': 'jr', 'status': 'entregado', 'total': 10000, 'commissions': [
-            {'distributor_id': 'jr', 'role': 'seller', 'amount': 2250},
-            {'distributor_id': 'ma', 'role': 'override', 'amount': 350}]},
+        {'referred_by': 'j', 'status': 'entregado', 'total': 10000, 'commissions': [
+            {'distributor_id': 'j', 'role': 'seller', 'amount': 2000},
+            {'distributor_id': 'ma', 'role': 'override', 'amount': 500}]},
     ]
     r = _distributor_rollup(ma, [], orders)
-    assert r['sales_count'] == 1          # solo su venta directa cuenta como VENTA
-    assert r['sales_total'] == 5000
-    assert r['earnings'] == 1850          # 1500 venta propia + 350 sobrecomisión
+    assert r['sales_count'] == 1 and r['sales_total'] == 5000
+    assert r['earnings'] == 2000          # 1500 propia + 500 sobrecomisión
     assert r['tier'] == 'master'
 
 
-# ---------- Pirámide: barra de nivel ----------
-def test_level_progress_junior_toward_senior():
-    lp = pyramid.level_progress('junior', 30000)
-    assert lp['current'] == 'junior' and lp['next'] == 'senior' and lp['kind'] == 'promotion'
-    assert lp['target'] == 100000 and lp['remaining'] == 70000
-    assert abs(lp['progress'] - 0.30) < 1e-9
+# ---------- Pirámide: barra de nivel (ventas + reclutas) ----------
+def test_level_progress_two_bars_sales_and_recruits():
+    lp = pyramid.level_progress('junior0', personal_sales=250000, team_sales=250000, active_recruits=1)
+    assert lp['next'] == 'junior1' and lp['kind'] == 'promotion'
+    assert lp['sales']['target'] == 500000 and abs(lp['sales']['progress'] - 0.5) < 1e-9
+    assert lp['recruits']['target'] == 2 and lp['recruits']['value'] == 1
+    assert lp['qualifies'] is False        # ventas a medias y falta 1 recluta
 
 
-def test_level_progress_senior_toward_master():
-    lp = pyramid.level_progress('senior', 250000)
-    assert lp['next'] == 'master' and lp['target'] == 500000 and lp['remaining'] == 250000
-    assert abs(lp['progress'] - 0.5) < 1e-9
+def test_level_progress_qualifies_when_both_met():
+    lp = pyramid.level_progress('junior1', personal_sales=3000000, team_sales=3000000, active_recruits=4)
+    assert lp['next'] == 'senior' and lp['qualifies'] is True
 
 
-def test_level_progress_master_at_cap_is_maxed():
-    lp = pyramid.level_progress('master', 999999, 0.40)
-    assert lp['kind'] == 'maxed' and lp['next'] is None and lp['progress'] == 1.0
+def test_level_progress_senior_uses_team_sales():
+    lp = pyramid.level_progress('senior', personal_sales=0, team_sales=10000000, active_recruits=8)
+    assert lp['sales']['basis'] == 'team' and lp['sales']['done'] is True
+    assert lp['recruits']['target'] == 8 and lp['qualifies'] is True
 
 
-def test_level_progress_master_below_cap_steps_by_half_point():
-    lp = pyramid.level_progress('master', 600000, 0.30)
-    assert lp['kind'] == 'rate_step' and lp['rate'] == 0.30 and lp['next_rate'] == 0.305
-    assert lp['remaining'] == 400000        # 600k → dentro del 2do bloque, faltan 400k
-    assert abs(lp['progress'] - 0.2) < 1e-9
+def test_level_progress_diamond_is_top_no_next():
+    lp = pyramid.level_progress('diamond', 0, 0, 0)
+    assert lp['kind'] == 'top' and lp['next'] is None and lp['rate'] == 0.45
 
 
-def test_level_progress_never_exceeds_full_bar():
-    lp = pyramid.level_progress('junior', 999999)
-    assert lp['progress'] == 1.0 and lp['remaining'] == 0.0
+def test_level_progress_elite_to_diamond_is_manual():
+    lp = pyramid.level_progress('elite', personal_sales=0, team_sales=100000000, active_recruits=32)
+    assert lp['next'] == 'diamond' and lp['manual'] is True and lp['qualifies'] is True

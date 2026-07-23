@@ -91,9 +91,10 @@ async def resolve_distributor(code):
     return await db.users.find_one({'distributor_code': code, 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
 
 
-async def _upline_chain(dist, levels=pyramid.MAX_OVERRIDE_LEVELS):
+async def _upline_chain(dist, levels=len(pyramid.TIER_ORDER)):
     """Sube por el árbol de la pirámide desde `dist`: devuelve sus uplines
-    (distribuidores) del más cercano al más lejano, hasta `levels`. Corta ciclos."""
+    (distribuidores) del más cercano al más lejano. El override diferencial sube
+    toda la cadena (el total nunca pasa de la tasa más alta). Corta ciclos."""
     chain = []
     seen = {dist['id']}
     current = dist
@@ -108,6 +109,39 @@ async def _upline_chain(dist, levels=pyramid.MAX_OVERRIDE_LEVELS):
         seen.add(up_id)
         current = up
     return chain
+
+
+async def _downline_stats(dist_id):
+    """Estadísticas de la RED (downline) de un distribuidor, para la barra de nivel:
+    - active_recruits: distribuidores en su red con ≥1 venta propia (no cancelada).
+    - team_sales: ventas propias del distribuidor + de toda su red.
+    Recorre el árbol por upline_id (BFS), corta ciclos."""
+    dists = await db.users.find({'role': 'distributor'}, {'_id': 0, 'id': 1, 'upline_id': 1}).to_list(5000)
+    children = {}
+    for d in dists:
+        children.setdefault(d.get('upline_id'), []).append(d['id'])
+    # BFS: todos los descendientes
+    network, queue, seen = [], list(children.get(dist_id, [])), set()
+    while queue:
+        nid = queue.pop()
+        if nid in seen:
+            continue
+        seen.add(nid)
+        network.append(nid)
+        queue.extend(children.get(nid, []))
+    # Ventas propias (no canceladas) por distribuidor, en un solo paso
+    ids = network + [dist_id]
+    rows = await db.orders.find(
+        {'referred_by': {'$in': ids}, 'status': {'$ne': 'cancelado'}},
+        {'_id': 0, 'referred_by': 1, 'total': 1},
+    ).to_list(20000)
+    sales_by = {}
+    for o in rows:
+        sales_by[o['referred_by']] = sales_by.get(o['referred_by'], 0) + o.get('total', 0)
+    active_recruits = sum(1 for nid in network if sales_by.get(nid, 0) > 0)
+    team_sales = sum(sales_by.values())
+    return {'active_recruits': active_recruits, 'team_sales': team_sales,
+            'personal_sales': sales_by.get(dist_id, 0), 'network_size': len(network)}
 
 
 # ----------------- Health -----------------
@@ -814,12 +848,15 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # el codigo de alguien. El vinculo 'referred_by' del usuario NO genera comision
     # por si solo; cada orden se atribuye por el codigo usado en ESA compra.
     referrer = await resolve_distributor(payload.distributor_code)
-    # Descuento: automatico por volumen (10% base, 15% desde $35,000 — Christian
-    # quitó el 20% el 2026-07-21 para no competir con sus distribuidores) O el
-    # del codigo del distribuidor — NUNCA se acumulan; aplica el MAYOR. Manda el servidor.
-    auto_rate = 0.15 if discountable >= 35000 else 0.10
-    code_rate = referrer.get('customer_discount_rate', 0) if referrer else 0
-    discount_rate = max(auto_rate, code_rate)
+    # Descuento (modelo pirámide 2026-07-23): si se usa un CÓDIGO de distribuidor,
+    # el descuento lo pone él (0..su comisión de nivel) y sale de SU tajada — no se
+    # acumula con la promo automática. Sin código = venta directa con la promo
+    # automática por volumen (la paga la casa), sin comisión.
+    if referrer:
+        discount_rate = max(0.0, min(pyramid.tier_rate(referrer.get('tier')),
+                                     referrer.get('customer_discount_rate', 0) or 0))
+    else:
+        discount_rate = 0.15 if discountable >= 35000 else 0.10
     discount = round(discountable * discount_rate)
     after_discount = subtotal - discount
     # Lealtad: el canje se limita al saldo real y a la mercancia (el envio va en dinero).
@@ -832,13 +869,15 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     shipping = payload.shipping if payload.shipping else 0   # el envio se cotiza por separado
     total = paid_merchandise + shipping
     points_earned = loyalty.earn(paid_merchandise, user is not None and loyalty.eligible(user))
-    # Pirámide: el vendedor gana su tasa y cada upline (hasta 2) su 3.5% fijo. Se
-    # bloquea en pesos al crear la orden; los reportes suman lo guardado.
+    # Pirámide: el vendedor gana (su tasa − el descuento que dio) y cada upline su
+    # DIFERENCIAL, sobre la mercancía con descuento (`discountable`). Se bloquea en
+    # pesos al crear la orden; los reportes suman lo guardado.
     commissions = []
     commission = 0
     if referrer:
         upline = await _upline_chain(referrer)
-        commissions = pyramid.compute_commission_breakdown(paid_merchandise, referrer, upline)
+        commissions = pyramid.compute_commission_breakdown(
+            discountable, referrer, upline, discount_rate=discount_rate)
         commission = pyramid.seller_amount(commissions)
     order = Order(
         order_number=gen_order_number(),
@@ -1286,7 +1325,7 @@ def _distributor_rollup(dist, users, orders):
         'commission_rate': dist.get('commission_rate', 0.25),
         'customer_discount_rate': dist.get('customer_discount_rate', 0),
         # Pirámide: nivel y de quién cuelga.
-        'tier': dist.get('tier', 'junior'),
+        'tier': dist.get('tier', pyramid.DEFAULT_TIER),
         'upline_id': dist.get('upline_id'),
         'created_at': dist.get('created_at'),
         'clients_count': len(clients),
@@ -1318,23 +1357,39 @@ async def seed_demo(admin=Depends(get_current_admin), clear: bool = False):
         return {'cleared': True}
 
     def _iso(y, m, d):
+        from datetime import datetime, timezone
         return datetime(y, m, d, 12, 0, tzinfo=timezone.utc).isoformat()
     pw = hash_password('Demo-1234!')
     consents = {'age_confirmed': True, 'privacy_accepted': True, 'accepted_at': _iso(2026, 4, 1)}
 
-    def _dist(_id, name, email, code, rate, tier, upline, disc):
-        return {'id': _id, 'name': name, 'email': email, 'password_hash': pw,
-                'role': 'distributor', 'distributor_code': code, 'commission_rate': rate,
-                'customer_discount_rate': disc, 'tier': tier, 'upline_id': upline,
-                'language': 'es', 'email_verified': True, 'blocked': False,
-                'consents': consents, 'created_at': _iso(2026, 4, 1), 'seed': True}
+    # Árbol: María (Master) > Luis (Senior) > 4 Juniors activos.
+    MARIA, LUIS = 'seed-maria', 'seed-luis'
+    JUN = [('seed-ana', 'Ana', 'ANA'), ('seed-beto', 'Beto', 'BETO'),
+           ('seed-caro', 'Caro', 'CARO'), ('seed-dani', 'Dani', 'DANI')]
 
-    M, S, J = 'seed-maria', 'seed-luis', 'seed-ana'
-    await db.users.insert_many([
-        _dist(M, 'María (Master demo)', 'maria.demo@exygenlabs.com', 'MARIA-40', 0.40, 'master', None, 0.15),
-        _dist(S, 'Luis (Senior demo)', 'luis.demo@exygenlabs.com', 'LUIS-26', 0.26, 'senior', M, 0.12),
-        _dist(J, 'Ana (Junior demo)', 'ana.demo@exygenlabs.com', 'ANA-15', 0.225, 'junior', S, 0.15),
-    ])
+    def _dist(_id, name, email, code, tier, upline, disc):
+        return {'id': _id, 'name': name, 'email': email, 'password_hash': pw,
+                'role': 'distributor', 'distributor_code': code,
+                'commission_rate': pyramid.tier_rate(tier), 'customer_discount_rate': disc,
+                'tier': tier, 'upline_id': upline, 'language': 'es', 'email_verified': True,
+                'blocked': False, 'consents': consents, 'created_at': _iso(2026, 4, 1), 'seed': True}
+
+    dist_docs = [
+        _dist(MARIA, 'María (Master demo)', 'maria.demo@exygenlabs.com', 'MARIA-DEMO', 'master', None, 0.25),
+        _dist(LUIS, 'Luis (Senior demo)', 'luis.demo@exygenlabs.com', 'LUIS-DEMO', 'senior', MARIA, 0.20),
+    ] + [_dist(jid, f'{nm} (Junior demo)', f'{nm.lower()}.demo@exygenlabs.com', f'{code}-DEMO', 'junior1', LUIS, 0.15)
+         for jid, nm, code in JUN]
+    await db.users.insert_many(dist_docs)
+    tier_by = {d['id']: d['tier'] for d in dist_docs}
+    upline_by = {d['id']: d['upline_id'] for d in dist_docs}
+    disc_by = {d['id']: d['customer_discount_rate'] for d in dist_docs}
+
+    def _chain(did):
+        out, cur = [], upline_by.get(did)
+        while cur:
+            out.append({'id': cur, 'tier': tier_by[cur]})
+            cur = upline_by.get(cur)
+        return out
 
     def _client(_id, name, email, ref, pts):
         return {'id': _id, 'name': name, 'email': email, 'password_hash': pw, 'role': 'user',
@@ -1342,60 +1397,65 @@ async def seed_demo(admin=Depends(get_current_admin), clear: bool = False):
                 'points_balance': pts, 'consents': consents, 'created_at': _iso(2026, 4, 5),
                 'phone': '+52 (55) 1234-5678', 'seed': True}
 
-    CARLOS, SOFIA, DIEGO, MARTA = 'seed-carlos', 'seed-sofia', 'seed-diego', 'seed-marta'
+    CARLOS = 'seed-carlos'
     await db.users.insert_many([
-        _client(CARLOS, 'Carlos Demo', 'carlos.demo@exygenlabs.com', J, 420),
-        _client(SOFIA, 'Sofía Demo', 'sofia.demo@exygenlabs.com', S, 0),
-        _client(DIEGO, 'Diego Demo', 'diego.demo@exygenlabs.com', M, 0),
-        _client(MARTA, 'Marta Demo', 'marta.demo@exygenlabs.com', J, 0),
+        _client(CARLOS, 'Carlos Demo', 'carlos.demo@exygenlabs.com', 'seed-ana', 4200),
+        _client('seed-sofia', 'Sofía Demo', 'sofia.demo@exygenlabs.com', 'seed-beto', 0),
+        _client('seed-diego', 'Diego Demo', 'diego.demo@exygenlabs.com', 'seed-caro', 0),
+        _client('seed-marta', 'Marta Demo', 'marta.demo@exygenlabs.com', 'seed-dani', 0),
+        _client('seed-pepe', 'Pepe Demo', 'pepe.demo@exygenlabs.com', 'seed-luis', 0),
+        _client('seed-rosa', 'Rosa Demo', 'rosa.demo@exygenlabs.com', 'seed-maria', 0),
     ])
 
     items = {
         'sema': {'product_id': 'seed-sema::10 mg', 'name': 'Semaglutida', 'presentation': '10 mg', 'price': 2049, 'quantity': 1},
         'reta': {'product_id': 'seed-reta::10 mg', 'name': 'Retatrutida', 'presentation': '10 mg', 'price': 2499, 'quantity': 1},
-        'bpc': {'product_id': 'seed-bpc::10 mg', 'name': 'BPC-157', 'presentation': '10 mg', 'price': 899, 'quantity': 2},
         'klow': {'product_id': 'seed-klow::80 mg', 'name': 'KLOW (BPC + GHK-Cu + TB-500 + KPV)', 'presentation': '80 mg', 'price': 2879, 'quantity': 1},
     }
-    seller = {'junior': J, 'senior': S, 'master': M}
-
-    def _comms(kind, merch):
-        if kind == 'junior':
-            return [{'distributor_id': J, 'role': 'seller', 'rate': 0.225, 'amount': round(merch * 0.225)},
-                    {'distributor_id': S, 'role': 'override', 'rate': 0.035, 'amount': round(merch * 0.035)},
-                    {'distributor_id': M, 'role': 'override', 'rate': 0.035, 'amount': round(merch * 0.035)}]
-        if kind == 'senior':
-            return [{'distributor_id': S, 'role': 'seller', 'rate': 0.26, 'amount': round(merch * 0.26)},
-                    {'distributor_id': M, 'role': 'override', 'rate': 0.035, 'amount': round(merch * 0.035)}]
-        if kind == 'master':
-            return [{'distributor_id': M, 'role': 'seller', 'rate': 0.40, 'amount': round(merch * 0.40)}]
-        return []
-
     n = [0]
-    def _order(user_id, name, kind, merch, keys, status, y, m, d):
+
+    def _order(user_id, name, seller_id, merch, keys, status, y, m, d):
         n[0] += 1
-        comms = _comms(kind, merch) if kind else []
+        seller = {'id': seller_id, 'tier': tier_by[seller_id]}
+        dr = disc_by[seller_id]
+        comms = pyramid.compute_commission_breakdown(merch, seller, _chain(seller_id), discount_rate=dr)
+        discount = round(merch * dr)
         return {'id': str(uuid.uuid4()), 'order_number': f'EX-{y}{m:02d}{d:02d}-{1000+n[0]}',
                 'user_id': user_id, 'items': [items[k] for k in keys],
                 'customer': {'full_name': name, 'email': name.split()[0].lower() + '.demo@exygenlabs.com',
                              'phone': '+52 (55) 1234-5678'},
-                'payment_method': 'spei', 'subtotal': merch, 'discount': 0, 'discount_rate': 0,
-                'shipping': 0, 'total': merch, 'status': status,
-                'referred_by': seller.get(kind), 'commission': (comms[0]['amount'] if comms else 0),
-                'commissions': comms, 'points_used': 0, 'points_earned': round(merch * 0.03),
-                'points_awarded': status != 'pendiente', 'created_at': _iso(y, m, d),
-                'paid_at': _iso(y, m, d), 'seed': True}
+                'payment_method': 'spei', 'subtotal': merch, 'discount': discount, 'discount_rate': dr,
+                'shipping': 0, 'total': merch - discount, 'status': status,
+                'referred_by': seller_id, 'commission': pyramid.seller_amount(comms), 'commissions': comms,
+                'points_used': 0, 'points_earned': round(merch * 0.03), 'points_awarded': status != 'pendiente',
+                'created_at': _iso(y, m, d), 'paid_at': _iso(y, m, d), 'seed': True}
 
-    await db.orders.insert_many([
-        _order(CARLOS, 'Carlos Demo', 'junior', 8000, ['sema', 'bpc'], 'entregado', 2026, 4, 12),
-        _order(CARLOS, 'Carlos Demo', 'junior', 6000, ['reta'], 'entregado', 2026, 5, 20),
-        _order(MARTA, 'Marta Demo', 'junior', 12000, ['sema', 'reta'], 'entregado', 2026, 6, 3),
-        _order(MARTA, 'Marta Demo', 'junior', 4000, ['bpc'], 'confirmado', 2026, 7, 10),
-        _order(SOFIA, 'Sofía Demo', 'senior', 15000, ['klow', 'sema'], 'entregado', 2026, 5, 15),
-        _order(SOFIA, 'Sofía Demo', 'senior', 9000, ['reta'], 'entregado', 2026, 6, 22),
-        _order(DIEGO, 'Diego Demo', 'master', 20000, ['klow', 'reta'], 'entregado', 2026, 6, 28),
-        _order(DIEGO, 'Diego Demo', 'master', 7000, ['sema'], 'confirmado', 2026, 7, 5),
-        _order(CARLOS, 'Carlos Demo', None, 3000, ['bpc'], 'entregado', 2026, 7, 15),
-    ])
+    # Ventas grandes para que las barras se vean (umbrales en millones).
+    specs = [
+        # Ana → Carlos (~$1.05M personal → 35% hacia Senior); son 3 pedidos del cliente demo
+        (CARLOS, 'Carlos Demo', 'seed-ana', 350000, ['sema', 'klow'], 'entregado', 2026, 4, 12),
+        (CARLOS, 'Carlos Demo', 'seed-ana', 350000, ['reta'], 'entregado', 2026, 5, 20),
+        (CARLOS, 'Carlos Demo', 'seed-ana', 350000, ['klow'], 'confirmado', 2026, 6, 15),
+        # Beto → Sofía (~$1.05M)
+        ('seed-sofia', 'Sofía Demo', 'seed-beto', 400000, ['klow'], 'entregado', 2026, 4, 18),
+        ('seed-sofia', 'Sofía Demo', 'seed-beto', 350000, ['sema'], 'entregado', 2026, 5, 22),
+        ('seed-sofia', 'Sofía Demo', 'seed-beto', 300000, ['reta'], 'entregado', 2026, 6, 28),
+        # Caro → Diego (~$1.05M)
+        ('seed-diego', 'Diego Demo', 'seed-caro', 380000, ['reta'], 'entregado', 2026, 4, 25),
+        ('seed-diego', 'Diego Demo', 'seed-caro', 340000, ['klow'], 'entregado', 2026, 5, 30),
+        ('seed-diego', 'Diego Demo', 'seed-caro', 330000, ['sema'], 'entregado', 2026, 6, 10),
+        # Dani → Marta (~$1.05M)
+        ('seed-marta', 'Marta Demo', 'seed-dani', 360000, ['sema'], 'entregado', 2026, 5, 5),
+        ('seed-marta', 'Marta Demo', 'seed-dani', 350000, ['reta'], 'entregado', 2026, 6, 12),
+        ('seed-marta', 'Marta Demo', 'seed-dani', 340000, ['klow'], 'confirmado', 2026, 7, 8),
+        # Luis (Senior) vende directo a Pepe (~$900k propias)
+        ('seed-pepe', 'Pepe Demo', 'seed-luis', 450000, ['klow', 'reta'], 'entregado', 2026, 5, 14),
+        ('seed-pepe', 'Pepe Demo', 'seed-luis', 450000, ['sema'], 'entregado', 2026, 6, 20),
+        # María (Master) vende directo a Rosa (~$1.1M propias)
+        ('seed-rosa', 'Rosa Demo', 'seed-maria', 550000, ['klow', 'sema'], 'entregado', 2026, 6, 3),
+        ('seed-rosa', 'Rosa Demo', 'seed-maria', 550000, ['reta'], 'confirmado', 2026, 7, 4),
+    ]
+    await db.orders.insert_many([_order(*s) for s in specs])
     return {
         'distributors': await db.users.count_documents({'seed': True, 'role': 'distributor'}),
         'clients': await db.users.count_documents({'seed': True, 'role': 'user'}),
@@ -1686,11 +1746,15 @@ async def distributor_summary(dist=Depends(get_current_distributor)):
             e['sales'] += o.get('total', 0)
     earnings_total = sum(_my_amount(o, dist['id']) for o in valid)
     own_earnings = sum(_my_amount(o, dist['id']) for o in own_sales)
+    # Red: reclutas activos y ventas de equipo, para la barra de nivel (ventas + reclutas).
+    net = await _downline_stats(dist['id'])
+    tier = dist.get('tier', pyramid.DEFAULT_TIER)
     return {
         'distributor_code': dist.get('distributor_code'),
-        'commission_rate': dist.get('commission_rate', pyramid.tier_rate(dist.get('tier'))),
+        'commission_rate': dist.get('commission_rate', pyramid.tier_rate(tier)),
         'customer_discount_rate': dist.get('customer_discount_rate', 0),
-        'tier': dist.get('tier', 'junior'),
+        'tier': tier,
+        'max_discount': pyramid.max_discount(tier),
         'clients_count': len(users),
         'sales_count': len(own_sales),
         'sales_total': sum(o.get('total', 0) for o in own_sales),
@@ -1698,9 +1762,11 @@ async def distributor_summary(dist=Depends(get_current_distributor)):
         # Desglose: cuánto es de ventas propias y cuánto de sobrecomisión del equipo.
         'own_earnings': own_earnings,
         'override_earnings': earnings_total - own_earnings,
-        # Barra de nivel: avance hacia el siguiente nivel (o al próximo +0.5% si Master).
-        'level': pyramid.level_progress(
-            dist.get('tier'), sum(o.get('total', 0) for o in own_sales), dist.get('commission_rate')),
+        # Red y barra de nivel: avance en VENTAS y en RECLUTAS ACTIVOS.
+        'active_recruits': net['active_recruits'],
+        'network_size': net['network_size'],
+        'team_sales': net['team_sales'],
+        'level': pyramid.level_progress(tier, net['personal_sales'], net['team_sales'], net['active_recruits']),
         'monthly': sorted(by_month.values(), key=lambda e: e['month']),
     }
 

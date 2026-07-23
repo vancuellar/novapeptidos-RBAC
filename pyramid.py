@@ -1,137 +1,103 @@
-"""Esquema de distribuidores en pirámide (Master / Senior / Junior).
+"""Esquema de distribuidores en pirámide — 6 niveles, override DIFERENCIAL.
 
-Diseño cerrado por Christian (handoff §4ter, 2026-07-21). Reglas del reparto:
+Diseño cerrado con Christian (2026-07-22/23). Reglas:
 
-  (i)  Cada distribuidor gana su TASA de nivel sobre la venta que hace con su
-       código. Además, cada distribuidor por ENCIMA de él (hasta 2 niveles) gana
-       una SOBRECOMISIÓN FIJA de 3.5% sobre esa misma venta.
-         - Vende Junior: Jr 22.5 + su Senior 3.5 + el Master 3.5 = 29.5
-         - Vende Senior: Sr 26 + su Master 3.5 = 29.5
-         - Vende Master: se queda la bolsa entera (30–40%)
-  (ii) Todo sub nuevo entra como JUNIOR; a Senior/Master solo se llega por ascenso.
-       El descuento al cliente sale SOLO de la tajada del vendedor (nunca toca el
-       3.5% de arriba) — eso lo controla el checkout, no este módulo.
-  (iii) La sobrecomisión de 3.5% es FIJA e intocable, sin importar el nivel del de
-       arriba. Lo que no se reparte (p.ej. un Junior sin Senior arriba) se queda
-       con la casa (Christian).
+  Niveles y tasa (la tasa ES la comisión Y el descuento MÁXIMO que puede dar el
+  distribuidor a su cliente, de 0 hasta ese %):
+    junior0 20% · junior1 25% · senior 30% · master 35% · elite 40% · diamond 45%
 
-Este módulo es PURO (sin base de datos): recibe diccionarios y devuelve el reparto
-en pesos, redondeado y bloqueado al momento de la orden. Los reportes suman lo
-guardado, así que cambiar tasas o niveles nunca toca ventas pasadas.
+  Override DIFERENCIAL: en una venta, cada distribuidor por ENCIMA del vendedor
+  gana la DIFERENCIA entre su tasa y la más alta ya pagada debajo de él. Así el
+  total repartido = la tasa del nivel MÁS ALTO de la cadena (nunca más), y si un
+  nivel se salta, el de arriba absorbe la diferencia. El total nunca pasa del 45%.
+
+  El DESCUENTO al cliente sale SOLO de la tajada del VENDEDOR: si un Senior (30%)
+  da 15% de descuento, se queda 15; los de arriba cobran su diferencial intacto.
+
+  Ascensos: se necesitan VENTAS (acumuladas) Y RECLUTAS ACTIVOS (con ≥1 venta) en
+  la red. El ascenso lo APRUEBA Christian al llegar a la meta; la barra muestra el
+  avance de las dos cosas. Diamond es a mano (invitación).
+
+Módulo PURO: recibe dicts, devuelve el reparto en pesos, bloqueado al crear la
+orden. Los reportes suman lo guardado → cambiar tasas/niveles no toca ventas viejas.
 """
 
-# Tasa base por nivel (proporción de la venta). Un distribuidor puede traer una
-# `commission_rate` explícita que MANDA sobre la del nivel (Master fundador 40%,
-# élite 45% que otorga Christian a mano).
+# Niveles en orden y su tasa (comisión = descuento máximo).
+TIER_ORDER = ['junior0', 'junior1', 'senior', 'master', 'elite', 'diamond']
 TIER_RATES = {
-    'junior': 0.225,
-    'senior': 0.26,
-    'master': 0.30,
+    'junior0': 0.20,
+    'junior1': 0.25,
+    'senior': 0.30,
+    'master': 0.35,
+    'elite': 0.40,
+    'diamond': 0.45,
 }
-DEFAULT_TIER = 'junior'
+DEFAULT_TIER = 'junior0'
+HARD_CAP = 0.45   # ningún reparto individual ni total pasa de aquí
 
-# Sobrecomisión fija por cada nivel de arriba, y cuántos niveles suben.
-OVERRIDE_RATE = 0.035
-MAX_OVERRIDE_LEVELS = 2
-
-# Tope duro: ninguna tajada individual pasa de esto (coincide con COMMISSION_CAP
-# del servidor). Master élite = 0.45; dejamos 0.50 como techo absoluto.
-HARD_CAP = 0.50
-
-
-# Ascensos: ventas PROPIAS acumuladas para calificar al siguiente nivel. El
-# ascenso lo APRUEBA Christian (§4ter); la barra solo muestra el avance. Son
-# constantes fáciles de cambiar — valores de arranque, ajustables.
-PROMOTE_TARGETS = {'junior': 100000, 'senior': 500000}
-MASTER_STEP_SALES = 500000    # cada $500k de ventas netas → +0.5% de comisión
-MASTER_STEP_RATE = 0.005
-MASTER_MAX_RATE = 0.40        # el 45% élite lo otorga Christian a mano, fuera de la barra
+# Ascensos: (nivel_origen -> nivel_destino, meta de ventas, base, reclutas activos).
+# 'personal' = ventas propias; 'team' = ventas de toda su red (él + downline).
+# Diamond es a mano: se lista pero no asciende solo.
+LEVEL_STEPS = [
+    {'from': 'junior0', 'to': 'junior1', 'sales': 500000,    'basis': 'personal', 'recruits': 2,  'manual': False},
+    {'from': 'junior1', 'to': 'senior',  'sales': 3000000,   'basis': 'personal', 'recruits': 4,  'manual': False},
+    {'from': 'senior',  'to': 'master',  'sales': 10000000,  'basis': 'team',     'recruits': 8,  'manual': False},
+    {'from': 'master',  'to': 'elite',   'sales': 30000000,  'basis': 'team',     'recruits': 16, 'manual': False},
+    {'from': 'elite',   'to': 'diamond', 'sales': 100000000, 'basis': 'team',     'recruits': 32, 'manual': True},
+]
+CASHBACK_RATE = 0.04   # ventaja del canal, la paga Christian, FUERA de la bolsa
 
 
 def tier_rate(tier):
-    """Tasa base de un nivel dado (junior por defecto si no se reconoce)."""
+    """Tasa (comisión = descuento máximo) de un nivel. junior0 por defecto."""
     return TIER_RATES.get(tier or DEFAULT_TIER, TIER_RATES[DEFAULT_TIER])
 
 
-def level_progress(tier, lifetime_sales, commission_rate=None):
-    """Avance hacia el siguiente nivel. Junior/Senior: hacia el umbral de ventas
-    que califica al ascenso. Master: hacia el próximo +0.5% de comisión (cada
-    $500k) hasta el tope. Devuelve un dict listo para pintar la barra."""
-    tier = tier if tier in TIER_RATES else DEFAULT_TIER
-    sales = max(0.0, float(lifetime_sales or 0))
-    if tier in PROMOTE_TARGETS:
-        target = PROMOTE_TARGETS[tier]
-        return {
-            'current': tier,
-            'next': 'senior' if tier == 'junior' else 'master',
-            'kind': 'promotion',
-            'target': target,
-            'current_value': sales,
-            'progress': min(1.0, sales / target) if target else 1.0,
-            'remaining': max(0.0, target - sales),
-        }
-    # Master
-    rate = commission_rate if commission_rate is not None else TIER_RATES['master']
-    if rate >= MASTER_MAX_RATE:
-        return {'current': 'master', 'next': None, 'kind': 'maxed', 'target': None,
-                'current_value': sales, 'progress': 1.0, 'remaining': 0.0, 'rate': rate}
-    into_block = sales % MASTER_STEP_SALES
-    return {
-        'current': 'master', 'next': None, 'kind': 'rate_step',
-        'target': MASTER_STEP_SALES, 'current_value': into_block,
-        'progress': into_block / MASTER_STEP_SALES,
-        'remaining': MASTER_STEP_SALES - into_block,
-        'rate': rate, 'next_rate': round(min(MASTER_MAX_RATE, rate + MASTER_STEP_RATE), 4),
-    }
+def max_discount(tier):
+    """Descuento máximo que ese nivel puede dar a su cliente = su comisión."""
+    return tier_rate(tier)
 
 
-def seller_rate(dist):
-    """Tasa del vendedor: su `commission_rate` explícita si la tiene (fundador/
-    élite), si no la de su nivel. Acotada al tope duro."""
-    r = dist.get('commission_rate')
-    if r is None:
-        r = tier_rate(dist.get('tier'))
-    return max(0.0, min(HARD_CAP, float(r)))
+def compute_commission_breakdown(merchandise, seller, upline_chain=None, discount_rate=0.0):
+    """Reparte UNA venta hecha con el código de `seller`, sobre `merchandise` (MXN).
 
+    - El vendedor gana (su tasa − descuento que dio), sobre la mercancía.
+    - Cada upline gana la DIFERENCIA entre su tasa y la más alta ya pagada debajo.
+    - `discount_rate` es lo que el vendedor decidió dar al cliente (0..su tasa);
+      sale de SU tajada, no toca a los de arriba.
 
-def compute_commission_breakdown(paid_merchandise, seller, upline_chain=None):
-    """Reparte la comisión de UNA venta hecha con el código de `seller`.
-
-    - `paid_merchandise`: mercancía pagada (después de descuento y canje), en MXN.
-    - `seller`: dict del distribuidor cuyo código se usó (con 'id', 'tier' y/o
-      'commission_rate').
-    - `upline_chain`: distribuidores por encima del vendedor, del más cercano al
-      más lejano. Solo se usan los primeros MAX_OVERRIDE_LEVELS.
-
-    Devuelve una lista de dicts: {distributor_id, role, rate, amount}. `role` es
-    'seller' o 'override'. La suma es la comisión total de la orden.
-    """
-    if not seller or paid_merchandise <= 0:
+    Devuelve [{distributor_id, role, rate, amount(MXN), ...}]. La suma es la
+    comisión total de la orden (sin el cashback, que va aparte)."""
+    if not seller or merchandise <= 0:
         return []
-    base = float(paid_merchandise)
-    rate = seller_rate(seller)
-    out = [{
-        'distributor_id': seller['id'],
-        'role': 'seller',
-        'rate': rate,
-        'amount': round(base * rate),
+    base = float(merchandise)
+    s_rate = tier_rate(seller.get('tier'))
+    disc = max(0.0, min(s_rate, float(discount_rate or 0)))
+    rows = [{
+        'distributor_id': seller['id'], 'role': 'seller', 'rate': s_rate,
+        'discount': round(disc, 4), 'amount': round(base * (s_rate - disc)),
     }]
     seen = {seller['id']}
-    for up in (upline_chain or [])[:MAX_OVERRIDE_LEVELS]:
+    highest = s_rate   # la tasa más alta ya cubierta debajo del upline en turno
+    for up in (upline_chain or []):
         if not up or up.get('id') in seen:
-            continue          # nunca pagar dos veces al mismo ni al propio vendedor
-        seen.add(up['id'])
-        out.append({
-            'distributor_id': up['id'],
-            'role': 'override',
-            'rate': OVERRIDE_RATE,
-            'amount': round(base * OVERRIDE_RATE),
+            continue
+        u_rate = tier_rate(up.get('tier'))
+        diff = u_rate - highest
+        if diff <= 0:
+            continue   # no está más arriba que lo ya pagado: no cobra, seguimos
+        rows.append({
+            'distributor_id': up['id'], 'role': 'override', 'rate': u_rate,
+            'diff': round(diff, 4), 'amount': round(base * diff),
         })
-    return out
+        seen.add(up['id'])
+        highest = u_rate
+    return rows
 
 
 def seller_amount(breakdown):
-    """La tajada del vendedor (para el campo `commission` de la orden, compat)."""
+    """La tajada del vendedor (ya con su descuento restado), para el campo
+    `commission` de la orden (compatibilidad)."""
     for row in breakdown:
         if row['role'] == 'seller':
             return row['amount']
@@ -139,16 +105,14 @@ def seller_amount(breakdown):
 
 
 def total_amount(breakdown):
-    """Suma de todo lo repartido en la orden (vendedor + sobrecomisiones)."""
+    """Suma de todo lo repartido (vendedor + sobrecomisiones), sin cashback."""
     return sum(row['amount'] for row in breakdown)
 
 
 def earnings_for(distributor_id, orders):
-    """Cuánto ganó un distribuidor en una lista de órdenes: suma su tajada en el
-    `commissions` de cada orden (como vendedor O como upline). Ignora canceladas.
-
-    Compatibilidad: si una orden vieja no trae `commissions` pero sí `commission`
-    y `referred_by` == este distribuidor, cuenta ese `commission` (venta directa)."""
+    """Cuánto ganó un distribuidor: su tajada en el `commissions` de cada orden
+    (como vendedor O como upline), ignorando canceladas. Cae al campo viejo
+    `commission` si la orden es anterior a la pirámide y fue su venta directa."""
     total = 0
     for o in orders:
         if o.get('status') == 'cancelado':
@@ -159,3 +123,43 @@ def earnings_for(distributor_id, orders):
         elif o.get('referred_by') == distributor_id:
             total += o.get('commission', 0)
     return total
+
+
+def _step_from(tier):
+    tier = tier if tier in TIER_RATES else DEFAULT_TIER
+    for s in LEVEL_STEPS:
+        if s['from'] == tier:
+            return s
+    return None   # diamond: no hay siguiente
+
+
+def _bar(value, target):
+    value = max(0.0, float(value or 0))
+    target = float(target or 0)
+    return {
+        'value': value, 'target': target,
+        'progress': min(1.0, value / target) if target else 1.0,
+        'remaining': max(0.0, target - value),
+        'done': value >= target,
+    }
+
+
+def level_progress(tier, personal_sales, team_sales, active_recruits):
+    """Avance hacia el siguiente nivel: DOS metas, ventas y reclutas activos.
+    Devuelve dict con las dos barras y si califica (las dos cumplidas)."""
+    tier = tier if tier in TIER_RATES else DEFAULT_TIER
+    step = _step_from(tier)
+    if step is None:
+        return {'current': tier, 'next': None, 'kind': 'top', 'rate': tier_rate(tier),
+                'sales': None, 'recruits': None, 'qualifies': False, 'manual': False}
+    sales_value = personal_sales if step['basis'] == 'personal' else team_sales
+    sales = _bar(sales_value, step['sales'])
+    recruits = _bar(active_recruits, step['recruits'])
+    return {
+        'current': tier, 'next': step['to'], 'kind': 'promotion',
+        'rate': tier_rate(tier), 'next_rate': tier_rate(step['to']),
+        'sales': {**sales, 'basis': step['basis']},
+        'recruits': recruits,
+        'qualifies': sales['done'] and recruits['done'],
+        'manual': step['manual'],   # diamond requiere aprobación a mano
+    }
