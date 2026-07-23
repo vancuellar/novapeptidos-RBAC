@@ -12,6 +12,7 @@ import json
 from datetime import datetime, timezone
 from typing import List, Optional
 
+from pydantic import BaseModel
 from database import db, client
 from models import (
     RegisterInput, LoginInput, ForgotPasswordInput, ResetPasswordInput,
@@ -113,7 +114,7 @@ async def _resolve_code(code):
     if not code:
         return None, 0.0
     c = code.strip().upper()
-    doc = await db.discount_codes.find_one({'code': c, 'active': True})
+    doc = await db.discount_codes.find_one({'code': c, 'active': True, 'kind': {'$ne': 'coupon'}})
     if doc:
         if doc.get('expires_at') and doc['expires_at'] < now_iso():
             return None, 0.0   # caducado
@@ -921,8 +922,18 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # El código puede ser uno de los VARIOS del distribuidor (con su propio
     # descuento) o su código legacy. El descuento sale del código, acotado a su
     # comisión de nivel, y de SU tajada. Sin código = promo automática (la casa).
-    referrer, code_discount = await _resolve_code(payload.distributor_code)
-    if referrer:
+    # Cupón personal (regalo del admin): descuento directo, sin comisión ni atribución.
+    coupon = None
+    if payload.distributor_code:
+        _c = await db.discount_codes.find_one({'code': payload.distributor_code.strip().upper(),
+                                               'active': True, 'kind': 'coupon'})
+        if _c and not _c.get('used') and (not _c.get('expires_at') or _c['expires_at'] >= now_iso()) \
+           and (not _c.get('user_id') or (user and user['id'] == _c['user_id'])):
+            coupon = _c
+    referrer, code_discount = ((None, 0.0) if coupon else await _resolve_code(payload.distributor_code))
+    if coupon:
+        discount_rate = coupon['discount_rate']
+    elif referrer:
         discount_rate = code_discount
     else:
         discount_rate = 0.15 if discountable >= 35000 else 0.10
@@ -966,6 +977,9 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         points_earned=points_earned,
     )
     await db.orders.insert_one(order.model_dump())
+    if coupon and coupon.get('single_use', True):
+        await db.discount_codes.update_one({'id': coupon['id']},
+                                           {'$set': {'used': True, 'active': False, 'used_order': order.order_number}})
     # Notificar a quienes ganan comisión en esta venta (vendedor + uplines).
     for row in commissions:
         if row.get('amount', 0) > 0:
@@ -1356,10 +1370,14 @@ async def admin_analytics(admin=Depends(get_current_admin)):
 @api_router.get('/discount-code/{code}')
 async def check_discount_code(code: str):
     """Publico: valida un codigo y devuelve SOLO el % de descuento (nada personal)."""
+    c = (code or '').strip().upper()
+    cdoc = await db.discount_codes.find_one({'code': c, 'active': True, 'kind': 'coupon'})
+    if cdoc and not cdoc.get('used') and (not cdoc.get('expires_at') or cdoc['expires_at'] >= now_iso()):
+        return {'code': c, 'discount_rate': cdoc.get('discount_rate', 0)}
     dist, discount = await _resolve_code(code)
     if not dist:
         raise HTTPException(status_code=404, detail='Codigo no valido')
-    return {'code': code.strip().upper(), 'discount_rate': discount}
+    return {'code': c, 'discount_rate': discount}
 
 
 # ----------------- Distribuidor: sus códigos de descuento (auto) -----------------
@@ -2741,7 +2759,148 @@ async def tutorial_video(filename: str, request: Request, token: str = Query(...
     return _Response(content=chunk, status_code=206, media_type='video/mp4', headers=headers)
 
 
+# ----------------- Admin: fichas por persona (2026-07-23) -----------------
+@api_router.get('/admin/distributors/{dist_id}/detail')
+async def admin_distributor_detail(dist_id: str, admin=Depends(get_current_admin)):
+    """Ficha completa de UN distribuidor: perfil, códigos, clientes, red y ventas.
+    Sin datos confidenciales de clientes (ni teléfonos, ni direcciones, ni salud)."""
+    dist = await db.users.find_one({'id': dist_id, 'role': 'distributor'},
+                                   {'_id': 0, 'password_hash': 0, 'totp_secret': 0})
+    if not dist:
+        raise HTTPException(status_code=404, detail='Distribuidor no encontrado')
+    users = await db.users.find({}, {'_id': 0, 'password_hash': 0}).to_list(5000)
+    orders = await db.orders.find({}, {'_id': 0}).to_list(10000)
+    roll = _distributor_rollup(dist, users, orders)
+
+    codes = await db.discount_codes.find({'distributor_id': dist_id}, {'_id': 0}).to_list(300)
+    codes = [_code_projection(c) | {'active': c.get('active', False)} for c in codes]
+
+    # Clientes: SOLO nombre, correo y números de negocio (nada personal).
+    my_orders = [o for o in orders if o.get('referred_by') == dist_id and o.get('status') != 'cancelado']
+    by_user = {}
+    for o in my_orders:
+        if o.get('user_id'):
+            b = by_user.setdefault(o['user_id'], {'orders': 0, 'total': 0.0, 'commission': 0.0, 'last': ''})
+            b['orders'] += 1
+            b['total'] += o.get('total', 0)
+            b['commission'] += next((r.get('amount', 0) for r in o.get('commissions', [])
+                                     if r.get('distributor_id') == dist_id), o.get('commission', 0) if o.get('referred_by') == dist_id else 0)
+            b['last'] = max(b['last'], o.get('created_at', ''))
+    clients = []
+    for u in users:
+        if u.get('referred_by') == dist_id or u['id'] in by_user:
+            b = by_user.get(u['id'], {'orders': 0, 'total': 0, 'commission': 0, 'last': ''})
+            clients.append({'id': u['id'], 'name': u.get('name'), 'email': u.get('email'),
+                            'orders': b['orders'], 'total': b['total'],
+                            'commission': b['commission'], 'last_order': b['last'] or None})
+    clients.sort(key=lambda c: -c['total'])
+
+    # Red: sub-distribuidores directos con sus números.
+    subs = []
+    for u in users:
+        if u.get('role') == 'distributor' and u.get('upline_id') == dist_id:
+            sroll = _distributor_rollup(u, users, orders)
+            subs.append({'id': u['id'], 'name': u.get('name'), 'email': u.get('email'),
+                         'tier': u.get('tier'), 'distributor_code': u.get('distributor_code'),
+                         'sales_total': sroll.get('sales_total', 0), 'clients_count': sroll.get('clients_count', 0),
+                         'earnings': sroll.get('earnings', 0)})
+    subs.sort(key=lambda x: -x['sales_total'])
+
+    sales = [{'order_number': o.get('order_number'), 'created_at': o.get('created_at'),
+              'status': o.get('status'), 'total': o.get('total', 0),
+              'commission': next((r.get('amount', 0) for r in o.get('commissions', [])
+                                  if r.get('distributor_id') == dist_id), o.get('commission', 0))}
+             for o in sorted(my_orders, key=lambda o: o.get('created_at', ''), reverse=True)[:50]]
+
+    return {'distributor': roll, 'codes': codes, 'clients': clients, 'subdistributors': subs, 'sales': sales}
+
+
+@api_router.get('/admin/customers/{user_id}/detail')
+async def admin_customer_detail(user_id: str, admin=Depends(get_current_admin)):
+    """Ficha de UN cliente: pedidos, pagos, puntos y cupones que le hemos dado."""
+    u = await db.users.find_one({'id': user_id}, {'_id': 0, 'password_hash': 0, 'totp_secret': 0})
+    if not u:
+        raise HTTPException(status_code=404, detail='Cliente no encontrado')
+    orders = await db.orders.find({'user_id': user_id}, {'_id': 0}).to_list(1000)
+    orders.sort(key=lambda o: o.get('created_at', ''), reverse=True)
+    paid = [o for o in orders if o.get('status') in loyalty.PAID_STATUSES]
+    coupons = await db.discount_codes.find({'kind': 'coupon', 'user_id': user_id}, {'_id': 0}).to_list(100)
+    ledger = await db.points.find({'user_id': user_id}, {'_id': 0}).to_list(200)
+    ledger.sort(key=lambda e: e.get('created_at', ''), reverse=True)
+    return {
+        'customer': {'id': u['id'], 'name': u.get('name'), 'email': u.get('email'),
+                     'created_at': u.get('created_at'), 'blocked': u.get('blocked', False),
+                     'referred_by': u.get('referred_by'),
+                     'points_balance': int(u.get('points_balance', 0) or 0)},
+        'orders': [{'id': o['id'], 'order_number': o.get('order_number'), 'created_at': o.get('created_at'),
+                    'status': o.get('status'), 'total': o.get('total', 0),
+                    'payment_method': o.get('payment_method'), 'discount': o.get('discount', 0),
+                    'points_used': o.get('points_used', 0)} for o in orders[:100]],
+        'paid_total': sum(o.get('total', 0) for o in paid),
+        'paid_count': len(paid),
+        'coupons': [{'code': c['code'], 'discount_rate': c.get('discount_rate', 0),
+                     'expires_at': c.get('expires_at'), 'used': c.get('used', False),
+                     'active': c.get('active', False), 'note': c.get('note', '')} for c in coupons],
+        'points_ledger': ledger[:50],
+    }
+
+
+class CouponCreate(BaseModel):
+    discount_rate: float           # 0.05 .. 0.50
+    expires_days: int = 30
+    note: str = ''
+
+
+@api_router.post('/admin/customers/{user_id}/coupon')
+async def admin_send_coupon(user_id: str, payload: CouponCreate, admin=Depends(get_current_admin)):
+    """Cupón PERSONAL de un solo uso para un cliente. Sin comisión de nadie."""
+    u = await db.users.find_one({'id': user_id}, {'_id': 0, 'id': 1, 'name': 1})
+    if not u:
+        raise HTTPException(status_code=404, detail='Cliente no encontrado')
+    rate = max(0.05, min(0.50, payload.discount_rate))
+    code = 'GIFT-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    while await db.discount_codes.find_one({'code': code}):
+        code = 'GIFT-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    from datetime import timedelta
+    expires = (datetime.now(timezone.utc) + timedelta(days=max(1, payload.expires_days))).isoformat()
+    await db.discount_codes.insert_one({
+        'id': str(uuid.uuid4()), 'code': code, 'kind': 'coupon', 'user_id': user_id,
+        'discount_rate': rate, 'active': True, 'used': False, 'single_use': True,
+        'note': payload.note, 'created_by': 'admin', 'created_at': now_iso(), 'expires_at': expires,
+    })
+    await notify(user_id, 'coupon', 'Tienes un regalo de Exygen',
+                 f'Te mandamos el cupón {code} con {round(rate * 100)}% de descuento en tu próxima compra. '
+                 + (payload.note or ''), link='/catalogo')
+    return {'code': code, 'discount_rate': rate, 'expires_at': expires}
+
+
+class GiftPoints(BaseModel):
+    points: int
+    note: str = ''
+
+
+@api_router.post('/admin/customers/{user_id}/gift-points')
+async def admin_gift_points(user_id: str, payload: GiftPoints, admin=Depends(get_current_admin)):
+    """Regala puntos de lealtad a un cliente (cortesía de la casa)."""
+    if payload.points <= 0 or payload.points > 100000:
+        raise HTTPException(status_code=400, detail='Cantidad de puntos no válida')
+    u = await db.users.find_one({'id': user_id}, {'_id': 0, 'id': 1})
+    if not u:
+        raise HTTPException(status_code=404, detail='Cliente no encontrado')
+    await db.users.update_one({'id': user_id}, {'$inc': {'points_balance': int(payload.points)}})
+    await db.points.insert_one({
+        'id': str(uuid.uuid4()), 'user_id': user_id, 'order_id': None, 'order_number': '',
+        'type': 'gift', 'points': int(payload.points), 'note': payload.note, 'created_at': now_iso(),
+    })
+    await notify(user_id, 'gift_points', 'Te regalamos puntos',
+                 f'Exygen te regaló {payload.points:,} puntos de lealtad. {payload.note or ""}'.strip(),
+                 link='/cuenta')
+    fresh = await db.users.find_one({'id': user_id}, {'_id': 0, 'points_balance': 1})
+    return {'points_balance': int((fresh or {}).get('points_balance', 0) or 0)}
+
+
 app.include_router(api_router)
+
 
 app.add_middleware(
     CORSMiddleware,
