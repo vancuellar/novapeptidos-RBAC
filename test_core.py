@@ -807,3 +807,13 @@ def test_discount_tiers_start_at_15_and_step_5_below_commission():
 
 def test_discount_tiers_diamond_ends_at_38():
     assert pyramid.discount_tiers_for(0.43) == [0.15, 0.20, 0.25, 0.30, 0.35, 0.38]
+
+
+# ---------- Centro de noticias: audiencia por rol ----------
+from server import _audience_for_role
+
+
+def test_notification_audience_by_role():
+    assert _audience_for_role('user') == ['all', 'clients']
+    assert _audience_for_role('distributor') == ['all', 'distributors']
+    assert set(_audience_for_role('admin')) == {'all', 'clients', 'distributors'}

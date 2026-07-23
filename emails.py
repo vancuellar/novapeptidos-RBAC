@@ -288,6 +288,37 @@ def _distributor_email_html(copy, name, code, link, needs_activation):
 </html>"""
 
 
+NEWS_SUBJECT = {'es': 'Novedad de Exygen Labs', 'en': 'News from Exygen Labs', 'pt': 'Novidade da Exygen Labs'}
+
+
+def _news_email_html(name, title, body):
+    safe_body = html.escape(body).replace('\n', '<br>')
+    return f"""<!DOCTYPE html>
+<html lang="es-MX">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{DARK_EMAIL_STYLE}</head>
+<body class="em-bg" style="margin:0;padding:0;background-color:#FFFFFF;">
+    <div style="max-width:560px;margin:0 auto;font-family:Helvetica,Arial,sans-serif;padding:32px 24px;">
+      <div class="em-ink" style="text-align:center;font-size:20px;letter-spacing:3px;color:#132763;font-weight:bold;">EXYGEN&nbsp;LABS</div>
+      <div class="em-muted" style="text-align:center;font-size:11px;letter-spacing:2px;color:#8A93A8;padding-top:4px;">RESEARCH PEPTIDES</div>
+      <h1 class="em-ink" style="font-size:20px;color:#132763;margin-top:28px;">{html.escape(title)}</h1>
+      <p class="em-body" style="font-size:15px;color:#3D4657;line-height:1.6;">{safe_body}</p>
+      <p class="em-muted" style="font-size:12px;color:#8A93A8;line-height:1.6;margin-top:24px;">exygenlabs.com</p>
+    </div>
+</body>
+</html>"""
+
+
+async def send_news_email(name, email, title, body, language=None):
+    """Aviso del centro de noticias por correo. Best-effort; nunca lanza."""
+    if os.environ.get('EMAIL_ENABLED', 'false').lower() != 'true':
+        return
+    lang = normalize_language(language)
+    try:
+        await asyncio.to_thread(_send_email_sync, email, NEWS_SUBJECT[lang], _news_email_html(name or '', title, body))
+    except Exception:
+        logger.exception('Failed to send news email to %s', email)
+
+
 async def send_distributor_welcome_email(name, email, code, link, language=None, needs_activation=True):
     """Bienvenida propia del distribuidor con su código de referido. `needs_activation`
     True = cuenta nueva (el botón activa y elige contraseña); False = cliente convertido

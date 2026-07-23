@@ -244,6 +244,16 @@ class DiscountCodeCreate(BaseModel):
     discount_rate: float = 0.0             # 0..su comisión de nivel
 
 
+class AnnouncementCreate(BaseModel):
+    # Aviso que publica el admin (centro de noticias). Audiencia: todos / clientes
+    # / distribuidores. `email` = mandarlo también por correo (para lo importante).
+    title: str
+    body: str = ''
+    audience: str = 'all'                  # all | clients | distributors
+    link: Optional[str] = None
+    email: bool = False
+
+
 # ---------- Protocolos (seguimiento de consumo / recompra) ----------
 class ProtocolInput(BaseModel):
     """Lo que el cliente registra para que calculemos cuándo se le acaba el vial.

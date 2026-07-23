@@ -20,7 +20,7 @@ from models import (
     OrderCreate, Order, OrderStatusUpdate, OrderShippingUpdate,
     ProtocolInput, ProtocolUpdate, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput,
-    ChatInput, DistributorCreate, DiscountCodeCreate, GoogleAuthInput, now_iso,
+    ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
 )
 from auth import (
     hash_password, verify_password, create_token,
@@ -56,7 +56,7 @@ from lab_reference import (
 from emails import (
     send_welcome_email, send_reset_email, send_verification_email,
     send_invitation_email, send_order_email, send_payment_confirmed_email, normalize_language, email_enabled,
-    send_admin_notification, send_distributor_welcome_email,
+    send_admin_notification, send_distributor_welcome_email, send_news_email,
 )
 from datetime import timedelta
 import asyncio
@@ -126,6 +126,40 @@ async def _resolve_code(code):
     if dist:
         return dist, max(0.0, min(pyramid.tier_rate(dist.get('tier')), dist.get('customer_discount_rate', 0)))
     return None, 0.0
+
+
+# ----------------- Centro de noticias / notificaciones -----------------
+async def notify(user_id, ntype, title, body='', link=None, dedup=None):
+    """Crea una notificación PERSONAL para un usuario. `dedup`: si se pasa, no
+    duplica una del mismo tipo+dedup en los últimos 30 días (para 'por terminarse')."""
+    if not user_id:
+        return
+    if dedup:
+        since = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        exists = await db.notifications.find_one(
+            {'user_id': user_id, 'type': ntype, 'dedup': dedup, 'created_at': {'$gte': since}})
+        if exists:
+            return
+    await db.notifications.insert_one({
+        'id': str(uuid.uuid4()), 'kind': 'personal', 'user_id': user_id, 'type': ntype,
+        'title': title, 'body': body, 'link': link, 'dedup': dedup, 'created_at': now_iso()})
+
+
+async def broadcast_notification(ntype, title, body='', audience='all', link=None):
+    """Aviso del admin para una audiencia (all | clients | distributors)."""
+    doc = {'id': str(uuid.uuid4()), 'kind': 'broadcast', 'audience': audience, 'type': ntype,
+           'title': title, 'body': body, 'link': link, 'created_at': now_iso()}
+    await db.notifications.insert_one(doc)
+    return doc
+
+
+def _audience_for_role(role):
+    """Qué broadcasts ve cada rol."""
+    if role == 'distributor':
+        return ['all', 'distributors']
+    if role == 'admin':
+        return ['all', 'clients', 'distributors']
+    return ['all', 'clients']
 
 
 async def _upline_chain(dist, levels=len(pyramid.TIER_ORDER)):
@@ -932,6 +966,13 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         points_earned=points_earned,
     )
     await db.orders.insert_one(order.model_dump())
+    # Notificar a quienes ganan comisión en esta venta (vendedor + uplines).
+    for row in commissions:
+        if row.get('amount', 0) > 0:
+            role = 'tu venta' if row['role'] == 'seller' else 'una venta de tu equipo'
+            await notify(row['distributor_id'], 'new_sale', 'Nueva venta',
+                         f"Ganaste ${row['amount']:,.0f} por {role} (pedido {order.order_number}).",
+                         link='/distribuidor')
     if points_used:
         # El canje se descuenta de inmediato: si no, dos pedidos seguidos
         # podrian gastar el mismo saldo.
@@ -1150,12 +1191,19 @@ async def update_order_status(order_id: str, payload: OrderStatusUpdate, admin=D
     elif payload.status == 'cancelado':
         await revoke_order_points(order)
     # Aviso de pago confirmado al cliente, solo al ENTRAR a 'confirmado'.
+    num = order.get('order_number')
     if payload.status == 'confirmado' and (prev.get('status') or '') != 'confirmado':
         lang = None
         if order.get('user_id'):
             u = await db.users.find_one({'id': order['user_id']}, {'_id': 0, 'language': 1})
             lang = (u or {}).get('language')
         asyncio.create_task(send_payment_confirmed_email(order, lang))
+        await notify(order.get('user_id'), 'payment_confirmed', 'Pago confirmado',
+                     f'Confirmamos el pago de tu pedido {num}. ¡Gracias!', link=f'/pedido/{num}')
+    # Notificación de entrega, solo al ENTRAR a 'entregado'.
+    if payload.status == 'entregado' and (prev.get('status') or '') != 'entregado':
+        await notify(order.get('user_id'), 'order_delivered', 'Pedido entregado',
+                     f'Tu pedido {num} fue entregado. ¡Disfrútalo!', link=f'/pedido/{num}')
     return await db.orders.find_one({'id': order_id}, {'_id': 0})
 
 
@@ -1384,6 +1432,87 @@ async def rotate_discount_codes(dist=Depends(get_current_distributor)):
     """Renueva YA todos los códigos (nuevos textos). Los viejos dejan de servir."""
     codes = await _ensure_distributor_codes(dist, force_rotate=True)
     return {'rotated': True, 'codes': [_code_projection(c) for c in codes]}
+
+
+# ----------------- Centro de noticias: feed del usuario -----------------
+async def _generate_running_low(user):
+    """Notificación 'por terminarse' a partir de los protocolos del cliente
+    (misma proyección que Mi cuenta). No duplica (dedup por protocolo)."""
+    try:
+        protos = await db.protocols.find({'user_id': user['id'], 'active': True}, {'_id': 0}).to_list(100)
+    except Exception:
+        return
+    for p in protos:
+        proj = _protocol_projection(p)
+        if proj.get('needs_repurchase'):
+            name = p.get('product_name') or 'tu péptido'
+            days = proj.get('days_left')
+            await notify(user['id'], 'running_low', 'Se te está por acabar un producto',
+                         f'Según tu dosis, {name} te alcanza para unos {days} días. Considera recomprar.',
+                         link='/cuenta?tab=tools', dedup=p.get('id'))
+
+
+@api_router.get('/me/notifications')
+async def my_notifications(user=Depends(get_current_user)):
+    """Feed del usuario: sus notificaciones personales + los avisos de su
+    audiencia, más el conteo de no leídas."""
+    if user.get('role') == 'user':
+        await _generate_running_low(user)
+    aud = _audience_for_role(user.get('role'))
+    docs = await db.notifications.find({'$or': [
+        {'kind': 'personal', 'user_id': user['id']},
+        {'kind': 'broadcast', 'audience': {'$in': aud}},
+    ]}, {'_id': 0}).to_list(500)
+    docs.sort(key=lambda d: d.get('created_at', ''), reverse=True)
+    seen_at = user.get('notifications_seen_at') or ''
+    unread = sum(1 for d in docs if d.get('created_at', '') > seen_at)
+    return {'unread': unread, 'notifications': docs[:100]}
+
+
+@api_router.post('/me/notifications/seen')
+async def mark_notifications_seen(user=Depends(get_current_user)):
+    """Marca todo como leído (guarda la fecha)."""
+    await db.users.update_one({'id': user['id']}, {'$set': {'notifications_seen_at': now_iso()}})
+    return {'ok': True}
+
+
+# ----------------- Centro de noticias: admin publica avisos -----------------
+@api_router.get('/admin/announcements')
+async def list_announcements(admin=Depends(get_current_admin)):
+    docs = await db.notifications.find({'kind': 'broadcast'}, {'_id': 0}).to_list(500)
+    docs.sort(key=lambda d: d.get('created_at', ''), reverse=True)
+    return docs
+
+
+@api_router.post('/admin/announcements')
+async def create_announcement(payload: AnnouncementCreate, admin=Depends(get_current_admin)):
+    aud = payload.audience if payload.audience in ('all', 'clients', 'distributors') else 'all'
+    doc = await broadcast_notification('announcement', payload.title.strip()[:140],
+                                       (payload.body or '').strip()[:4000], aud, payload.link)
+    if payload.email:
+        asyncio.create_task(_email_announcement(aud, doc['title'], doc['body']))
+    return {'id': doc['id'], 'audience': aud, 'emailed': bool(payload.email)}
+
+
+@api_router.delete('/admin/announcements/{ann_id}')
+async def delete_announcement(ann_id: str, admin=Depends(get_current_admin)):
+    res = await db.notifications.delete_one({'id': ann_id, 'kind': 'broadcast'})
+    if not res.deleted_count:
+        raise HTTPException(status_code=404, detail='Aviso no encontrado')
+    return {'id': ann_id, 'deleted': True}
+
+
+async def _email_announcement(audience, title, body):
+    """Manda el aviso por correo a la audiencia. Best-effort; nunca lanza."""
+    q = {'role': 'user'} if audience == 'clients' else {'role': 'distributor'} if audience == 'distributors' else {}
+    try:
+        users = await db.users.find({**q, 'email_verified': True, 'blocked': {'$ne': True}},
+                                    {'_id': 0, 'email': 1, 'name': 1, 'language': 1}).to_list(20000)
+        for u in users:
+            if u.get('email'):
+                await send_news_email(u['name'], u['email'], title, body, u.get('language'))
+    except Exception:
+        logger.exception('Failed to email announcement')
 
 
 # ----------------- Admin: Invite customers -----------------
@@ -1846,6 +1975,19 @@ async def update_distributor_pyramid(dist_id: str, payload: dict, admin=Depends(
         raise HTTPException(status_code=400, detail='Nada que actualizar')
     await db.users.update_one({'id': dist_id}, {'$set': update})
     fresh = await db.users.find_one({'id': dist_id}, {'_id': 0, 'password_hash': 0})
+    # Notificar el ASCENSO (subió de nivel) — un logro para el distribuidor.
+    if 'tier' in update:
+        order = pyramid.TIER_ORDER
+        old_i = order.index(dist.get('tier')) if dist.get('tier') in order else -1
+        new_i = order.index(update['tier']) if update['tier'] in order else -1
+        if new_i > old_i:
+            names = {'junior0': 'Junior 0', 'junior1': 'Junior 1', 'senior': 'Senior',
+                     'master': 'Master', 'elite': 'Elite', 'diamond': 'Diamond'}
+            nice = names.get(update['tier'], update['tier'])
+            rate = round(pyramid.tier_rate(update['tier']) * 100)
+            await notify(dist_id, 'level_up', f'¡Subiste a {nice}!',
+                         f'Alcanzaste el nivel {nice}: ahora tu comisión es {rate}%. ¡Felicidades!',
+                         link='/distribuidor')
     return {'id': fresh['id'], 'name': fresh['name'],
             'tier': fresh.get('tier', 'junior'), 'upline_id': fresh.get('upline_id'),
             'commission_rate': fresh.get('commission_rate')}
