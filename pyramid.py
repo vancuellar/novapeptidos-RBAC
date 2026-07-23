@@ -30,20 +30,32 @@ TIER_RATES = {
     'senior': 0.30,
     'master': 0.35,
     'elite': 0.40,
-    'diamond': 0.45,
+    'diamond': 0.43,   # nivel SECRETO desbloqueable (no aparece en la escalera)
 }
 DEFAULT_TIER = 'junior0'
 HARD_CAP = 0.45   # ningún reparto individual ni total pasa de aquí
 
+# Diamond es un nivel SECRETO: no está en la escalera visible (el tope que ven los
+# distribuidores es Elite 40%). Se desbloquea al llegar a estas metas; el sistema
+# avisa al admin y Christian lo otorga a mano. Christian, 2026-07-23.
+DIAMOND_SALES = 50000000      # $50M de ventas de EQUIPO
+DIAMOND_RECRUITS = 32         # MÁS de 32 activos en la red (estricto)
+
+
+def diamond_qualifies(team_sales, active_recruits):
+    """¿Este distribuidor (Elite) ya desbloqueó el Diamond secreto?"""
+    return (team_sales or 0) >= DIAMOND_SALES and (active_recruits or 0) > DIAMOND_RECRUITS
+
 # Ascensos: (nivel_origen -> nivel_destino, meta de ventas, base, reclutas activos).
 # 'personal' = ventas propias; 'team' = ventas de toda su red (él + downline).
 # Diamond es a mano: se lista pero no asciende solo.
+# Escalera VISIBLE (Diamond NO está aquí: es secreto). El tope que ve un
+# distribuidor es Elite. Diamond se desbloquea por separado (diamond_qualifies).
 LEVEL_STEPS = [
     {'from': 'junior0', 'to': 'junior1', 'sales': 500000,    'basis': 'personal', 'recruits': 2,  'manual': False},
     {'from': 'junior1', 'to': 'senior',  'sales': 3000000,   'basis': 'personal', 'recruits': 4,  'manual': False},
     {'from': 'senior',  'to': 'master',  'sales': 10000000,  'basis': 'team',     'recruits': 8,  'manual': False},
     {'from': 'master',  'to': 'elite',   'sales': 30000000,  'basis': 'team',     'recruits': 16, 'manual': False},
-    {'from': 'elite',   'to': 'diamond', 'sales': 100000000, 'basis': 'team',     'recruits': 32, 'manual': True},
 ]
 CASHBACK_RATE = 0.04   # ventaja del canal, la paga Christian, FUERA de la bolsa
 

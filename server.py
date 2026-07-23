@@ -1317,6 +1317,26 @@ def _distributor_rollup(dist, users, orders):
     clients = [u for u in users if u.get('referred_by') == dist['id']]
     # VENTAS propias = pedidos hechos con SU código (no canceladas).
     valid = [o for o in orders if o.get('referred_by') == dist['id'] and o.get('status') != 'cancelado']
+    # Red (downline) desde los usuarios ya cargados, para ventas de equipo,
+    # reclutas activos y la señal secreta de Diamond (solo la ve el admin).
+    children = {}
+    for u in users:
+        if u.get('role') == 'distributor':
+            children.setdefault(u.get('upline_id'), []).append(u['id'])
+    network, queue, seen = [], list(children.get(dist['id'], [])), set()
+    while queue:
+        nid = queue.pop()
+        if nid in seen:
+            continue
+        seen.add(nid); network.append(nid); queue.extend(children.get(nid, []))
+    net_ids = set(network) | {dist['id']}
+    sales_by = {}
+    for o in orders:
+        rb = o.get('referred_by')
+        if rb in net_ids and o.get('status') != 'cancelado':
+            sales_by[rb] = sales_by.get(rb, 0) + o.get('total', 0)
+    team_sales = sum(sales_by.values())
+    active_recruits = sum(1 for nid in network if sales_by.get(nid, 0) > 0)
     return {
         'id': dist['id'],
         'name': dist['name'],
@@ -1333,6 +1353,10 @@ def _distributor_rollup(dist, users, orders):
         'sales_total': sum(o.get('total', 0) for o in valid),
         # GANANCIAS = su tajada como vendedor + sobrecomisiones de su downline.
         'earnings': pyramid.earnings_for(dist['id'], orders),
+        'team_sales': team_sales,
+        'active_recruits': active_recruits,
+        # Señal secreta: este Elite ya desbloqueó el Diamond (43%). Solo el admin la ve.
+        'diamond_eligible': dist.get('tier') == 'elite' and pyramid.diamond_qualifies(team_sales, active_recruits),
     }
 
 

@@ -626,7 +626,7 @@ def test_pyramid_tier_rates_are_the_six_levels():
     assert pyramid.tier_rate('senior') == 0.30
     assert pyramid.tier_rate('master') == 0.35
     assert pyramid.tier_rate('elite') == 0.40
-    assert pyramid.tier_rate('diamond') == 0.45
+    assert pyramid.tier_rate('diamond') == 0.43   # secreto
 
 
 def test_pyramid_differential_total_equals_top_tier():
@@ -756,11 +756,19 @@ def test_level_progress_senior_uses_team_sales():
     assert lp['recruits']['target'] == 8 and lp['qualifies'] is True
 
 
-def test_level_progress_diamond_is_top_no_next():
+def test_level_progress_elite_is_the_visible_top():
+    # Diamond es SECRETO: para el distribuidor, Elite es el tope de la escalera.
+    lp = pyramid.level_progress('elite', 0, 999999999, 999)
+    assert lp['kind'] == 'top' and lp['next'] is None and lp['rate'] == 0.40
+
+
+def test_level_progress_diamond_is_top():
     lp = pyramid.level_progress('diamond', 0, 0, 0)
-    assert lp['kind'] == 'top' and lp['next'] is None and lp['rate'] == 0.45
+    assert lp['kind'] == 'top' and lp['next'] is None and lp['rate'] == 0.43
 
 
-def test_level_progress_elite_to_diamond_is_manual():
-    lp = pyramid.level_progress('elite', personal_sales=0, team_sales=100000000, active_recruits=32)
-    assert lp['next'] == 'diamond' and lp['manual'] is True and lp['qualifies'] is True
+def test_diamond_qualifies_needs_50m_and_more_than_32():
+    assert pyramid.diamond_qualifies(50000000, 33) is True
+    assert pyramid.diamond_qualifies(50000000, 32) is False    # debe ser MÁS de 32
+    assert pyramid.diamond_qualifies(49999999, 40) is False    # y $50M de equipo
+    assert pyramid.diamond_qualifies(60000000, 40) is True
