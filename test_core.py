@@ -894,3 +894,11 @@ def test_deny_view_as_blocks_writes():
     # un usuario normal (o anónimo) pasa sin problema
     deny_view_as({'id': 'x'})
     deny_view_as(None)
+
+
+def test_deny_view_as_guards_optional_user_paths():
+    """Regresión: el checkout usa get_optional_user; si la marca no viaja ahí,
+    un token de 'ver como' podría COMPRAR. Debe bloquearse igual."""
+    with pytest.raises(HTTPException) as e:
+        deny_view_as({'id': 'x', 'role': 'user', 'view_as': True})
+    assert e.value.status_code == 403

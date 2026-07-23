@@ -84,7 +84,14 @@ async def get_optional_user(credentials: HTTPAuthorizationCredentials = Depends(
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user = await db.users.find_one({'id': payload.get('sub')}, {'_id': 0, 'password_hash': 0, 'totp_secret': 0, 'totp_secret_pending': 0})
-        return None if (user and user.get('blocked')) else user
+        if user and user.get('blocked'):
+            return None
+        # La marca de "ver como" también viaja aquí: si no, un endpoint que use
+        # get_optional_user (p. ej. crear pedido) aceptaría escrituras.
+        if user and payload.get('view_as'):
+            user['view_as'] = True
+            user['view_as_admin'] = payload.get('admin_id')
+        return user
     except Exception:
         return None
 
