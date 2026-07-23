@@ -189,8 +189,12 @@ class Order(BaseModel):
     shipping: float
     total: float
     status: str = 'pendiente'   # pendiente | confirmado | enviado | entregado | cancelado
-    referred_by: Optional[str] = None   # id del distribuidor que refirió (si aplica)
-    commission: float = 0               # ganancia del distribuidor en esta orden (MXN)
+    referred_by: Optional[str] = None   # id del distribuidor cuyo código se usó (si aplica)
+    commission: float = 0               # tajada del VENDEDOR en esta orden (MXN) — compat
+    # Pirámide: reparto completo bloqueado al crear la orden. Cada fila es
+    # {distributor_id, role: 'seller'|'override', rate, amount(MXN)}. Los reportes
+    # suman lo guardado, así que cambiar tasas/niveles nunca toca ventas pasadas.
+    commissions: List[dict] = Field(default_factory=list)
     # Lealtad: canje descontado al crear; los ganados se depositan al confirmarse el pago
     points_used: int = 0
     points_earned: int = 0
@@ -229,6 +233,8 @@ class DistributorCreate(BaseModel):
     email: EmailStr
     commission_rate: float = 0.30          # 0..1 — proporción de cada venta que gana el distribuidor (default 30%, Christian 2026-07-22)
     customer_discount_rate: float = 0.10   # 0.05..0.50 — descuento que su código da a SUS clientes
+    tier: str = 'junior'                   # junior | senior | master — pirámide (§4ter)
+    upline_id: Optional[str] = None        # distribuidor que lo trajo (para las sobrecomisiones)
 
 
 # ---------- Protocolos (seguimiento de consumo / recompra) ----------

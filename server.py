@@ -29,6 +29,7 @@ from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret
 import coa_store
 from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
 import loyalty
+import pyramid
 import auth_factors
 import btcpay
 import nowpayments
@@ -88,6 +89,25 @@ async def resolve_distributor(code):
     if not code:
         return None
     return await db.users.find_one({'distributor_code': code, 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
+
+
+async def _upline_chain(dist, levels=pyramid.MAX_OVERRIDE_LEVELS):
+    """Sube por el árbol de la pirámide desde `dist`: devuelve sus uplines
+    (distribuidores) del más cercano al más lejano, hasta `levels`. Corta ciclos."""
+    chain = []
+    seen = {dist['id']}
+    current = dist
+    for _ in range(levels):
+        up_id = current.get('upline_id')
+        if not up_id or up_id in seen:
+            break
+        up = await db.users.find_one({'id': up_id, 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
+        if not up:
+            break
+        chain.append(up)
+        seen.add(up_id)
+        current = up
+    return chain
 
 
 # ----------------- Health -----------------
@@ -812,7 +832,14 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     shipping = payload.shipping if payload.shipping else 0   # el envio se cotiza por separado
     total = paid_merchandise + shipping
     points_earned = loyalty.earn(paid_merchandise, user is not None and loyalty.eligible(user))
-    commission = round(paid_merchandise * referrer.get('commission_rate', 0.25)) if referrer else 0
+    # Pirámide: el vendedor gana su tasa y cada upline (hasta 2) su 3.5% fijo. Se
+    # bloquea en pesos al crear la orden; los reportes suman lo guardado.
+    commissions = []
+    commission = 0
+    if referrer:
+        upline = await _upline_chain(referrer)
+        commissions = pyramid.compute_commission_breakdown(paid_merchandise, referrer, upline)
+        commission = pyramid.seller_amount(commissions)
     order = Order(
         order_number=gen_order_number(),
         user_id=user['id'] if user else None,
@@ -826,6 +853,7 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         total=total,
         referred_by=referrer['id'] if referrer else None,
         commission=commission,
+        commissions=commissions,
         points_used=points_used,
         points_earned=points_earned,
     )
@@ -1248,8 +1276,8 @@ def _distributor_rollup(dist, users, orders):
     cliente NO cuentan, aunque el cliente este ligado a el. 'clients' sigue siendo
     la relacion (quien uso su codigo/registro), solo para listarlos."""
     clients = [u for u in users if u.get('referred_by') == dist['id']]
-    sales = [o for o in orders if o.get('referred_by') == dist['id']]
-    valid = [o for o in sales if o.get('status') != 'cancelado']
+    # VENTAS propias = pedidos hechos con SU código (no canceladas).
+    valid = [o for o in orders if o.get('referred_by') == dist['id'] and o.get('status') != 'cancelado']
     return {
         'id': dist['id'],
         'name': dist['name'],
@@ -1257,11 +1285,15 @@ def _distributor_rollup(dist, users, orders):
         'distributor_code': dist.get('distributor_code'),
         'commission_rate': dist.get('commission_rate', 0.25),
         'customer_discount_rate': dist.get('customer_discount_rate', 0),
+        # Pirámide: nivel y de quién cuelga.
+        'tier': dist.get('tier', 'junior'),
+        'upline_id': dist.get('upline_id'),
         'created_at': dist.get('created_at'),
         'clients_count': len(clients),
         'sales_count': len(valid),
         'sales_total': sum(o.get('total', 0) for o in valid),
-        'earnings': sum(o.get('commission', 0) for o in valid),
+        # GANANCIAS = su tajada como vendedor + sobrecomisiones de su downline.
+        'earnings': pyramid.earnings_for(dist['id'], orders),
     }
 
 
@@ -1296,6 +1328,10 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
         # arriba del 50%. El servidor lo exige; el navegador no basta.
         'commission_rate': max(0.0, min(COMMISSION_CAP, payload.commission_rate)),
         'customer_discount_rate': max(0.05, min(0.50, payload.customer_discount_rate)),
+        # Pirámide (§4ter): todo distribuidor nuevo entra como JUNIOR salvo que el
+        # admin diga otra cosa; upline = quién lo trajo (para las sobrecomisiones).
+        'tier': payload.tier if payload.tier in pyramid.TIER_RATES else 'junior',
+        'upline_id': payload.upline_id,
         'language': 'es',
         'email_verified': False,
         'invited_at': now_iso(),
@@ -1477,28 +1513,92 @@ async def update_distributor_rates(dist_id: str, payload: dict, admin=Depends(ge
             'customer_discount_rate': fresh['customer_discount_rate']}
 
 
+@api_router.put('/admin/distributors/{dist_id}/pyramid')
+async def update_distributor_pyramid(dist_id: str, payload: dict, admin=Depends(get_current_admin)):
+    """Asigna el NIVEL (junior/senior/master) y/o el UPLINE de un distribuidor.
+
+    Es como se arma y se asciende en la pirámide (§4ter). Los ascensos van hacia
+    adelante: las ventas ya hechas guardaron su reparto en pesos y no se tocan.
+    Reglas de seguridad: el upline debe existir y ser distribuidor, no puede ser
+    él mismo, y no se permite un ciclo (que su upline termine colgando de él)."""
+    dist = await db.users.find_one({'id': dist_id, 'role': 'distributor'}, {'_id': 0})
+    if not dist:
+        raise HTTPException(status_code=404, detail='Distribuidor no encontrado')
+    update = {}
+    if 'tier' in payload:
+        tier = payload.get('tier')
+        if tier not in pyramid.TIER_RATES:
+            raise HTTPException(status_code=400, detail='Nivel inválido (junior/senior/master)')
+        update['tier'] = tier
+    if 'upline_id' in payload:
+        up_id = payload.get('upline_id') or None
+        if up_id:
+            if up_id == dist_id:
+                raise HTTPException(status_code=400, detail='Un distribuidor no puede ser su propio upline')
+            up = await db.users.find_one({'id': up_id, 'role': 'distributor'}, {'_id': 0})
+            if not up:
+                raise HTTPException(status_code=400, detail='El upline debe ser un distribuidor existente')
+            # Evitar ciclos: subir desde el upline propuesto; si topamos con dist_id, es ciclo.
+            cursor, hops = up, 0
+            while cursor and hops < 50:
+                if cursor.get('id') == dist_id:
+                    raise HTTPException(status_code=400, detail='Ese upline crearía un ciclo en la pirámide')
+                nxt = cursor.get('upline_id')
+                cursor = await db.users.find_one({'id': nxt}, {'_id': 0}) if nxt else None
+                hops += 1
+        update['upline_id'] = up_id
+    if not update:
+        raise HTTPException(status_code=400, detail='Nada que actualizar')
+    await db.users.update_one({'id': dist_id}, {'$set': update})
+    fresh = await db.users.find_one({'id': dist_id}, {'_id': 0, 'password_hash': 0})
+    return {'id': fresh['id'], 'name': fresh['name'],
+            'tier': fresh.get('tier', 'junior'), 'upline_id': fresh.get('upline_id'),
+            'commission_rate': fresh.get('commission_rate')}
+
+
 # ----------------- Distributor portal -----------------
+def _my_amount(order, dist_id):
+    """Lo que ESTE distribuidor gana en una orden: su tajada en el reparto de la
+    pirámide (vendedor o upline). Cae al campo viejo `commission` si la orden es
+    anterior a la pirámide y fue su venta directa."""
+    rows = order.get('commissions')
+    if rows:
+        return sum(r.get('amount', 0) for r in rows if r.get('distributor_id') == dist_id)
+    return order.get('commission', 0) if order.get('referred_by') == dist_id else 0
+
+
 @api_router.get('/distributor/summary')
 async def distributor_summary(dist=Depends(get_current_distributor)):
-    # Ventas atribuidas = solo pedidos hechos con SU código (regla Christian
-    # 2026-07-22). Los clientes se listan aparte por la relación 'referred_by'.
+    # Clientes = relación (referred_by). VENTAS propias = pedidos con SU código.
+    # GANANCIAS = su tajada como vendedor + sobrecomisiones de su downline, así que
+    # jalamos también los pedidos donde aparece en el reparto (commissions).
     users = await db.users.find({'referred_by': dist['id']}, {'_id': 0, 'password_hash': 0}).to_list(5000)
-    orders = await db.orders.find({'referred_by': dist['id']}, {'_id': 0}).to_list(10000)
+    orders = await db.orders.find(
+        {'$or': [{'referred_by': dist['id']}, {'commissions.distributor_id': dist['id']}]}, {'_id': 0}
+    ).to_list(10000)
     valid = [o for o in orders if o.get('status') != 'cancelado']
+    own_sales = [o for o in valid if o.get('referred_by') == dist['id']]
     by_month = {}
     for o in valid:
         m = (o.get('created_at') or '')[:7]
         e = by_month.setdefault(m, {'month': m, 'earnings': 0, 'sales': 0})
-        e['earnings'] += o.get('commission', 0)
-        e['sales'] += o.get('total', 0)
+        e['earnings'] += _my_amount(o, dist['id'])
+        if o.get('referred_by') == dist['id']:
+            e['sales'] += o.get('total', 0)
+    earnings_total = sum(_my_amount(o, dist['id']) for o in valid)
+    own_earnings = sum(_my_amount(o, dist['id']) for o in own_sales)
     return {
         'distributor_code': dist.get('distributor_code'),
-        'commission_rate': dist.get('commission_rate', 0.25),
+        'commission_rate': dist.get('commission_rate', pyramid.tier_rate(dist.get('tier'))),
         'customer_discount_rate': dist.get('customer_discount_rate', 0),
+        'tier': dist.get('tier', 'junior'),
         'clients_count': len(users),
-        'sales_count': len(valid),
-        'sales_total': sum(o.get('total', 0) for o in valid),
-        'earnings_total': sum(o.get('commission', 0) for o in valid),
+        'sales_count': len(own_sales),
+        'sales_total': sum(o.get('total', 0) for o in own_sales),
+        'earnings_total': earnings_total,
+        # Desglose: cuánto es de ventas propias y cuánto de sobrecomisión del equipo.
+        'own_earnings': own_earnings,
+        'override_earnings': earnings_total - own_earnings,
         'monthly': sorted(by_month.values(), key=lambda e: e['month']),
     }
 

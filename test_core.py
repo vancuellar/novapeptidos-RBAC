@@ -614,3 +614,108 @@ def test_payment_confirmed_email_renders(monkeypatch):
     assert sent['to'] == 'ana@x.y'
     assert 'EX-20260721-0009' in sent['subject']
     assert 'EX-20260721-0009' in sent['html'] and 'Ana' in sent['html']
+
+
+# ---------- Pirámide de distribuidores (motor de comisiones) ----------
+import pyramid
+
+
+def test_pyramid_junior_sale_splits_seller_and_two_uplines():
+    # Vende Junior (22.5%). Su Senior arriba (3.5%) y el Master de ese Senior (3.5%).
+    jr = {'id': 'jr', 'tier': 'junior'}
+    sr = {'id': 'sr', 'tier': 'senior'}
+    ma = {'id': 'ma', 'tier': 'master'}
+    b = pyramid.compute_commission_breakdown(10000, jr, [sr, ma])
+    amounts = {r['distributor_id']: r['amount'] for r in b}
+    assert amounts == {'jr': 2250, 'sr': 350, 'ma': 350}   # 22.5 + 3.5 + 3.5
+    assert pyramid.seller_amount(b) == 2250
+    assert pyramid.total_amount(b) == 2950                  # 29.5% total
+
+
+def test_pyramid_senior_sale_pays_only_one_upline():
+    sr = {'id': 'sr', 'tier': 'senior'}
+    ma = {'id': 'ma', 'tier': 'master'}
+    b = pyramid.compute_commission_breakdown(10000, sr, [ma])
+    amounts = {r['distributor_id']: r['amount'] for r in b}
+    assert amounts == {'sr': 2600, 'ma': 350}              # 26 + 3.5 = 29.5
+
+
+def test_pyramid_master_sale_keeps_the_whole_bag():
+    ma = {'id': 'ma', 'tier': 'master'}
+    b = pyramid.compute_commission_breakdown(10000, ma, [])
+    assert pyramid.total_amount(b) == 3000                 # 30%, sin nadie arriba
+
+
+def test_pyramid_founding_master_rate_overrides_tier():
+    founder = {'id': 'f', 'tier': 'master', 'commission_rate': 0.40}
+    b = pyramid.compute_commission_breakdown(10000, founder, [])
+    assert pyramid.seller_amount(b) == 4000                # 40% explícito manda
+
+
+def test_pyramid_junior_without_upline_leaves_rest_to_house():
+    # Un Junior directo de un Master (sin Senior en medio): 22.5 + 3.5, el otro
+    # 3.5 se queda con la casa (no se reparte).
+    jr = {'id': 'jr', 'tier': 'junior'}
+    ma = {'id': 'ma', 'tier': 'master'}
+    b = pyramid.compute_commission_breakdown(10000, jr, [ma])
+    assert pyramid.total_amount(b) == 2600                 # 22.5 + 3.5, no hay 2do nivel
+
+
+def test_pyramid_caps_override_levels_at_two():
+    jr = {'id': 'jr', 'tier': 'junior'}
+    chain = [{'id': 'u1'}, {'id': 'u2'}, {'id': 'u3'}]     # 3 niveles arriba
+    b = pyramid.compute_commission_breakdown(10000, jr, chain)
+    ids = [r['distributor_id'] for r in b]
+    assert ids == ['jr', 'u1', 'u2']                        # u3 no cobra (máx 2)
+
+
+def test_pyramid_never_pays_the_same_distributor_twice():
+    jr = {'id': 'jr', 'tier': 'junior'}
+    b = pyramid.compute_commission_breakdown(10000, jr, [jr, {'id': 'sr'}])
+    ids = [r['distributor_id'] for r in b]
+    assert ids == ['jr', 'sr']                              # el vendedor no se auto-paga arriba
+
+
+def test_pyramid_earnings_for_sums_seller_and_override_roles():
+    orders = [
+        {'status': 'entregado', 'commissions': [
+            {'distributor_id': 'jr', 'role': 'seller', 'amount': 2250},
+            {'distributor_id': 'sr', 'role': 'override', 'amount': 350},
+        ]},
+        {'status': 'entregado', 'commissions': [
+            {'distributor_id': 'sr', 'role': 'seller', 'amount': 2600},
+        ]},
+        {'status': 'cancelado', 'commissions': [
+            {'distributor_id': 'sr', 'role': 'seller', 'amount': 9999},
+        ]},
+    ]
+    assert pyramid.earnings_for('sr', orders) == 350 + 2600   # cancelada no cuenta
+    assert pyramid.earnings_for('jr', orders) == 2250
+
+
+def test_pyramid_earnings_for_reads_legacy_commission_field():
+    # Órdenes viejas sin `commissions`: cuenta `commission` si fue su venta directa.
+    orders = [{'status': 'entregado', 'referred_by': 'd1', 'commission': 500}]
+    assert pyramid.earnings_for('d1', orders) == 500
+    assert pyramid.earnings_for('otro', orders) == 0
+
+
+def test_pyramid_zero_merchandise_pays_nothing():
+    assert pyramid.compute_commission_breakdown(0, {'id': 'x', 'tier': 'master'}, []) == []
+
+
+def test_distributor_rollup_counts_override_earnings():
+    # Un Master gana su venta directa + sobrecomisión de la venta de su Junior.
+    ma = {'id': 'ma', 'name': 'M', 'email': 'm@x', 'tier': 'master'}
+    orders = [
+        {'referred_by': 'ma', 'status': 'entregado', 'total': 5000, 'commissions': [
+            {'distributor_id': 'ma', 'role': 'seller', 'amount': 1500}]},
+        {'referred_by': 'jr', 'status': 'entregado', 'total': 10000, 'commissions': [
+            {'distributor_id': 'jr', 'role': 'seller', 'amount': 2250},
+            {'distributor_id': 'ma', 'role': 'override', 'amount': 350}]},
+    ]
+    r = _distributor_rollup(ma, [], orders)
+    assert r['sales_count'] == 1          # solo su venta directa cuenta como VENTA
+    assert r['sales_total'] == 5000
+    assert r['earnings'] == 1850          # 1500 venta propia + 350 sobrecomisión
+    assert r['tier'] == 'master'
