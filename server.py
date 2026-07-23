@@ -1307,6 +1307,105 @@ async def admin_distributors(admin=Depends(get_current_admin)):
     return out
 
 
+@api_router.post('/admin/seed-demo')
+async def seed_demo(admin=Depends(get_current_admin), clear: bool = False):
+    """Siembra (o borra) datos DEMO para ver los 3 paneles en vivo. Todo lleva
+    seed=True. `?clear=true` solo borra. Es temporal: Christian pidió ver cómo
+    funcionan los paneles con datos. Idempotente. Solo admin."""
+    for c in ('users', 'orders', 'points'):
+        await db[c].delete_many({'seed': True})
+    if clear:
+        return {'cleared': True}
+
+    def _iso(y, m, d):
+        return datetime(y, m, d, 12, 0, tzinfo=timezone.utc).isoformat()
+    pw = hash_password('Demo-1234!')
+    consents = {'age_confirmed': True, 'privacy_accepted': True, 'accepted_at': _iso(2026, 4, 1)}
+
+    def _dist(_id, name, email, code, rate, tier, upline, disc):
+        return {'id': _id, 'name': name, 'email': email, 'password_hash': pw,
+                'role': 'distributor', 'distributor_code': code, 'commission_rate': rate,
+                'customer_discount_rate': disc, 'tier': tier, 'upline_id': upline,
+                'language': 'es', 'email_verified': True, 'blocked': False,
+                'consents': consents, 'created_at': _iso(2026, 4, 1), 'seed': True}
+
+    M, S, J = 'seed-maria', 'seed-luis', 'seed-ana'
+    await db.users.insert_many([
+        _dist(M, 'María (Master demo)', 'maria.demo@exygenlabs.com', 'MARIA-40', 0.40, 'master', None, 0.15),
+        _dist(S, 'Luis (Senior demo)', 'luis.demo@exygenlabs.com', 'LUIS-26', 0.26, 'senior', M, 0.12),
+        _dist(J, 'Ana (Junior demo)', 'ana.demo@exygenlabs.com', 'ANA-15', 0.225, 'junior', S, 0.15),
+    ])
+
+    def _client(_id, name, email, ref, pts):
+        return {'id': _id, 'name': name, 'email': email, 'password_hash': pw, 'role': 'user',
+                'referred_by': ref, 'language': 'es', 'email_verified': True, 'blocked': False,
+                'points_balance': pts, 'consents': consents, 'created_at': _iso(2026, 4, 5),
+                'phone': '+52 (55) 1234-5678', 'seed': True}
+
+    CARLOS, SOFIA, DIEGO, MARTA = 'seed-carlos', 'seed-sofia', 'seed-diego', 'seed-marta'
+    await db.users.insert_many([
+        _client(CARLOS, 'Carlos Demo', 'carlos.demo@exygenlabs.com', J, 420),
+        _client(SOFIA, 'Sofía Demo', 'sofia.demo@exygenlabs.com', S, 0),
+        _client(DIEGO, 'Diego Demo', 'diego.demo@exygenlabs.com', M, 0),
+        _client(MARTA, 'Marta Demo', 'marta.demo@exygenlabs.com', J, 0),
+    ])
+
+    items = {
+        'sema': {'product_id': 'seed-sema::10 mg', 'name': 'Semaglutida', 'presentation': '10 mg', 'price': 2049, 'quantity': 1},
+        'reta': {'product_id': 'seed-reta::10 mg', 'name': 'Retatrutida', 'presentation': '10 mg', 'price': 2499, 'quantity': 1},
+        'bpc': {'product_id': 'seed-bpc::10 mg', 'name': 'BPC-157', 'presentation': '10 mg', 'price': 899, 'quantity': 2},
+        'klow': {'product_id': 'seed-klow::80 mg', 'name': 'KLOW (BPC + GHK-Cu + TB-500 + KPV)', 'presentation': '80 mg', 'price': 2879, 'quantity': 1},
+    }
+    seller = {'junior': J, 'senior': S, 'master': M}
+
+    def _comms(kind, merch):
+        if kind == 'junior':
+            return [{'distributor_id': J, 'role': 'seller', 'rate': 0.225, 'amount': round(merch * 0.225)},
+                    {'distributor_id': S, 'role': 'override', 'rate': 0.035, 'amount': round(merch * 0.035)},
+                    {'distributor_id': M, 'role': 'override', 'rate': 0.035, 'amount': round(merch * 0.035)}]
+        if kind == 'senior':
+            return [{'distributor_id': S, 'role': 'seller', 'rate': 0.26, 'amount': round(merch * 0.26)},
+                    {'distributor_id': M, 'role': 'override', 'rate': 0.035, 'amount': round(merch * 0.035)}]
+        if kind == 'master':
+            return [{'distributor_id': M, 'role': 'seller', 'rate': 0.40, 'amount': round(merch * 0.40)}]
+        return []
+
+    n = [0]
+    def _order(user_id, name, kind, merch, keys, status, y, m, d):
+        n[0] += 1
+        comms = _comms(kind, merch) if kind else []
+        return {'id': str(uuid.uuid4()), 'order_number': f'EX-{y}{m:02d}{d:02d}-{1000+n[0]}',
+                'user_id': user_id, 'items': [items[k] for k in keys],
+                'customer': {'full_name': name, 'email': name.split()[0].lower() + '.demo@exygenlabs.com',
+                             'phone': '+52 (55) 1234-5678'},
+                'payment_method': 'spei', 'subtotal': merch, 'discount': 0, 'discount_rate': 0,
+                'shipping': 0, 'total': merch, 'status': status,
+                'referred_by': seller.get(kind), 'commission': (comms[0]['amount'] if comms else 0),
+                'commissions': comms, 'points_used': 0, 'points_earned': round(merch * 0.03),
+                'points_awarded': status != 'pendiente', 'created_at': _iso(y, m, d),
+                'paid_at': _iso(y, m, d), 'seed': True}
+
+    await db.orders.insert_many([
+        _order(CARLOS, 'Carlos Demo', 'junior', 8000, ['sema', 'bpc'], 'entregado', 2026, 4, 12),
+        _order(CARLOS, 'Carlos Demo', 'junior', 6000, ['reta'], 'entregado', 2026, 5, 20),
+        _order(MARTA, 'Marta Demo', 'junior', 12000, ['sema', 'reta'], 'entregado', 2026, 6, 3),
+        _order(MARTA, 'Marta Demo', 'junior', 4000, ['bpc'], 'confirmado', 2026, 7, 10),
+        _order(SOFIA, 'Sofía Demo', 'senior', 15000, ['klow', 'sema'], 'entregado', 2026, 5, 15),
+        _order(SOFIA, 'Sofía Demo', 'senior', 9000, ['reta'], 'entregado', 2026, 6, 22),
+        _order(DIEGO, 'Diego Demo', 'master', 20000, ['klow', 'reta'], 'entregado', 2026, 6, 28),
+        _order(DIEGO, 'Diego Demo', 'master', 7000, ['sema'], 'confirmado', 2026, 7, 5),
+        _order(CARLOS, 'Carlos Demo', None, 3000, ['bpc'], 'entregado', 2026, 7, 15),
+    ])
+    return {
+        'distributors': await db.users.count_documents({'seed': True, 'role': 'distributor'}),
+        'clients': await db.users.count_documents({'seed': True, 'role': 'user'}),
+        'orders': await db.orders.count_documents({'seed': True}),
+        'logins': {'password': 'Demo-1234!',
+                   'master': 'maria.demo@exygenlabs.com', 'senior': 'luis.demo@exygenlabs.com',
+                   'junior': 'ana.demo@exygenlabs.com', 'client': 'carlos.demo@exygenlabs.com'},
+    }
+
+
 @api_router.post('/admin/distributors')
 async def create_distributor(payload: DistributorCreate, admin=Depends(get_current_admin)):
     existing = await db.users.find_one({'email': payload.email.lower()})
