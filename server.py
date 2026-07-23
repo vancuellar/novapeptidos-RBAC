@@ -93,7 +93,7 @@ async def resolve_distributor(code):
 
 
 # ----------------- Códigos de descuento (auto-generados por nivel) -----------------
-CODE_TTL_DAYS = 30   # rotación automática: los códigos se renuevan cada 30 días
+CODE_TTL_DAYS = 90   # rotación automática: los códigos se renuevan cada 90 días
 
 
 def gen_discount_code(name, pct):
