@@ -49,7 +49,7 @@ from webauthn import (
 from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
 from webauthn.helpers.structs import (
     AuthenticatorSelectionCriteria, ResidentKeyRequirement,
-    UserVerificationRequirement, PublicKeyCredentialDescriptor,
+    UserVerificationRequirement, PublicKeyCredentialDescriptor, AuthenticatorAttachment,
 )
 from lab_reference import (
     MARKERS_BY_KEY, range_for, evaluate, families_for_products, relevant_markers,
@@ -462,10 +462,13 @@ async def passkey_register_options(user=Depends(get_current_user)):
         exclude_credentials=[
             PublicKeyCredentialDescriptor(id=base64url_to_bytes(c['credential_id'])) for c in existing
         ],
-        # resident_key REQUIRED = la llave se puede usar sin escribir el correo.
+        # PLATFORM = el sensor del propio equipo (Touch ID / Face ID / Windows
+        # Hello), no una llave USB externa. user_verification REQUIRED obliga a la
+        # biometría o PIN. resident_key REQUIRED = entra sin escribir el correo.
         authenticator_selection=AuthenticatorSelectionCriteria(
+            authenticator_attachment=AuthenticatorAttachment.PLATFORM,
             resident_key=ResidentKeyRequirement.REQUIRED,
-            user_verification=UserVerificationRequirement.PREFERRED,
+            user_verification=UserVerificationRequirement.REQUIRED,
         ),
     )
     cid = await _store_challenge(options.challenge, 'register', user['id'])
@@ -520,7 +523,7 @@ async def passkey_login_options():
     """Publico y sin usuario: la llave descubrible dice quien es."""
     options = generate_authentication_options(
         rp_id=PASSKEY_RP_ID,
-        user_verification=UserVerificationRequirement.PREFERRED,
+        user_verification=UserVerificationRequirement.REQUIRED,
     )
     cid = await _store_challenge(options.challenge, 'login')
     return {'challenge_id': cid, 'options': json.loads(options_to_json(options))}
@@ -1715,130 +1718,6 @@ async def admin_distributors(admin=Depends(get_current_admin)):
     out = [_distributor_rollup(d, users, orders) for d in dists]
     out.sort(key=lambda d: -d['earnings'])
     return out
-
-
-@api_router.post('/admin/seed-demo')
-async def seed_demo(admin=Depends(get_current_admin), clear: bool = False):
-    """Siembra (o borra) datos DEMO para ver los 3 paneles en vivo. Todo lleva
-    seed=True. `?clear=true` solo borra. Es temporal: Christian pidió ver cómo
-    funcionan los paneles con datos. Idempotente. Solo admin."""
-    for c in ('users', 'orders', 'points'):
-        await db[c].delete_many({'seed': True})
-    if clear:
-        return {'cleared': True}
-
-    def _iso(y, m, d):
-        from datetime import datetime, timezone
-        return datetime(y, m, d, 12, 0, tzinfo=timezone.utc).isoformat()
-    pw = hash_password('Demo-1234!')
-    consents = {'age_confirmed': True, 'privacy_accepted': True, 'accepted_at': _iso(2026, 4, 1)}
-
-    # Árbol: María (Master) > Luis (Senior) > 4 Juniors activos.
-    MARIA, LUIS = 'seed-maria', 'seed-luis'
-    JUN = [('seed-ana', 'Ana', 'ANA'), ('seed-beto', 'Beto', 'BETO'),
-           ('seed-caro', 'Caro', 'CARO'), ('seed-dani', 'Dani', 'DANI')]
-
-    def _dist(_id, name, email, code, tier, upline, disc):
-        return {'id': _id, 'name': name, 'email': email, 'password_hash': pw,
-                'role': 'distributor', 'distributor_code': code,
-                'commission_rate': pyramid.tier_rate(tier), 'customer_discount_rate': disc,
-                'tier': tier, 'upline_id': upline, 'language': 'es', 'email_verified': True,
-                'blocked': False, 'consents': consents, 'created_at': _iso(2026, 4, 1), 'seed': True}
-
-    dist_docs = [
-        _dist(MARIA, 'María (Master demo)', 'maria.demo@exygenlabs.com', 'MARIA-DEMO', 'master', None, 0.25),
-        _dist(LUIS, 'Luis (Senior demo)', 'luis.demo@exygenlabs.com', 'LUIS-DEMO', 'senior', MARIA, 0.20),
-    ] + [_dist(jid, f'{nm} (Junior demo)', f'{nm.lower()}.demo@exygenlabs.com', f'{code}-DEMO', 'junior1', LUIS, 0.15)
-         for jid, nm, code in JUN]
-    await db.users.insert_many(dist_docs)
-    tier_by = {d['id']: d['tier'] for d in dist_docs}
-    upline_by = {d['id']: d['upline_id'] for d in dist_docs}
-    disc_by = {d['id']: d['customer_discount_rate'] for d in dist_docs}
-
-    def _chain(did):
-        out, cur = [], upline_by.get(did)
-        while cur:
-            out.append({'id': cur, 'tier': tier_by[cur]})
-            cur = upline_by.get(cur)
-        return out
-
-    def _client(_id, name, email, ref, pts):
-        return {'id': _id, 'name': name, 'email': email, 'password_hash': pw, 'role': 'user',
-                'referred_by': ref, 'language': 'es', 'email_verified': True, 'blocked': False,
-                'points_balance': pts, 'consents': consents, 'created_at': _iso(2026, 4, 5),
-                'phone': '+52 (55) 1234-5678', 'seed': True}
-
-    CARLOS = 'seed-carlos'
-    await db.users.insert_many([
-        _client(CARLOS, 'Carlos Demo', 'carlos.demo@exygenlabs.com', 'seed-ana', 4200),
-        _client('seed-sofia', 'Sofía Demo', 'sofia.demo@exygenlabs.com', 'seed-beto', 0),
-        _client('seed-diego', 'Diego Demo', 'diego.demo@exygenlabs.com', 'seed-caro', 0),
-        _client('seed-marta', 'Marta Demo', 'marta.demo@exygenlabs.com', 'seed-dani', 0),
-        _client('seed-pepe', 'Pepe Demo', 'pepe.demo@exygenlabs.com', 'seed-luis', 0),
-        _client('seed-rosa', 'Rosa Demo', 'rosa.demo@exygenlabs.com', 'seed-maria', 0),
-    ])
-
-    items = {
-        'sema': {'product_id': 'seed-sema::10 mg', 'name': 'Semaglutida', 'presentation': '10 mg', 'price': 2049, 'quantity': 1},
-        'reta': {'product_id': 'seed-reta::10 mg', 'name': 'Retatrutida', 'presentation': '10 mg', 'price': 2499, 'quantity': 1},
-        'klow': {'product_id': 'seed-klow::80 mg', 'name': 'KLOW (BPC + GHK-Cu + TB-500 + KPV)', 'presentation': '80 mg', 'price': 2879, 'quantity': 1},
-    }
-    n = [0]
-
-    def _order(user_id, name, seller_id, merch, keys, status, y, m, d):
-        n[0] += 1
-        seller = {'id': seller_id, 'tier': tier_by[seller_id]}
-        dr = disc_by[seller_id]
-        comms = pyramid.compute_commission_breakdown(merch, seller, _chain(seller_id), discount_rate=dr)
-        discount = round(merch * dr)
-        return {'id': str(uuid.uuid4()), 'order_number': f'EX-{y}{m:02d}{d:02d}-{1000+n[0]}',
-                'user_id': user_id, 'items': [items[k] for k in keys],
-                'customer': {'full_name': name, 'email': name.split()[0].lower() + '.demo@exygenlabs.com',
-                             'phone': '+52 (55) 1234-5678'},
-                'payment_method': 'spei', 'subtotal': merch, 'discount': discount, 'discount_rate': dr,
-                'shipping': 0, 'total': merch - discount, 'status': status,
-                'referred_by': seller_id, 'commission': pyramid.seller_amount(comms), 'commissions': comms,
-                'points_used': 0, 'points_earned': round(merch * 0.03), 'points_awarded': status != 'pendiente',
-                'created_at': _iso(y, m, d), 'paid_at': _iso(y, m, d), 'seed': True}
-
-    # Ventas grandes para que las barras se vean (umbrales en millones).
-    specs = [
-        # Ana → Carlos (~$1.05M personal → 35% hacia Senior); son 3 pedidos del cliente demo
-        (CARLOS, 'Carlos Demo', 'seed-ana', 350000, ['sema', 'klow'], 'entregado', 2026, 4, 12),
-        (CARLOS, 'Carlos Demo', 'seed-ana', 350000, ['reta'], 'entregado', 2026, 5, 20),
-        (CARLOS, 'Carlos Demo', 'seed-ana', 350000, ['klow'], 'confirmado', 2026, 6, 15),
-        # Beto → Sofía (~$1.05M)
-        ('seed-sofia', 'Sofía Demo', 'seed-beto', 400000, ['klow'], 'entregado', 2026, 4, 18),
-        ('seed-sofia', 'Sofía Demo', 'seed-beto', 350000, ['sema'], 'entregado', 2026, 5, 22),
-        ('seed-sofia', 'Sofía Demo', 'seed-beto', 300000, ['reta'], 'entregado', 2026, 6, 28),
-        # Caro → Diego (~$1.05M)
-        ('seed-diego', 'Diego Demo', 'seed-caro', 380000, ['reta'], 'entregado', 2026, 4, 25),
-        ('seed-diego', 'Diego Demo', 'seed-caro', 340000, ['klow'], 'entregado', 2026, 5, 30),
-        ('seed-diego', 'Diego Demo', 'seed-caro', 330000, ['sema'], 'entregado', 2026, 6, 10),
-        # Dani → Marta (~$1.05M)
-        ('seed-marta', 'Marta Demo', 'seed-dani', 360000, ['sema'], 'entregado', 2026, 5, 5),
-        ('seed-marta', 'Marta Demo', 'seed-dani', 350000, ['reta'], 'entregado', 2026, 6, 12),
-        ('seed-marta', 'Marta Demo', 'seed-dani', 340000, ['klow'], 'confirmado', 2026, 7, 8),
-        # Luis (Senior) vende directo a Pepe (~$900k propias)
-        ('seed-pepe', 'Pepe Demo', 'seed-luis', 450000, ['klow', 'reta'], 'entregado', 2026, 5, 14),
-        ('seed-pepe', 'Pepe Demo', 'seed-luis', 450000, ['sema'], 'entregado', 2026, 6, 20),
-        # María (Master) vende directo a Rosa (~$1.1M propias)
-        ('seed-rosa', 'Rosa Demo', 'seed-maria', 550000, ['klow', 'sema'], 'entregado', 2026, 6, 3),
-        ('seed-rosa', 'Rosa Demo', 'seed-maria', 550000, ['reta'], 'confirmado', 2026, 7, 4),
-    ]
-    await db.orders.insert_many([_order(*s) for s in specs])
-    # Códigos de descuento AUTO por nivel para cada distribuidor demo.
-    await db.discount_codes.delete_many({'distributor_id': {'$in': [d['id'] for d in dist_docs]}})
-    for d in dist_docs:
-        await _ensure_distributor_codes(d)
-    return {
-        'distributors': await db.users.count_documents({'seed': True, 'role': 'distributor'}),
-        'clients': await db.users.count_documents({'seed': True, 'role': 'user'}),
-        'orders': await db.orders.count_documents({'seed': True}),
-        'logins': {'password': 'Demo-1234!',
-                   'master': 'maria.demo@exygenlabs.com', 'senior': 'luis.demo@exygenlabs.com',
-                   'junior': 'ana.demo@exygenlabs.com', 'client': 'carlos.demo@exygenlabs.com'},
-    }
 
 
 @api_router.post('/admin/distributors')
