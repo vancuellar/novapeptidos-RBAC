@@ -902,3 +902,16 @@ def test_deny_view_as_guards_optional_user_paths():
     with pytest.raises(HTTPException) as e:
         deny_view_as({'id': 'x', 'role': 'user', 'view_as': True})
     assert e.value.status_code == 403
+
+
+# ---------- Privacidad del distribuidor (Christian 2026-07-23) ----------
+def test_distributor_never_sees_client_contact_or_products():
+    """El distribuidor ve un RESUMEN de sus clientes, no su ficha:
+    nada de correo, teléfono, domicilio ni qué compuestos compró."""
+    import inspect, server as srv
+    src = inspect.getsource(srv.distributor_orders) + inspect.getsource(srv.distributor_clients) \
+        + inspect.getsource(srv.distributor_sales)
+    for prohibido in ("'customer_email'", "'customer_phone'", "'destination'", "'email': u['email']"):
+        assert prohibido not in src, f'fuga de datos del cliente: {prohibido}'
+    # sí puede ver lo operativo
+    assert "'status'" in src and "'total'" in src and "'commission'" in src

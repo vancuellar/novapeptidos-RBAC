@@ -1534,6 +1534,9 @@ async def my_notifications(user=Depends(get_current_user)):
         {'kind': 'personal', 'user_id': user['id']},
         {'kind': 'broadcast', 'audience': {'$in': aud}},
     ]}, {'_id': 0}).to_list(500)
+    # Las que el usuario borró con la X no vuelven a aparecer.
+    dismissed = set(user.get('notifications_dismissed') or [])
+    docs = [d for d in docs if d.get('id') not in dismissed]
     docs.sort(key=lambda d: d.get('created_at', ''), reverse=True)
     seen_at = user.get('notifications_seen_at') or ''
     unread = sum(1 for d in docs if d.get('created_at', '') > seen_at)
@@ -1544,6 +1547,39 @@ async def my_notifications(user=Depends(get_current_user)):
 async def mark_notifications_seen(user=Depends(get_current_user)):
     """Marca todo como leído (guarda la fecha)."""
     deny_view_as(user)
+    await db.users.update_one({'id': user['id']}, {'$set': {'notifications_seen_at': now_iso()}})
+    return {'ok': True}
+
+
+@api_router.delete('/me/notifications/{notif_id}')
+async def dismiss_notification(notif_id: str, user=Depends(get_current_user)):
+    """La X de una notificación. Las personales se borran; los avisos del admin
+    (broadcast) solo se ocultan para ESE usuario."""
+    deny_view_as(user)
+    doc = await db.notifications.find_one({'id': notif_id}, {'_id': 0, 'kind': 1, 'user_id': 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail='No encontrada')
+    if doc.get('kind') == 'personal':
+        if doc.get('user_id') != user['id']:
+            raise HTTPException(status_code=403, detail='No es tuya')
+        await db.notifications.delete_one({'id': notif_id})
+    else:
+        await db.users.update_one({'id': user['id']},
+                                  {'$addToSet': {'notifications_dismissed': notif_id}})
+    return {'ok': True}
+
+
+@api_router.delete('/me/notifications')
+async def dismiss_all_notifications(user=Depends(get_current_user)):
+    """Limpia el centro de novedades del usuario de un jalón."""
+    deny_view_as(user)
+    aud = _audience_for_role(user.get('role'))
+    await db.notifications.delete_many({'kind': 'personal', 'user_id': user['id']})
+    bcast = await db.notifications.find({'kind': 'broadcast', 'audience': {'$in': aud}},
+                                        {'_id': 0, 'id': 1}).to_list(500)
+    if bcast:
+        await db.users.update_one({'id': user['id']},
+                                  {'$addToSet': {'notifications_dismissed': {'$each': [b['id'] for b in bcast]}}})
     await db.users.update_one({'id': user['id']}, {'$set': {'notifications_seen_at': now_iso()}})
     return {'ok': True}
 
@@ -2136,11 +2172,14 @@ async def distributor_clients(dist=Depends(get_current_distributor)):
     out = []
     for u in users:
         uo = [o for o in by_user.get(u['id'], []) if o.get('status') != 'cancelado']
+        # Privacidad (Christian 2026-07-23): el distribuidor ve un RESUMEN, no la
+        # ficha del cliente. Nada de correo, teléfono ni domicilio.
         out.append({
-            'id': u['id'], 'name': u['name'], 'email': u['email'], 'created_at': u.get('created_at'),
+            'id': u['id'], 'name': u['name'], 'created_at': u.get('created_at'),
             'orders_count': len(uo),
             'total_spent': sum(o.get('total', 0) for o in uo),
             'my_earnings': sum(o.get('commission', 0) for o in uo),
+            'last_order_at': max([o.get('created_at', '') for o in uo], default=None),
         })
     out.sort(key=lambda u: -u['total_spent'])
     return out
@@ -2162,10 +2201,10 @@ async def distributor_sales(dist=Depends(get_current_distributor)):
         'order_number': o.get('order_number'),
         'created_at': o.get('created_at'),
         'status': o.get('status'),
-        'customer_name': (o.get('customer') or {}).get('full_name'),
+        'customer_name': ((o.get('customer') or {}).get('full_name') or '').split(' ')[0],
         'total': o.get('total', 0),
         'commission': o.get('commission', 0),
-        'items': [{'name': it.get('name'), 'quantity': it.get('quantity')} for it in o.get('items', [])],
+        'items_count': sum(int(it.get('quantity', 0) or 0) for it in o.get('items', [])),
     } for o in orders]
 
 
@@ -2180,24 +2219,20 @@ async def distributor_orders(dist=Depends(get_current_distributor)):
     out = []
     for o in orders:
         c = o.get('customer') or {}
+        # Privacidad (Christian 2026-07-23): NADA de correo, teléfono, domicilio,
+        # ni qué compuestos compró su cliente. Solo lo necesario para dar
+        # seguimiento: quién, cuánto, cómo pagó, en qué va el envío.
         out.append({
             'order_number': o.get('order_number'),
             'created_at': o.get('created_at'),
             'status': o.get('status', 'pendiente'),
-            'customer_name': c.get('full_name'),
-            'customer_email': c.get('email'),
-            'customer_phone': c.get('phone'),
-            'destination': ', '.join(x for x in [c.get('city'), c.get('state'),
-                                                 c.get('country') if c.get('country') not in (None, '', 'MX') else None] if x),
+            'customer_name': (c.get('full_name') or '').split(' ')[0],
             'payment_method': o.get('payment_method'),
-            'items': [{'name': it.get('name'), 'quantity': it.get('quantity'),
-                       'presentation': it.get('presentation', '')} for it in o.get('items', [])],
+            'items_count': sum(int(it.get('quantity', 0) or 0) for it in o.get('items', [])),
             'total': o.get('total', 0),
             'discount_rate': o.get('discount_rate', 0),
             'commission': o.get('commission', 0),
             'carrier': o.get('carrier', ''),
-            'tracking_number': o.get('tracking_number', ''),
-            'tracking_url': o.get('tracking_url', ''),
             'shipped_at': o.get('shipped_at'),
             'delivered_at': o.get('delivered_at'),
             'eta': o.get('eta', ''),
