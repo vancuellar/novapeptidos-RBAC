@@ -105,6 +105,10 @@ class ProductBase(BaseModel):
     # puede venderse por distribuidores. Si no deja 5x neto: SOLO venta directa.
     commission_cap: float = 0.50
     distributor_eligible: bool = True
+    # Un producto vive en su `category` principal y, opcionalmente, aparece
+    # también en estas otras (p. ej. un combo en su categoría funcional Y en
+    # "stacks"). Christian 2026-07-23.
+    extra_categories: List[str] = []
 
 
 class ProductCreate(ProductBase):
@@ -120,6 +124,7 @@ class Product(ProductBase):
 class ProductUpdate(BaseModel):
     commission_cap: Optional[float] = None
     distributor_eligible: Optional[bool] = None
+    extra_categories: Optional[List[str]] = None
     name: Optional[str] = None
     slug: Optional[str] = None
     category: Optional[str] = None

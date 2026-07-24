@@ -776,15 +776,21 @@ async def list_products(
 ):
     query = {}
     if category:
-        query['category'] = category
+        # Un combo puede estar en su categoría funcional Y en 'stacks': se busca
+        # en la principal o en las adicionales.
+        query['$or'] = [{'category': category}, {'extra_categories': category}]
     if featured is not None:
         query['featured'] = featured
     if search:
-        query['$or'] = [
+        search_or = [
             {'name': {'$regex': search, '$options': 'i'}},
             {'short_description': {'$regex': search, '$options': 'i'}},
             {'description': {'$regex': search, '$options': 'i'}},
         ]
+        if '$or' in query:            # ya hay filtro de categoría: exige ambos
+            query = {'$and': [{'$or': query.pop('$or')}, {'$or': search_or}]}
+        else:
+            query['$or'] = search_or
     if in_stock:
         query['stock'] = {'$gt': 0}
     price_q = {}
