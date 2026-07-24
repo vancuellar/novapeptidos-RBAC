@@ -2160,6 +2160,23 @@ async def distributor_summary(dist=Depends(get_current_distributor)):
     }
 
 
+@api_router.get('/distributor/best-sellers')
+async def distributor_best_sellers(dist=Depends(get_current_distributor)):
+    """Ranking AGREGADO de los productos que más vende su red (para que sepa
+    qué empujar). Nunca dice QUIÉN compró qué — solo totales por producto."""
+    orders = await db.orders.find({'referred_by': dist['id'], 'status': {'$ne': 'cancelado'}},
+                                  {'_id': 0, 'items': 1}).to_list(10000)
+    agg = {}
+    for o in orders:
+        for it in o.get('items', []):
+            name = it.get('name') or '—'
+            row = agg.setdefault(name, {'name': name, 'units': 0, 'orders': 0})
+            row['units'] += int(it.get('quantity', 0) or 0)
+            row['orders'] += 1
+    ranking = sorted(agg.values(), key=lambda r: -r['units'])[:10]
+    return {'ranking': ranking, 'total_products': len(agg)}
+
+
 @api_router.get('/distributor/clients')
 async def distributor_clients(dist=Depends(get_current_distributor)):
     users = await db.users.find({'referred_by': dist['id']}, {'_id': 0, 'password_hash': 0}).to_list(5000)
