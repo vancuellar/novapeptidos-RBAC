@@ -915,3 +915,26 @@ def test_distributor_never_sees_client_contact_or_products():
         assert prohibido not in src, f'fuga de datos del cliente: {prohibido}'
     # sí puede ver lo operativo
     assert "'status'" in src and "'total'" in src and "'commission'" in src
+
+
+# ---------- El asistente conoce el catálogo (vendedor 24/7) ----------
+from ai_assistant import catalog_block, SYSTEM_PROMPT
+
+
+def test_catalog_block_lists_products_with_price_and_stock():
+    prods = [
+        {'name': 'NAD+ 500 mg', 'price': 1259, 'category': 'longevidad', 'stock': 8},
+        {'name': 'Glutatión 600 mg', 'price': 899, 'category': 'longevidad', 'stock': 0},
+    ]
+    out = catalog_block(prods)
+    assert 'NAD+ 500 mg' in out and '$1,259' in out      # dice qué y a cuánto
+    assert 'AGOTADO' in out                              # marca lo que no hay
+    assert 'longevidad' in out                           # agrupado por categoría
+    assert catalog_block([]) == ''                       # sin catálogo, no inventa bloque
+
+
+def test_prompt_demands_plain_language_and_selling():
+    p = SYSTEM_PROMPT.lower()
+    assert 'no a cientificos' in p or 'gente normal' in p   # tono llano obligatorio
+    assert 'vender' in p                                    # rol comercial explícito
+    assert 'whatsapp' in p                                  # canal nuevo ya incluido

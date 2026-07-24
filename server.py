@@ -2574,7 +2574,12 @@ async def build_order_context(message: str, user) -> str:
 
 @api_router.post('/ai/chat')
 async def ai_chat(payload: ChatInput, user=Depends(get_optional_user)):
-    chat = build_chat(payload.session_id, payload.product_context, payload.language)
+    # El asistente es nuestro vendedor 24/7: necesita saber QUE vendemos y a que
+    # precio, o termina mandando al cliente al correo por cosas que si tenemos.
+    catalog = await db.products.find({}, {'_id': 0, 'name': 1, 'price': 1,
+                                          'category': 1, 'stock': 1}).to_list(500)
+    chat = build_chat(payload.session_id, payload.product_context, payload.language,
+                      products=catalog)
     order_context = await build_order_context(payload.message, user)
     if order_context:
         chat['system_message'] += order_context
