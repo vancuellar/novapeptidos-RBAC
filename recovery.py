@@ -24,13 +24,12 @@ MIN_FOR_OFFER = 2500
 # 10% (y 15% desde $35,000), así que una oferta que no lo supere no se siente:
 # por eso el primer escalón ya empieza en 15%.
 OFFER_TIERS = [
-    {'min': 35000, 'rate': 0.20, 'perk': 'envio_gratis'},
-    {'min': 10000, 'rate': 0.20, 'perk': 'envio_gratis'},
-    {'min': 2500,  'rate': 0.15, 'perk': 'agua_gratis'},
+    {'min': 10000, 'rate': 0.20, 'perks': ['agua_10ml', 'envio_gratis']},
+    {'min': 2500,  'rate': 0.15, 'perks': ['agua_10ml', 'envio_gratis']},
 ]
 
 PERK_TEXT = {
-    'agua_gratis': 'agua bacteriostática de cortesía',
+    'agua_10ml': 'agua bacteriostática de 10 mL de cortesía',
     'envio_gratis': 'envío gratis',
 }
 
@@ -60,8 +59,8 @@ def offer_for(cart_total):
             return {
                 'kind': 'cupon',
                 'rate': tier['rate'],
-                'perk': tier['perk'],
-                'perk_text': PERK_TEXT[tier['perk']],
+                'perks': list(tier['perks']),
+                'perk_text': ' + '.join(PERK_TEXT[p] for p in tier['perks']),
                 # EL CANDADO: el cupón no sirve si compra menos de lo que ya traía.
                 'min_order': round(total),
             }

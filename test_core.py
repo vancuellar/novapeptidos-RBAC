@@ -1085,6 +1085,15 @@ def test_recovery_escalera_por_monto():
     assert recovery.offer_for(40000)['rate'] == 0.20
 
 
+def test_recovery_los_dos_escalones_llevan_agua_de_10ml_y_envio_gratis():
+    # Christian, 2026-07-25: las dos ofertas llevan los mismos dos regalos;
+    # lo unico que cambia con el monto es el porcentaje.
+    for monto in (2500, 9999, 10000, 80000):
+        o = recovery.offer_for(monto)
+        assert o['perks'] == ['agua_10ml', 'envio_gratis'], monto
+        assert '10 mL' in o['perk_text'] and 'envío gratis' in o['perk_text'], monto
+
+
 def test_recovery_la_oferta_siempre_supera_al_descuento_automatico():
     # El sitio ya da 10% solo (15% desde $35,000). Una oferta que no lo supere
     # no se siente y solo regala margen.

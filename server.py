@@ -3079,7 +3079,8 @@ async def _mandar_oferta(intento):
             'created_by': 'ia_recuperacion', 'created_at': now_iso(), 'expires_at': expira,
         })
         marca.update({'offer_code': code, 'offer_rate': oferta['rate'],
-                      'offer_min_order': oferta['min_order'], 'offer_perk': oferta['perk']})
+                      'offer_min_order': oferta['min_order'], 'offer_perks': oferta['perks'],
+                      'offer_perk_text': oferta['perk_text']})
     await db.checkout_intentos.update_one({'id': intento['id']}, {'$set': marca})
     try:
         await send_cart_recovery_email(nombre, intento.get('email'), intento.get('items', []),
