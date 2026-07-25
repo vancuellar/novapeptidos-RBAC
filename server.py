@@ -933,6 +933,22 @@ async def award_order_points(order):
     await _points_entry(order['user_id'], order, 'earn', order['points_earned'])
 
 
+async def restore_order_stock(order):
+    """Devuelve al inventario lo que la orden se habia llevado. Se llama al
+    CANCELAR y al BORRAR: antes el stock se descontaba y nunca regresaba, asi que
+    cada cancelacion perdia piezas para siempre (auditoria del 2026-07-25)."""
+    if order.get('stock_restored'):
+        return                      # ya se devolvio: no lo hagamos dos veces
+    for item in order.get('items', []):
+        pid, qty = item.get('product_id'), int(item.get('quantity') or 0)
+        if not pid or qty <= 0:
+            continue
+        await db.products.update_one({'$or': [{'id': pid}, {'sku': pid}]},
+                                     {'$inc': {'stock': qty}})
+        await db.stock.update_one({'key': pid}, {'$inc': {'qty': qty}})
+    await db.orders.update_one({'id': order['id']}, {'$set': {'stock_restored': True}})
+
+
 async def revoke_order_points(order):
     """Al cancelar: quita lo depositado y devuelve lo canjeado. Idempotente."""
     if not order.get('user_id'):
@@ -992,7 +1008,7 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     _pdocs = await db.products.find(
         {'$or': [{'id': {'$in': _keys}}, {'sku': {'$in': _keys}}]},
         {'_id': 0, 'id': 1, 'sku': 1, 'name': 1, 'commission_cap': 1,
-         'distributor_eligible': 1, 'category': 1}).to_list(500)
+         'distributor_eligible': 1, 'category': 1, 'stock': 1}).to_list(500)
     _pflags = {}
     for d in _pdocs:
         _pflags[d['id']] = d
@@ -1019,6 +1035,23 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         if not _eligible(item):
             return 0.0
         return min(float(rate or 0), _cap_of(item))
+
+    # NO se vende lo que no hay. El servidor descontaba el stock sin revisarlo, asi
+    # que un pedido de 99,999 piezas pasaba y dejaba el inventario en negativo
+    # (encontrado en la auditoria del 2026-07-25). Se valida contra el catalogo real.
+    faltantes = []
+    for it in payload.items:
+        if it.quantity is None or it.quantity < 1:
+            raise HTTPException(status_code=400, detail=f'Cantidad invalida en {it.name}')
+        d = _pflags.get(it.product_id)
+        if not d:
+            continue          # producto que no resolvimos: no inventamos un limite
+        hay = int(d.get('stock') or 0)
+        if it.quantity > hay:
+            faltantes.append(f'{it.name}: pediste {it.quantity} y hay {hay}')
+    if faltantes:
+        raise HTTPException(status_code=409,
+                            detail='No tenemos suficiente de: ' + '; '.join(faltantes))
 
     discountable = sum(
         item.price * item.quantity for item in payload.items if _eligible(item)
@@ -1363,6 +1396,7 @@ async def update_order_status(order_id: str, payload: OrderStatusUpdate, admin=D
         await award_order_points(order)
     elif payload.status == 'cancelado':
         await revoke_order_points(order)
+        await restore_order_stock(order)     # lo cancelado regresa al inventario
     # Aviso de pago confirmado al cliente, solo al ENTRAR a 'confirmado'.
     num = order.get('order_number')
     if payload.status == 'confirmado' and (prev.get('status') or '') != 'confirmado':
@@ -3162,6 +3196,7 @@ async def admin_delete_order(order_id: str, admin=Depends(get_current_admin)):
         raise HTTPException(status_code=404, detail='Pedido no encontrado')
     if order.get('status') != 'cancelado':
         await revoke_order_points(order)     # devuelve puntos ganados y canjeados
+    await restore_order_stock(order)         # y devuelve las piezas al inventario
     await db.orders.delete_one({'id': order_id})
     await db.points.delete_many({'order_id': order_id})
     logger.warning('Admin %s borró el pedido %s (%s, $%s)', admin.get('email'),
