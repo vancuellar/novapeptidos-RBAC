@@ -29,6 +29,7 @@ from auth import (
 )
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
 import coa_store
+import meta_ads
 from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
 import loyalty
 import pyramid
@@ -2959,6 +2960,65 @@ async def track_event(payload: TrackEvent):
     doc['created_at'] = now_iso()
     await db.events.insert_one(doc)
     return {'ok': True}
+
+
+# ----------------- Panel de anuncios de Meta -----------------
+class MetaCsv(BaseModel):
+    csv: str
+
+
+@api_router.post('/admin/meta/import')
+async def admin_meta_import(payload: MetaCsv, admin=Depends(get_current_admin)):
+    """Sube el CSV del Administrador de Anuncios. Reemplaza la foto anterior:
+    el CSV de Meta ya trae el acumulado, no hay que ir sumando."""
+    rows = meta_ads.parse_csv(payload.csv or '')
+    if not rows:
+        raise HTTPException(status_code=400,
+                            detail='Ese archivo no parece el CSV de campañas de Meta '
+                                   '(no encuentro la columna "Nombre de la campaña").')
+    await db.meta_ads.delete_many({})
+    stamp = now_iso()
+    await db.meta_ads.insert_many([{**r, 'imported_at': stamp} for r in rows])
+    return {'imported': len(rows), 'summary': meta_ads.summarize(rows)}
+
+
+@api_router.get('/admin/meta/dashboard')
+async def admin_meta_dashboard(days: int = 30, admin=Depends(get_current_admin)):
+    """Lo que Meta gastó, cruzado con lo que el sitio de verdad vendió.
+
+    Fuente EN VIVO si hay token de Meta; si no, el último CSV subido. La salida es
+    idéntica en los dos casos, así que el panel no cambia cuando llegue el token."""
+    live = meta_ads.live_configured()
+    if live:
+        try:
+            rows = await meta_ads.fetch_live(days)
+        except Exception as e:                      # token vencido, Meta caído, etc.
+            logger.warning('Meta en vivo falló, uso el CSV: %s', e)
+            live = False
+            rows = []
+        if not rows:
+            live = False
+    if not live:
+        rows = await db.meta_ads.find({}, {'_id': 0}).to_list(500)
+    summary = meta_ads.summarize(rows)
+    # Cruce con la realidad: qué vendió el sitio en el mismo periodo.
+    desde = summary.get('date_start') or (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()[:10]
+    orders = await db.orders.find({'created_at': {'$gte': desde}}, {'_id': 0}).to_list(5000)
+    pagadas = [o for o in orders if o.get('status') not in ('cancelado',)]
+    evs = await db.events.find({'created_at': {'$gte': desde}, 'type': 'visit'},
+                               {'_id': 0, 'session': 1}).to_list(50000)
+    visitas = len({e.get('session') for e in evs if e.get('session')})
+    ingreso = sum(o.get('total', 0) for o in pagadas)
+    return {
+        'fuente': 'meta_en_vivo' if live else ('csv' if rows else 'sin_datos'),
+        'actualizado': (rows[0].get('imported_at') if rows and not live else now_iso()),
+        'resumen': summary,
+        'campanas': sorted(rows, key=lambda r: -r.get('spend', 0)),
+        'sitio': {'visitas': visitas, 'pedidos': len(pagadas), 'ingreso': ingreso},
+        'recomendaciones': meta_ads.advise(summary, site_visits=visitas,
+                                           site_orders=len(pagadas), site_revenue=ingreso),
+        'apagar': meta_ads.dead_weight(rows),
+    }
 
 
 @api_router.get('/admin/funnel')

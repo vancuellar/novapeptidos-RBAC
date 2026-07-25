@@ -973,3 +973,74 @@ def test_prompt_demands_plain_language_and_selling():
     assert 'no a cientificos' in p or 'gente normal' in p   # tono llano obligatorio
     assert 'vender' in p                                    # rol comercial explícito
     assert 'whatsapp' in p                                  # canal nuevo ya incluido
+
+
+# ---------- Panel de anuncios de Meta ----------
+import meta_ads
+
+CSV_META = (
+    '"Inicio del informe","Fin del informe","Nombre de la campaña","Entrega de la campaña",'
+    'Resultados,"Indicador de resultado","Importe gastado (USD)",Impresiones,Alcance\n'
+    '2026-07-23,2026-07-25,"Post: Visita el sitio",active,312,actions:link_click,9.88,8925,8165\n'
+    '2026-07-23,2026-07-25,"Publicacion sin gasto",active,,,0.01,1,1\n'
+)
+
+
+def test_meta_csv_lee_campanas_y_saca_los_clics_de_resultados():
+    rows = meta_ads.parse_csv(CSV_META)
+    assert len(rows) == 2
+    a = rows[0]
+    assert a['spend'] == 9.88 and a['impressions'] == 8925 and a['reach'] == 8165
+    # Meta no manda columna de clics: los pone en 'Resultados' con indicador link_click.
+    assert a['clicks'] == 312
+    assert round(a['cpc'], 4) == round(9.88 / 312, 4)
+    assert a['currency'] == 'USD'
+
+
+def test_meta_csv_en_ingles_tambien():
+    ingles = ('"Campaign name","Amount spent (MXN)",Impressions,Reach,"Link clicks"\n'
+              '"Prueba",100,1000,900,50\n')
+    rows = meta_ads.parse_csv(ingles)
+    assert rows[0]['clicks'] == 50 and rows[0]['currency'] == 'MXN'
+    assert rows[0]['cpc'] == 2.0
+
+
+def test_meta_csv_basura_no_revienta():
+    assert meta_ads.parse_csv('') == []
+    assert meta_ads.parse_csv('hola,mundo\n1,2\n') == []
+
+
+def test_meta_resumen_suma_bien():
+    s = meta_ads.summarize(meta_ads.parse_csv(CSV_META))
+    assert s['campaigns'] == 2 and s['spend'] == 9.89 and s['clicks'] == 312
+    assert s['date_start'] == '2026-07-23' and s['date_end'] == '2026-07-25'
+    assert s['roas'] == 0 and s['cpa'] == 0     # sin compras, sin dividir entre cero
+
+
+def test_meta_consejo_avisa_que_llega_gente_y_no_compra():
+    s = meta_ads.summarize(meta_ads.parse_csv(CSV_META))
+    avisos = meta_ads.advise(s, site_orders=0, site_revenue=0)
+    titulos = ' '.join(a['title'] for a in avisos)
+    assert 'ninguna venta' in titulos          # 312 clics, 0 ventas
+    assert 'aprende' in titulos                # no junta las 50 conversiones
+    assert any(a['level'] == 'alto' for a in avisos)
+
+
+def test_meta_consejo_calcula_el_retorno():
+    s = meta_ads.summarize(meta_ads.parse_csv(CSV_META))
+    avisos = meta_ads.advise(s, site_orders=3, site_revenue=20000, fx=18)
+    cuerpo = ' '.join(a['title'] + a['body'] for a in avisos)
+    assert 'recuperas' in cuerpo               # ROAS calculado contra el gasto en pesos
+
+
+def test_meta_sin_gasto_lo_dice_y_no_inventa():
+    avisos = meta_ads.advise(meta_ads.summarize([]))
+    assert len(avisos) == 1 and avisos[0]['level'] == 'alto'
+
+
+def test_meta_detecta_campanas_que_solo_gastan():
+    rows = meta_ads.parse_csv(CSV_META)
+    rows[0]['clicks'] = 0
+    rows[0]['purchases'] = 0
+    muertas = meta_ads.dead_weight(rows)
+    assert muertas and muertas[0]['spend'] == 9.88
