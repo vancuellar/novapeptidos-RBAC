@@ -34,6 +34,29 @@ TIER_RATES = {
 }
 DEFAULT_TIER = 'junior0'
 HARD_CAP = 0.45   # ningún reparto individual ni total pasa de aquí
+MANUAL_CAP = 0.50  # tope de la tasa que el admin puede poner A MANO (= COMMISSION_CAP)
+
+# Alias de niveles viejos guardados en la base antes de la pirámide de 6 niveles.
+TIER_ALIASES = {'junior': 'junior0'}
+
+
+def normalize_tier(tier):
+    """Nivel guardado -> nivel válido de la pirámide (junior0 si no se reconoce)."""
+    tier = TIER_ALIASES.get(tier, tier)
+    return tier if tier in TIER_RATES else DEFAULT_TIER
+
+
+def effective_rate(dist):
+    """Tasa REAL de un distribuidor: la MAYOR entre la de su nivel y la que el
+    admin le puso a mano (`commission_rate`).
+
+    Christian puede subirle la comisión a alguien sin moverlo de nivel (así fue
+    con Alanís: nivel junior, comisión 40%). Esa tasa manual manda: es su
+    comisión Y su descuento máximo, y de ahí salen sus códigos automáticos.
+    Tope: MANUAL_CAP (el mismo que valida el panel de admin)."""
+    tier_r = tier_rate(normalize_tier((dist or {}).get('tier')))
+    manual = float((dist or {}).get('commission_rate') or 0)
+    return min(MANUAL_CAP, max(tier_r, manual))
 
 # Diamond es un nivel SECRETO: no está en la escalera visible (el tope que ven los
 # distribuidores es Elite 40%). Se desbloquea al llegar a estas metas; el sistema
@@ -62,7 +85,7 @@ CASHBACK_RATE = 0.04   # ventaja del canal, la paga Christian, FUERA de la bolsa
 
 def tier_rate(tier):
     """Tasa (comisión = descuento máximo) de un nivel. junior0 por defecto."""
-    return TIER_RATES.get(tier or DEFAULT_TIER, TIER_RATES[DEFAULT_TIER])
+    return TIER_RATES.get(TIER_ALIASES.get(tier, tier) or DEFAULT_TIER, TIER_RATES[DEFAULT_TIER])
 
 
 def max_discount(tier):
@@ -101,7 +124,7 @@ def compute_commission_breakdown(merchandise, seller, upline_chain=None, discoun
     if not seller or merchandise <= 0:
         return []
     base = float(merchandise)
-    s_rate = tier_rate(seller.get('tier'))
+    s_rate = effective_rate(seller)
     disc = max(0.0, min(s_rate, float(discount_rate or 0)))
     rows = [{
         'distributor_id': seller['id'], 'role': 'seller', 'rate': s_rate,
@@ -112,7 +135,7 @@ def compute_commission_breakdown(merchandise, seller, upline_chain=None, discoun
     for up in (upline_chain or []):
         if not up or up.get('id') in seen:
             continue
-        u_rate = tier_rate(up.get('tier'))
+        u_rate = effective_rate(up)
         diff = u_rate - highest
         if diff <= 0:
             continue   # no está más arriba que lo ya pagado: no cobra, seguimos

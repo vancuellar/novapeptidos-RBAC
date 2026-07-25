@@ -809,6 +809,41 @@ def test_discount_tiers_diamond_ends_at_38():
     assert pyramid.discount_tiers_for(0.43) == [0.15, 0.20, 0.25, 0.30, 0.35, 0.38]
 
 
+# ---------- Comisión puesta A MANO por el admin (manda sobre el nivel) ----------
+def test_effective_rate_prefers_manual_commission_over_tier():
+    # El caso de Alanís: nivel junior (20%) pero Christian le puso 40% a mano.
+    alanis = {'tier': 'junior', 'commission_rate': 0.40}
+    assert pyramid.effective_rate(alanis) == 0.40
+    # Y por eso puede dar hasta 35% de descuento.
+    assert pyramid.discount_tiers_for(pyramid.effective_rate(alanis)) == [0.15, 0.20, 0.25, 0.30, 0.35]
+
+
+def test_effective_rate_keeps_tier_when_manual_is_lower():
+    assert pyramid.effective_rate({'tier': 'elite', 'commission_rate': 0.25}) == 0.40
+    assert pyramid.effective_rate({'tier': 'senior'}) == 0.30
+    assert pyramid.effective_rate({}) == pyramid.TIER_RATES['junior0']
+
+
+def test_effective_rate_never_passes_the_manual_cap():
+    assert pyramid.effective_rate({'tier': 'elite', 'commission_rate': 0.90}) == pyramid.MANUAL_CAP
+
+
+def test_normalize_tier_maps_old_junior_label():
+    assert pyramid.normalize_tier('junior') == 'junior0'
+    assert pyramid.normalize_tier('inventado') == 'junior0'
+    assert pyramid.normalize_tier('elite') == 'elite'
+
+
+def test_commission_uses_manual_rate_not_tier():
+    # Alanís vende $10,000 dando 35% de descuento: se queda 40-35 = 5%.
+    seller = {'id': 'alanis', 'tier': 'junior', 'commission_rate': 0.40}
+    rows = pyramid.compute_commission_breakdown(10000, seller, [], discount_rate=0.35)
+    assert rows[0]['amount'] == 500
+    # Sin descuento se lleva su 40% completo, no el 20% de su nivel.
+    rows = pyramid.compute_commission_breakdown(10000, seller, [], discount_rate=0)
+    assert rows[0]['amount'] == 4000
+
+
 # ---------- Centro de noticias: audiencia por rol ----------
 from server import _audience_for_role
 

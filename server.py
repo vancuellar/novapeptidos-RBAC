@@ -144,11 +144,11 @@ async def _resolve_code(code):
         dist = await db.users.find_one({'id': doc['distributor_id'], 'role': 'distributor'},
                                        {'_id': 0, 'password_hash': 0})
         if dist:
-            return dist, max(0.0, min(pyramid.tier_rate(dist.get('tier')), doc.get('discount_rate', 0)))
+            return dist, max(0.0, min(pyramid.effective_rate(dist), doc.get('discount_rate', 0)))
     dist = await db.users.find_one({'distributor_code': c, 'role': 'distributor'},
                                    {'_id': 0, 'password_hash': 0})
     if dist:
-        return dist, max(0.0, min(pyramid.tier_rate(dist.get('tier')), dist.get('customer_discount_rate', 0)))
+        return dist, max(0.0, min(pyramid.effective_rate(dist), dist.get('customer_discount_rate', 0)))
     return None, 0.0
 
 
@@ -1497,7 +1497,7 @@ async def _ensure_distributor_codes(dist, force_rotate=False):
     descuento de su comisión (15%, 20%… hasta 5% debajo de su comisión). Crea los
     que falten, ROTA los caducados (nuevo texto, el viejo muere), y desactiva los
     que ya no correspondan a su nivel. Devuelve los códigos vigentes ordenados."""
-    rate_basis = dist.get('commission_rate', pyramid.tier_rate(dist.get('tier')))
+    rate_basis = pyramid.effective_rate(dist)
     tiers = pyramid.discount_tiers_for(rate_basis)
     tierset = {round(r, 4) for r in tiers}
     existing = await db.discount_codes.find({'distributor_id': dist['id']}).to_list(300)
@@ -1537,7 +1537,7 @@ async def list_discount_codes(dist=Depends(get_current_distributor)):
     """Los códigos AUTO del distribuidor (uno por nivel de descuento). Se generan
     y rotan solos cada 30 días; el distribuidor solo elige cuál da a cada cliente."""
     codes = await _ensure_distributor_codes(dist)
-    return {'max_discount': pyramid.tier_rate(dist.get('tier')),
+    return {'max_discount': pyramid.effective_rate(dist),
             'rotate_days': CODE_TTL_DAYS,
             'codes': [_code_projection(c) for c in codes]}
 
@@ -1733,7 +1733,10 @@ def _distributor_rollup(dist, users, orders):
         'commission_rate': dist.get('commission_rate', 0.25),
         'customer_discount_rate': dist.get('customer_discount_rate', 0),
         # Pirámide: nivel y de quién cuelga.
-        'tier': dist.get('tier', pyramid.DEFAULT_TIER),
+        'tier': pyramid.normalize_tier(dist.get('tier')),
+        # Lo que de verdad gana y el descuento máximo que puede dar (nivel o mano).
+        'effective_rate': pyramid.effective_rate(dist),
+        'max_discount': max(pyramid.discount_tiers_for(pyramid.effective_rate(dist)) or [0]),
         'upline_id': dist.get('upline_id'),
         'created_at': dist.get('created_at'),
         'email_verified': dist.get('email_verified', False),
@@ -1963,9 +1966,23 @@ async def update_distributor_rates(dist_id: str, payload: dict, admin=Depends(ge
         raise HTTPException(status_code=400, detail='Nada que actualizar')
     await db.users.update_one({'id': dist_id}, {'$set': update})
     fresh = await db.users.find_one({'id': dist_id}, {'_id': 0, 'password_hash': 0})
+    # Al cambiar la comisión, sus códigos AUTO se rehacen EN EL ACTO: se crean los
+    # nuevos niveles de descuento (hasta 5% debajo de su comisión) y se desactivan
+    # los que ya no le corresponden. Antes había que esperar a que abriera el panel.
+    if 'commission_rate' in update:
+        before = pyramid.effective_rate(dist)
+        after = pyramid.effective_rate(fresh)
+        await _ensure_distributor_codes(fresh)
+        if after > before:
+            tope = round(max(pyramid.discount_tiers_for(after) or [0]) * 100)
+            await notify(dist_id, 'commission_up', 'Subió tu comisión',
+                         f'Tu comisión ahora es {round(after * 100)}%. Ya tienes códigos nuevos '
+                         f'para dar hasta {tope}% de descuento a tus clientes.',
+                         link='/distribuidor?tab=codes')
     return {'id': fresh['id'], 'name': fresh['name'],
             'commission_rate': fresh['commission_rate'],
-            'customer_discount_rate': fresh['customer_discount_rate']}
+            'customer_discount_rate': fresh['customer_discount_rate'],
+            'effective_rate': pyramid.effective_rate(fresh)}
 
 
 @api_router.put('/admin/distributors/{dist_id}/pyramid')
@@ -2008,8 +2025,10 @@ async def update_distributor_pyramid(dist_id: str, payload: dict, admin=Depends(
     fresh = await db.users.find_one({'id': dist_id}, {'_id': 0, 'password_hash': 0})
     # Notificar el ASCENSO (subió de nivel) — un logro para el distribuidor.
     if 'tier' in update:
+        # Su nivel nuevo puede darle más descuentos: rehacer los códigos AUTO ya.
+        await _ensure_distributor_codes(fresh)
         order = pyramid.TIER_ORDER
-        old_i = order.index(dist.get('tier')) if dist.get('tier') in order else -1
+        old_i = order.index(pyramid.normalize_tier(dist.get('tier')))
         new_i = order.index(update['tier']) if update['tier'] in order else -1
         if new_i > old_i:
             names = {'junior0': 'Junior 0', 'junior1': 'Junior 1', 'senior': 'Senior',
@@ -2057,13 +2076,14 @@ async def distributor_summary(dist=Depends(get_current_distributor)):
     own_earnings = sum(_my_amount(o, dist['id']) for o in own_sales)
     # Red: reclutas activos y ventas de equipo, para la barra de nivel (ventas + reclutas).
     net = await _downline_stats(dist['id'])
-    tier = dist.get('tier', pyramid.DEFAULT_TIER)
+    tier = pyramid.normalize_tier(dist.get('tier'))
+    rate = pyramid.effective_rate(dist)   # su nivel O la tasa que el admin le puso a mano
     return {
         'distributor_code': dist.get('distributor_code'),
-        'commission_rate': dist.get('commission_rate', pyramid.tier_rate(tier)),
+        'commission_rate': rate,
         'customer_discount_rate': dist.get('customer_discount_rate', 0),
         'tier': tier,
-        'max_discount': pyramid.max_discount(tier),
+        'max_discount': rate,
         'clients_count': len(users),
         'sales_count': len(own_sales),
         'sales_total': sum(o.get('total', 0) for o in own_sales),
