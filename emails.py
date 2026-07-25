@@ -308,6 +308,73 @@ def _news_email_html(name, title, body):
 </html>"""
 
 
+def _recovery_email_html(name, items, oferta, code, site='https://exygenlabs.com'):
+    """Correo de 'se te quedo el carrito'. Con cupon arriba de $2,500; abajo, solo
+    un recordatorio. El cupon dice CLARO que exige comprar el mismo monto o mas."""
+    saludo = f'Hola {html.escape(name)},' if name else 'Hola,'
+    lista = ''.join(
+        f'<tr><td class="em-body" style="font-size:14px;color:#3D4657;padding:4px 0;">'
+        f'{html.escape(str(i.get("name", "")))}</td>'
+        f'<td class="em-body" align="right" style="font-size:14px;color:#3D4657;padding:4px 0;">'
+        f'x{int(i.get("quantity", 1))}</td></tr>'
+        for i in (items or [])[:12])
+    if code:
+        minimo = _money(oferta.get('min_order', 0))
+        bloque = f"""
+      <div style="border:1px solid #132763;border-radius:12px;padding:20px;margin-top:24px;text-align:center;">
+        <div class="em-muted" style="font-size:12px;letter-spacing:2px;color:#8A93A8;">TU CUPON</div>
+        <div class="em-ink" style="font-size:26px;font-weight:bold;color:#132763;padding:8px 0;letter-spacing:2px;">{html.escape(code)}</div>
+        <div class="em-body" style="font-size:15px;color:#3D4657;">
+          {int(round(oferta['rate'] * 100))}% de descuento + {html.escape(oferta.get('perk_text', ''))}
+        </div>
+        <div class="em-muted" style="font-size:12px;color:#8A93A8;padding-top:10px;line-height:1.5;">
+          Valido en compras de {minimo} o mas, por 7 dias.<br>
+          Algunos productos admiten menos descuento por su margen.
+        </div>
+      </div>"""
+    else:
+        bloque = ('<p class="em-body" style="font-size:15px;color:#3D4657;line-height:1.6;">'
+                  'Si tienes alguna duda sobre estos compuestos, respondenos este correo '
+                  'y con gusto te orientamos.</p>')
+    return f"""<!DOCTYPE html>
+<html lang="es-MX">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{DARK_EMAIL_STYLE}</head>
+<body class="em-bg" style="margin:0;padding:0;background-color:#FFFFFF;">
+    <div style="max-width:560px;margin:0 auto;font-family:Helvetica,Arial,sans-serif;padding:32px 24px;">
+      <div class="em-ink" style="text-align:center;font-size:20px;letter-spacing:3px;color:#132763;font-weight:bold;">EXYGEN&nbsp;LABS</div>
+      <div class="em-muted" style="text-align:center;font-size:11px;letter-spacing:2px;color:#8A93A8;padding-top:4px;">RESEARCH PEPTIDES</div>
+      <h1 class="em-ink" style="font-size:20px;color:#132763;margin-top:28px;">Se te quedo el carrito</h1>
+      <p class="em-body" style="font-size:15px;color:#3D4657;line-height:1.6;">{saludo} guardamos lo que tenias listo:</p>
+      <table width="100%" cellpadding="0" cellspacing="0">{lista}</table>
+      {bloque}
+      <p style="text-align:center;margin-top:28px;">
+        <a href="{site}/carrito" style="background:#132763;color:#FFFFFF;text-decoration:none;padding:13px 28px;border-radius:8px;font-size:15px;display:inline-block;">Retomar mi compra</a>
+      </p>
+      <p class="em-muted" style="font-size:12px;color:#8A93A8;line-height:1.6;margin-top:24px;">
+        Productos para uso en investigacion (RUO). exygenlabs.com
+      </p>
+    </div>
+</body>
+</html>"""
+
+
+async def send_cart_recovery_email(name, email, items, oferta, code=None):
+    """UNA sola oferta por carrito abandonado. Best-effort; nunca lanza."""
+    if not email:
+        return
+    if os.environ.get('EMAIL_ENABLED', 'false').lower() != 'true':
+        logger.info('EMAIL_ENABLED != true, no mando recuperacion a %s', email)
+        return
+    asunto = 'Se te quedo el carrito en Exygen Labs'
+    if code:
+        asunto = f'Tu cupon {code} — se te quedo el carrito'
+    try:
+        await asyncio.to_thread(_send_email_sync, email, asunto,
+                                _recovery_email_html(name or '', items, oferta, code))
+    except Exception:
+        logger.exception('Failed to send cart recovery email to %s', email)
+
+
 async def send_news_email(name, email, title, body, language=None):
     """Aviso del centro de noticias por correo. Best-effort; nunca lanza."""
     if os.environ.get('EMAIL_ENABLED', 'false').lower() != 'true':

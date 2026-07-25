@@ -1059,3 +1059,65 @@ def test_meta_detecta_campanas_que_solo_gastan():
     rows[0]['purchases'] = 0
     muertas = meta_ads.dead_weight(rows)
     assert muertas and muertas[0]['spend'] == 9.88
+
+
+# ---------- Recuperacion de carritos abandonados ----------
+import recovery
+
+
+def test_recovery_no_regala_nada_abajo_de_2500():
+    # Regla dura de Christian: nada de cupones en carritos chicos.
+    for monto in (1, 999, 2499):
+        o = recovery.offer_for(monto)
+        assert o['kind'] == 'seguimiento', monto
+        assert 'rate' not in o
+
+
+def test_recovery_carrito_vacio_no_genera_nada():
+    assert recovery.offer_for(0)['kind'] == 'nada'
+    assert recovery.offer_for(None)['kind'] == 'nada'
+
+
+def test_recovery_escalera_por_monto():
+    assert recovery.offer_for(2500)['rate'] == 0.15
+    assert recovery.offer_for(9999)['rate'] == 0.15
+    assert recovery.offer_for(10000)['rate'] == 0.20
+    assert recovery.offer_for(40000)['rate'] == 0.20
+
+
+def test_recovery_la_oferta_siempre_supera_al_descuento_automatico():
+    # El sitio ya da 10% solo (15% desde $35,000). Una oferta que no lo supere
+    # no se siente y solo regala margen.
+    assert recovery.offer_for(3000)['rate'] > 0.10
+    assert recovery.offer_for(50000)['rate'] > 0.15
+
+
+def test_recovery_el_cupon_exige_comprar_lo_mismo_o_mas():
+    o = recovery.offer_for(8000)
+    assert o['min_order'] == 8000
+    assert recovery.coupon_is_valid_for({'min_order': 8000}, 8000) is True
+    assert recovery.coupon_is_valid_for({'min_order': 8000}, 12000) is True
+    # Si quita productos para pagar menos con el cupon: no aplica.
+    assert recovery.coupon_is_valid_for({'min_order': 8000}, 7999) is False
+
+
+def test_recovery_cupon_sin_minimo_no_bloquea():
+    assert recovery.coupon_is_valid_for({}, 100) is True
+
+
+def test_recovery_se_contacta_UNA_sola_vez():
+    base = {'status': 'pendiente', 'email': 'x@y.com', 'contacted': False}
+    assert recovery.should_contact(base, recovery.WAIT_MINUTES) is True
+    assert recovery.should_contact({**base, 'contacted': True}, 9999) is False
+
+
+def test_recovery_espera_antes_de_escribir():
+    base = {'status': 'pendiente', 'email': 'x@y.com', 'contacted': False}
+    assert recovery.should_contact(base, recovery.WAIT_MINUTES - 1) is False
+
+
+def test_recovery_no_escribe_si_ya_compro_ni_sin_correo():
+    assert recovery.should_contact(
+        {'status': 'convertido', 'email': 'x@y.com', 'contacted': False}, 9999) is False
+    assert recovery.should_contact(
+        {'status': 'pendiente', 'email': '  ', 'contacted': False}, 9999) is False

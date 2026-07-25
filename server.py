@@ -30,6 +30,7 @@ from auth import (
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
 import coa_store
 import meta_ads
+import recovery
 from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
 import loyalty
 import pyramid
@@ -1128,6 +1129,8 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         points_earned=points_earned,
     )
     await db.orders.insert_one(order.model_dump())
+    # Ese carrito SI se cerro: su intento deja de estar pendiente y la IA ya no le escribe.
+    asyncio.create_task(_cerrar_intentos(payload.customer.email))
     if coupon and coupon.get('single_use', True):
         await db.discount_codes.update_one({'id': coupon['id']},
                                            {'$set': {'used': True, 'active': False, 'used_order': order.order_number}})
@@ -2753,6 +2756,20 @@ async def chat_history(session_id: str):
 
 # ----------------- Startup: seed -----------------
 @app.on_event('startup')
+async def arrancar_recuperacion():
+    """Cada 15 minutos revisa los carritos abandonados y manda LA oferta a quien
+    ya lleva una hora sin cerrar. Una vez por carrito, nunca dos."""
+    async def bucle():
+        while True:
+            await asyncio.sleep(900)
+            try:
+                await _barrer_intentos()
+            except Exception:
+                logger.exception('Fallo el barrido de carritos abandonados')
+    asyncio.create_task(bucle())
+
+
+@app.on_event('startup')
 async def seed_db():
     try:
         admin_email = os.environ.get('ADMIN_EMAIL')
@@ -2960,6 +2977,162 @@ async def track_event(payload: TrackEvent):
     doc['created_at'] = now_iso()
     await db.events.insert_one(doc)
     return {'ok': True}
+
+
+# ----------------- Intentos de compra (carritos abandonados) -----------------
+class IntentoCompra(BaseModel):
+    email: str = ''
+    name: str = ''
+    phone: str = ''
+    items: List[dict] = []
+    subtotal: float = 0
+    total: float = 0
+    session_id: str = ''
+
+
+@api_router.post('/checkout/intento')
+async def registrar_intento(payload: IntentoCompra):
+    """Guarda que ALGUIEN estuvo a punto de comprar y no cerró.
+
+    Se llama desde el checkout mientras el cliente llena sus datos. No es un
+    pedido: vive aparte, con estatus 'pendiente', y NO cuenta en ingresos ni en
+    el contador de pedidos (Christian, 2026-07-25). Sirve para que la IA le dé
+    seguimiento y trate de cerrar la venta.
+
+    Se actualiza el mismo registro (por correo, o por sesión si aún no lo puso),
+    no se crea uno por cada tecla."""
+    email = (payload.email or '').strip().lower()
+    if not email and not payload.session_id:
+        return {'ok': False}
+    if not payload.items:
+        return {'ok': False}
+    clave = {'email': email} if email else {'session_id': payload.session_id}
+    ahora = now_iso()
+    doc = {
+        **clave,
+        'name': (payload.name or '').strip(),
+        'phone': (payload.phone or '').strip(),
+        'items': payload.items[:50],
+        'subtotal': float(payload.subtotal or 0),
+        'total': float(payload.total or 0),
+        'session_id': payload.session_id or '',
+        'status': 'pendiente',
+        'updated_at': ahora,
+    }
+    existing = await db.checkout_intentos.find_one(clave, {'_id': 0, 'id': 1, 'contacted': 1})
+    if existing:
+        await db.checkout_intentos.update_one({'id': existing['id']}, {'$set': doc})
+        return {'ok': True, 'id': existing['id']}
+    doc.update({'id': str(uuid.uuid4()), 'created_at': ahora, 'contacted': False,
+                'contacted_at': None, 'offer_code': None, 'offer_rate': 0})
+    if email:
+        doc['email'] = email
+    await db.checkout_intentos.insert_one(doc)
+    return {'ok': True, 'id': doc['id']}
+
+
+async def _cerrar_intentos(email, session_id=None):
+    """Ese carrito sí se cerró: el intento deja de estar pendiente."""
+    o = [{'email': (email or '').strip().lower()}] if email else []
+    if session_id:
+        o.append({'session_id': session_id})
+    if not o:
+        return
+    await db.checkout_intentos.update_many(
+        {'$or': o, 'status': 'pendiente'},
+        {'$set': {'status': 'convertido', 'converted_at': now_iso()}})
+
+
+async def _mandar_oferta(intento):
+    """Manda LA oferta (una sola) de un carrito abandonado.
+
+    Abajo de $2,500 no lleva cupón: solo un recordatorio. Arriba, el cupón exige
+    comprar el mismo monto o más — si no, quitarían productos para usarlo."""
+    oferta = recovery.offer_for(intento.get('total'))
+    if oferta['kind'] == 'nada':
+        return None
+    nombre = intento.get('name') or ''
+    marca = {'contacted': True, 'contacted_at': now_iso(), 'offer_kind': oferta['kind']}
+    code = None
+    if oferta['kind'] == 'cupon':
+        code = 'VUELVE-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=5))
+        while await db.discount_codes.find_one({'code': code}):
+            code = 'VUELVE-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=5))
+        expira = (datetime.now(timezone.utc) + timedelta(days=recovery.COUPON_DAYS)).isoformat()
+        await db.discount_codes.insert_one({
+            'id': str(uuid.uuid4()), 'code': code, 'kind': 'coupon',
+            'user_id': None,                       # por correo, no por cuenta
+            'email': intento.get('email'),
+            'discount_rate': oferta['rate'],
+            'min_order': oferta['min_order'],      # EL CANDADO del monto
+            'active': True, 'used': False, 'single_use': True,
+            'note': f'Recuperación de carrito · {oferta["perk_text"]}',
+            'created_by': 'ia_recuperacion', 'created_at': now_iso(), 'expires_at': expira,
+        })
+        marca.update({'offer_code': code, 'offer_rate': oferta['rate'],
+                      'offer_min_order': oferta['min_order'], 'offer_perk': oferta['perk']})
+    await db.checkout_intentos.update_one({'id': intento['id']}, {'$set': marca})
+    try:
+        await send_cart_recovery_email(nombre, intento.get('email'), intento.get('items', []),
+                                       oferta, code)
+    except Exception as e:
+        logger.warning('No se pudo mandar la oferta de recuperación a %s: %s',
+                       intento.get('email'), e)
+    return code
+
+
+@api_router.get('/admin/intentos')
+async def admin_intentos(admin=Depends(get_current_admin)):
+    """Carritos que no se cerraron, el más reciente primero."""
+    rows = await db.checkout_intentos.find({}, {'_id': 0}).to_list(1000)
+    rows.sort(key=lambda r: r.get('updated_at', ''), reverse=True)
+    pend = [r for r in rows if r.get('status') == 'pendiente']
+    return {
+        'intentos': rows[:300],
+        'pendientes': len(pend),
+        'valor_pendiente': sum(r.get('total', 0) for r in pend),
+        'recuperados': sum(1 for r in rows if r.get('status') == 'convertido' and r.get('contacted')),
+        'minimo_para_cupon': recovery.MIN_FOR_OFFER,
+    }
+
+
+@api_router.post('/admin/intentos/{intento_id}/oferta')
+async def admin_forzar_oferta(intento_id: str, admin=Depends(get_current_admin)):
+    """Manda la oferta YA, sin esperar la hora (para probar o para empujar)."""
+    it = await db.checkout_intentos.find_one({'id': intento_id}, {'_id': 0})
+    if not it:
+        raise HTTPException(status_code=404, detail='Intento no encontrado')
+    if it.get('contacted'):
+        raise HTTPException(status_code=400, detail='A este cliente ya se le escribió una vez')
+    code = await _mandar_oferta(it)
+    return {'enviado': True, 'codigo': code, 'oferta': recovery.offer_for(it.get('total'))}
+
+
+@api_router.delete('/admin/intentos/{intento_id}')
+async def admin_borrar_intento(intento_id: str, admin=Depends(get_current_admin)):
+    r = await db.checkout_intentos.delete_one({'id': intento_id})
+    if not r.deleted_count:
+        raise HTTPException(status_code=404, detail='Intento no encontrado')
+    return {'deleted': True}
+
+
+async def _barrer_intentos():
+    """Cada rato: a quién ya toca escribirle. UNA vez por carrito, nunca dos."""
+    try:
+        pend = await db.checkout_intentos.find(
+            {'status': 'pendiente', 'contacted': False}, {'_id': 0}).to_list(500)
+    except Exception as e:
+        logger.warning('No pude leer los intentos: %s', e)
+        return
+    ahora = datetime.now(timezone.utc)
+    for it in pend:
+        try:
+            visto = datetime.fromisoformat(it.get('updated_at') or it.get('created_at'))
+            minutos = (ahora - visto).total_seconds() / 60
+        except (TypeError, ValueError):
+            continue
+        if recovery.should_contact(it, minutos):
+            await _mandar_oferta(it)
 
 
 @api_router.delete('/admin/orders/{order_id}')
