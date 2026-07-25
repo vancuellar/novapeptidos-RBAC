@@ -2800,6 +2800,40 @@ async def tutorial_video(filename: str, request: Request, token: str = Query(...
     return _Response(content=chunk, status_code=206, media_type='video/mp4', headers=headers)
 
 
+@api_router.post('/admin/backfill-order-skus')
+async def backfill_order_skus(admin=Depends(get_current_admin)):
+    """Migra pedidos viejos: cambia el product_id inventado por el SKU real.
+
+    Los pedidos hechos antes del 2026-07-25 guardaron ids tipo "slug::5 mg". Se
+    reemplazan casando por NOMBRE exacto del renglon con el catalogo.
+    """
+    prods = await db.products.find({}, {'_id': 0, 'id': 1, 'sku': 1, 'name': 1}).to_list(1000)
+    por_nombre = {(p.get('name') or '').strip().lower(): p for p in prods}
+    validos = {p['id'] for p in prods} | {p.get('sku') for p in prods if p.get('sku')}
+
+    orders = await db.orders.find({}, {'_id': 0, 'id': 1, 'items': 1}).to_list(5000)
+    tocados = renglones = sin_match = 0
+    for o in orders:
+        items = o.get('items') or []
+        cambio = False
+        for it in items:
+            pid = it.get('product_id')
+            if pid in validos:
+                continue                      # ya apunta a algo real
+            m = por_nombre.get((it.get('name') or '').strip().lower())
+            if m and m.get('sku'):
+                it['product_id'] = m['sku']
+                cambio = True
+                renglones += 1
+            else:
+                sin_match += 1
+        if cambio:
+            await db.orders.update_one({'id': o['id']}, {'$set': {'items': items}})
+            tocados += 1
+    return {'pedidos_migrados': tocados, 'renglones_corregidos': renglones,
+            'renglones_sin_match': sin_match, 'pedidos_totales': len(orders)}
+
+
 @api_router.post('/admin/backfill-skus')
 async def backfill_skus(admin=Depends(get_current_admin)):
     """Asigna SKU a todo producto que no lo tenga. Idempotente y sin colisiones."""
