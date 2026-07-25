@@ -97,6 +97,29 @@ async def resolve_distributor(code):
 CODE_TTL_DAYS = 90   # rotación automática: los códigos se renuevan cada 90 días
 
 
+def gen_sku(name: str, presentation: str = '') -> str:
+    """SKU legible y estable a partir del nombre: 'BPC-157 5 mg' -> 'BPC157-5MG'.
+
+    Se arma del COMPUESTO + PRESENTACION, en mayusculas y sin simbolos. Es la
+    llave que el carrito manda al hacer el pedido.
+    """
+    import unicodedata
+    def clean(x):
+        x = unicodedata.normalize('NFKD', str(x or '')).encode('ascii', 'ignore').decode()
+        return re.sub(r'[^A-Za-z0-9]', '', x).upper()
+
+    base = str(name or '')
+    # separar la presentacion del final del nombre si viene pegada
+    m = re.search(r'^(.*?)[\s]+([\d.,]+\s*(?:mg|iu|ml|u|g))\s*$', base, re.I)
+    if m:
+        compuesto, pres = m.group(1), m.group(2)
+    else:
+        compuesto, pres = base, presentation
+    comp = clean(compuesto)[:14] or 'PROD'
+    pr = clean(pres)
+    return f'{comp}-{pr}' if pr else comp
+
+
 def gen_discount_code(name, pct):
     """Código OPAQUE, no adivinable: PREFIJO-PCT-XXXX (parte al azar). El % en el
     texto es informativo; el descuento real SIEMPRE sale del valor guardado."""
@@ -932,10 +955,22 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # Tope de comisión y elegibilidad POR PRODUCTO (regla Christian 2026-07-23):
     # si un producto no deja 5x neto, no participa del canal de distribuidores
     # (ni descuento de código, ni promo, ni comisión) — solo venta directa.
-    _ids = [it.product_id for it in payload.items]
-    _pdocs = await db.products.find({'id': {'$in': _ids}},
-                                    {'_id': 0, 'id': 1, 'commission_cap': 1, 'distributor_eligible': 1}).to_list(500)
-    _pflags = {d['id']: d for d in _pdocs}
+    # Resolvemos cada renglon contra el catalogo real. Aceptamos id o SKU: el
+    # carrito viejo mandaba ids inventados ("slug::5 mg") que no existian, y eso
+    # hacia que el producto se saltara su tope de comision (Christian 2026-07-25).
+    _keys = [it.product_id for it in payload.items]
+    _pdocs = await db.products.find(
+        {'$or': [{'id': {'$in': _keys}}, {'sku': {'$in': _keys}}]},
+        {'_id': 0, 'id': 1, 'sku': 1, 'name': 1, 'commission_cap': 1,
+         'distributor_eligible': 1}).to_list(500)
+    _pflags = {}
+    for d in _pdocs:
+        _pflags[d['id']] = d
+        if d.get('sku'):
+            _pflags[d['sku']] = d
+    _huerfanos = [it.name for it in payload.items if it.product_id not in _pflags]
+    if _huerfanos:
+        logger.warning('Pedido con productos no resueltos: %s', _huerfanos)
 
     def _cap_of(item):
         d = _pflags.get(item.product_id, {})
@@ -2763,6 +2798,29 @@ async def tutorial_video(filename: str, request: Request, token: str = Query(...
     headers['Content-Range'] = f'bytes {start}-{end}/{size}'
     from starlette.responses import Response as _Response
     return _Response(content=chunk, status_code=206, media_type='video/mp4', headers=headers)
+
+
+@api_router.post('/admin/backfill-skus')
+async def backfill_skus(admin=Depends(get_current_admin)):
+    """Asigna SKU a todo producto que no lo tenga. Idempotente y sin colisiones."""
+    prods = await db.products.find({}, {'_id': 0, 'id': 1, 'name': 1, 'presentation': 1,
+                                        'sku': 1}).to_list(1000)
+    usados = {p['sku'] for p in prods if p.get('sku')}
+    hechos, colisiones = 0, 0
+    for p in prods:
+        if p.get('sku'):
+            continue
+        base = gen_sku(p.get('name', ''), p.get('presentation', ''))
+        sku = base
+        n = 2
+        while sku in usados:          # dos presentaciones no pueden compartir SKU
+            sku = f'{base}-{n}'
+            n += 1
+            colisiones += 1
+        usados.add(sku)
+        await db.products.update_one({'id': p['id']}, {'$set': {'sku': sku}})
+        hechos += 1
+    return {'asignados': hechos, 'colisiones_resueltas': colisiones, 'total': len(prods)}
 
 
 # ----------------- Admin: "ver como" (solo lectura) -----------------

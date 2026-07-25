@@ -103,6 +103,10 @@ class ProductBase(BaseModel):
     is_new: bool = False
     # Tope de comisión por producto (escalera ROI de la maestra) y si el producto
     # puede venderse por distribuidores. Si no deja 5x neto: SOLO venta directa.
+    # SKU: codigo unico y estable de cada presentacion (BPC157-5MG). Es la llave
+    # que usa el carrito; sin el, el front inventaba ids tipo "slug::5 mg" que no
+    # existian en la base (bug de checkout, Christian 2026-07-25).
+    sku: str = ''
     commission_cap: float = 0.50
     distributor_eligible: bool = True
     # Un producto vive en su `category` principal y, opcionalmente, aparece
@@ -122,6 +126,7 @@ class Product(ProductBase):
 
 
 class ProductUpdate(BaseModel):
+    sku: Optional[str] = None
     commission_cap: Optional[float] = None
     distributor_eligible: Optional[bool] = None
     extra_categories: Optional[List[str]] = None
