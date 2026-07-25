@@ -24,23 +24,48 @@ MIN_FOR_OFFER = 2500
 # 10% (y 15% desde $35,000), así que una oferta que no lo supere no se siente:
 # por eso el primer escalón ya empieza en 15%.
 OFFER_TIERS = [
-    {'min': 10000, 'rate': 0.20, 'perks': ['agua_10ml', 'envio_gratis']},
-    {'min': 5000,  'rate': 0.15, 'perks': ['agua_10ml', 'envio_gratis']},
-    {'min': 2500,  'rate': 0.15, 'perks': ['agua_3ml', 'envio_gratis']},
+    {'min': 10000, 'rate': 0.20, 'water': 'agua_10ml', 'water_per': 10000},
+    {'min': 5000,  'rate': 0.15, 'water': 'agua_10ml', 'water_per': None},
+    {'min': 2500,  'rate': 0.15, 'water': 'agua_3ml',  'water_per': None},
 ]
 
 # El agua no es un regalo cualquiera: la NECESITAN para reconstituir, así que
 # quita fricción de verdad. Por eso va en los tres escalones — pero la de 3 mL
 # ($199) en el chico y la de 10 mL ($349) de $5,000 para arriba, para que el que
-# compra más se lleve el mejor trato y no al revés. Christian, 2026-07-25.
+# compra más se lleve el mejor trato y no al revés.
+#
+# De $10,000 en adelante va UNA de 10 mL POR CADA $10,000 ($20k = 2, $30k = 3…).
+# Christian, 2026-07-25. Así el regalo crece con el carrito y el porcentaje que
+# se regala se queda parejo (~23.5%) en vez de dispararse o diluirse.
 PERK_TEXT = {
     'agua_3ml': 'agua bacteriostática de 3 mL de cortesía',
     'agua_10ml': 'agua bacteriostática de 10 mL de cortesía',
     'envio_gratis': 'envío gratis',
 }
+PERK_PLURAL = {
+    'agua_3ml': 'aguas bacteriostáticas de 3 mL de cortesía',
+    'agua_10ml': 'aguas bacteriostáticas de 10 mL de cortesía',
+}
 
 # El SKU que hay que meter en la caja al preparar el pedido.
 PERK_SKU = {'agua_3ml': 'AGUABACTERIOST-3ML', 'agua_10ml': 'AGUABACTERIOST-10ML'}
+
+
+def water_bottles(total, tier):
+    """Cuántas botellas de agua van de regalo con este carrito.
+
+    Solo el escalón de $10,000+ escala: una por cada $10,000. Los de abajo dan una."""
+    per = tier.get('water_per')
+    if not per:
+        return 1
+    return max(1, int(float(total) // per))
+
+
+def _gift_text(perk, qty):
+    if qty <= 1:
+        return PERK_TEXT[perk]
+    return f'{qty} {PERK_PLURAL[perk]}'
+
 
 # Cuánto esperamos antes de escribirle. Ni encima (parece acoso) ni tarde (ya compró
 # en otro lado). Una hora es el estándar de la industria para el primer contacto.
@@ -65,11 +90,14 @@ def offer_for(cart_total):
         return {'kind': 'seguimiento'}
     for tier in OFFER_TIERS:
         if total >= tier['min']:
+            agua, qty = tier['water'], water_bottles(total, tier)
             return {
                 'kind': 'cupon',
                 'rate': tier['rate'],
-                'perks': list(tier['perks']),
-                'perk_text': ' + '.join(PERK_TEXT[p] for p in tier['perks']),
+                'perks': [agua, 'envio_gratis'],
+                # Lo que hay que EMPACAR: SKU y cuántas.
+                'gifts': [{'perk': agua, 'sku': PERK_SKU[agua], 'qty': qty}],
+                'perk_text': _gift_text(agua, qty) + ' + ' + PERK_TEXT['envio_gratis'],
                 # EL CANDADO: el cupón no sirve si compra menos de lo que ya traía.
                 'min_order': round(total),
             }

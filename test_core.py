@@ -1103,10 +1103,40 @@ def test_recovery_todos_los_escalones_llevan_agua_y_envio_gratis():
 
 
 def test_recovery_cada_regalo_de_agua_sabe_que_SKU_empacar():
-    for monto in (2500, 9000):
-        for perk in recovery.offer_for(monto)['perks']:
-            if perk.startswith('agua_'):
-                assert recovery.PERK_SKU[perk].startswith('AGUABACTERIOST')
+    for monto in (2500, 9000, 25000):
+        g = recovery.offer_for(monto)['gifts'][0]
+        assert g['sku'].startswith('AGUABACTERIOST') and g['qty'] >= 1
+
+
+def test_recovery_una_agua_de_10ml_por_cada_10_mil():
+    # Christian, 2026-07-25: $20k = 2 botellas, $30k = 3, y asi.
+    def qty(m):
+        return recovery.offer_for(m)['gifts'][0]['qty']
+    assert qty(10000) == 1
+    assert qty(19999) == 1
+    assert qty(20000) == 2
+    assert qty(35000) == 3
+    assert qty(100000) == 10
+
+
+def test_recovery_los_escalones_de_abajo_dan_UNA_sola():
+    for m in (2500, 4999, 5000, 9999):
+        assert recovery.offer_for(m)['gifts'][0]['qty'] == 1
+
+
+def test_recovery_el_texto_dice_cuantas_botellas():
+    assert '2 aguas' in recovery.offer_for(20000)['perk_text']
+    assert '1 agua' not in recovery.offer_for(10000)['perk_text']   # singular sin numero
+
+
+def test_recovery_regalar_de_mas_no_se_dispara_en_carritos_grandes():
+    # Con una botella por cada \$10,000 el % regalado se queda parejo, no crece.
+    def regalo(m):
+        o = recovery.offer_for(m)
+        return o['rate'] + o['gifts'][0]['qty'] * 349 / m
+    assert regalo(10000) < 0.245
+    assert regalo(50000) < 0.245
+    assert regalo(200000) < 0.245
 
 
 def test_recovery_el_escalon_chico_ya_no_regala_mas_que_el_grande():

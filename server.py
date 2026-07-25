@@ -3080,6 +3080,7 @@ async def _mandar_oferta(intento):
         })
         marca.update({'offer_code': code, 'offer_rate': oferta['rate'],
                       'offer_min_order': oferta['min_order'], 'offer_perks': oferta['perks'],
+                      'offer_gifts': oferta['gifts'],
                       'offer_perk_text': oferta['perk_text']})
     await db.checkout_intentos.update_one({'id': intento['id']}, {'$set': marca})
     try:
