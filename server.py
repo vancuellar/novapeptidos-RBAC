@@ -1036,8 +1036,13 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     if payload.distributor_code:
         _c = await db.discount_codes.find_one({'code': payload.distributor_code.strip().upper(),
                                                'active': True, 'kind': 'coupon'})
+        # EL CANDADO DEL MONTO: un cupón de recuperación de carrito solo sirve si la
+        # compra es del mismo monto o mayor al carrito que lo generó (Christian,
+        # 2026-07-25). Si no, el cliente quita productos, usa el cupón y salimos
+        # perdiendo. Los cupones normales (GIFT) no traen min_order y pasan igual.
         if _c and not _c.get('used') and (not _c.get('expires_at') or _c['expires_at'] >= now_iso()) \
-           and (not _c.get('user_id') or (user and user['id'] == _c['user_id'])):
+           and (not _c.get('user_id') or (user and user['id'] == _c['user_id'])) \
+           and recovery.coupon_is_valid_for(_c, discountable):
             coupon = _c
     referrer, code_discount = ((None, 0.0) if coupon else await _resolve_code(payload.distributor_code))
     if coupon:
@@ -1527,7 +1532,11 @@ async def check_discount_code(code: str):
     c = (code or '').strip().upper()
     cdoc = await db.discount_codes.find_one({'code': c, 'active': True, 'kind': 'coupon'})
     if cdoc and not cdoc.get('used') and (not cdoc.get('expires_at') or cdoc['expires_at'] >= now_iso()):
-        return {'code': c, 'discount_rate': cdoc.get('discount_rate', 0)}
+        # `min_order`: los cupones de recuperación de carrito exigen un monto mínimo.
+        # Se devuelve para que el carrito lo diga ANTES, y no le cobre al cliente algo
+        # distinto de lo que vio en pantalla.
+        return {'code': c, 'discount_rate': cdoc.get('discount_rate', 0),
+                'min_order': float(cdoc.get('min_order') or 0)}
     dist, discount = await _resolve_code(code)
     if not dist:
         raise HTTPException(status_code=404, detail='Codigo no valido')
