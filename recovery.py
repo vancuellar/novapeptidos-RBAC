@@ -25,13 +25,22 @@ MIN_FOR_OFFER = 2500
 # por eso el primer escalón ya empieza en 15%.
 OFFER_TIERS = [
     {'min': 10000, 'rate': 0.20, 'perks': ['agua_10ml', 'envio_gratis']},
-    {'min': 2500,  'rate': 0.15, 'perks': ['agua_10ml', 'envio_gratis']},
+    {'min': 5000,  'rate': 0.15, 'perks': ['agua_10ml', 'envio_gratis']},
+    {'min': 2500,  'rate': 0.15, 'perks': ['agua_3ml', 'envio_gratis']},
 ]
 
+# El agua no es un regalo cualquiera: la NECESITAN para reconstituir, así que
+# quita fricción de verdad. Por eso va en los tres escalones — pero la de 3 mL
+# ($199) en el chico y la de 10 mL ($349) de $5,000 para arriba, para que el que
+# compra más se lleve el mejor trato y no al revés. Christian, 2026-07-25.
 PERK_TEXT = {
+    'agua_3ml': 'agua bacteriostática de 3 mL de cortesía',
     'agua_10ml': 'agua bacteriostática de 10 mL de cortesía',
     'envio_gratis': 'envío gratis',
 }
+
+# El SKU que hay que meter en la caja al preparar el pedido.
+PERK_SKU = {'agua_3ml': 'AGUABACTERIOST-3ML', 'agua_10ml': 'AGUABACTERIOST-10ML'}
 
 # Cuánto esperamos antes de escribirle. Ni encima (parece acoso) ni tarde (ya compró
 # en otro lado). Una hora es el estándar de la industria para el primer contacto.

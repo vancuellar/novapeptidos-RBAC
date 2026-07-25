@@ -1085,13 +1085,42 @@ def test_recovery_escalera_por_monto():
     assert recovery.offer_for(40000)['rate'] == 0.20
 
 
-def test_recovery_los_dos_escalones_llevan_agua_de_10ml_y_envio_gratis():
-    # Christian, 2026-07-25: las dos ofertas llevan los mismos dos regalos;
-    # lo unico que cambia con el monto es el porcentaje.
-    for monto in (2500, 9999, 10000, 80000):
+def test_recovery_el_agua_sube_de_3ml_a_10ml_en_5000():
+    # Christian, 2026-07-25: agua de 3 mL en el escalon chico y de 10 mL desde
+    # $5,000, para que el que compra mas se lleve el mejor trato.
+    assert recovery.offer_for(2500)['perks'] == ['agua_3ml', 'envio_gratis']
+    assert recovery.offer_for(4999)['perks'] == ['agua_3ml', 'envio_gratis']
+    assert recovery.offer_for(5000)['perks'] == ['agua_10ml', 'envio_gratis']
+    assert recovery.offer_for(50000)['perks'] == ['agua_10ml', 'envio_gratis']
+
+
+def test_recovery_todos_los_escalones_llevan_agua_y_envio_gratis():
+    for monto in (2500, 4999, 5000, 9999, 10000, 80000):
         o = recovery.offer_for(monto)
-        assert o['perks'] == ['agua_10ml', 'envio_gratis'], monto
-        assert '10 mL' in o['perk_text'] and 'envío gratis' in o['perk_text'], monto
+        assert 'envio_gratis' in o['perks'], monto
+        assert any(p.startswith('agua_') for p in o['perks']), monto
+        assert 'envío gratis' in o['perk_text'], monto
+
+
+def test_recovery_cada_regalo_de_agua_sabe_que_SKU_empacar():
+    for monto in (2500, 9000):
+        for perk in recovery.offer_for(monto)['perks']:
+            if perk.startswith('agua_'):
+                assert recovery.PERK_SKU[perk].startswith('AGUABACTERIOST')
+
+
+def test_recovery_el_escalon_chico_ya_no_regala_mas_que_el_grande():
+    # Regalar = descuento + el agua como % del carrito. El de arriba debe salir
+    # igual o mejor; si no, premiamos al que compra menos.
+    def regalo(monto, precio_agua):
+        o = recovery.offer_for(monto)
+        return o['rate'] + precio_agua / monto
+    chico = regalo(2500, 199)      # agua de 3 mL
+    medio = regalo(5000, 349)      # agua de 10 mL
+    grande = regalo(10000, 349)
+    assert chico < 0.25            # ya no es el 29% de antes
+    assert medio <= chico
+    assert grande >= medio - 0.02  # el grande no queda peor que el mediano
 
 
 def test_recovery_la_oferta_siempre_supera_al_descuento_automatico():
