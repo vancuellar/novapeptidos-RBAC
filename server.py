@@ -776,7 +776,9 @@ async def change_password(payload: ChangePasswordInput, user=Depends(get_current
 
 @api_router.get('/auth/me')
 async def me(user=Depends(get_current_user)):
-    return user
+    # Un distribuidor compra para sí mismo con SU comisión máxima como descuento
+    # (Christian, 2026-07-25). El carrito lo necesita para mostrarlo en vivo.
+    return {**user, 'self_discount_rate': buyer_own_rate(user)}
 
 
 # ----------------- Categories -----------------
@@ -884,6 +886,26 @@ COMMISSION_CAP = 0.50
 # costo, un descuento encima la deja en perdida. El descuento se aplica a los demas
 # productos y estos quedan a precio de lista.
 NO_DISCOUNT_CATEGORIES = {'suministros', 'accesorios'}
+
+
+def buyer_own_rate(user):
+    """Descuento PROPIO de quien compra, sin necesidad de código (Christian, 2026-07-25).
+
+    - Distribuidor comprando para sí mismo: su comisión máxima (Alanís 40% → paga 60%).
+      Ese descuento ES su comisión, cobrada por adelantado: no gana comisión encima.
+    - Cliente con trato especial: el `personal_discount_rate` que le puso el admin
+      (el caso de Paz Cambray, 40% aunque sea solo cliente).
+
+    Siempre se recorta al tope de CADA producto (el ROI manda) y los insumos quedan
+    fuera. Es un piso, no un techo: si trae un código mejor, gana el mayor."""
+    if not user:
+        return 0.0
+    if user.get('role') == 'distributor':
+        return pyramid.effective_rate(user)
+    try:
+        return max(0.0, min(COMMISSION_CAP, float(user.get('personal_discount_rate') or 0)))
+    except (TypeError, ValueError):
+        return 0.0
 
 # ----------------- Lealtad (puntos) -----------------
 async def _points_entry(user_id, order, kind, points):
@@ -1022,6 +1044,16 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         discount_rate = code_discount
     else:
         discount_rate = 0.15 if discountable >= 35000 else 0.10
+    # COMPRA PROPIA de un distribuidor (regla de Christian, 2026-07-25): compra para
+    # sí mismo con SU comisión máxima como descuento (Alanís al 40% paga 60%). Ese
+    # descuento ES su comisión, cobrada por adelantado: NO gana comisión encima, y la
+    # orden no se atribuye a nadie. Sigue acotado al tope de cada producto (el ROI
+    # manda) y los insumos siguen fuera.
+    own_rate = buyer_own_rate(user)
+    if own_rate > 0:
+        discount_rate = max(discount_rate, own_rate)
+        if user.get('role') == 'distributor':
+            referrer = None   # su propia compra no se le atribuye ni le paga comision
     # Descuento RENGLÓN POR RENGLÓN: cada producto recibe el menor entre el descuento
     # pedido y su propio tope. Los que reciben menos se listan para poder avisarle al
     # cliente ("producto no participante, se aplicó un descuento alterno").
@@ -3130,6 +3162,7 @@ async def admin_customer_detail(user_id: str, admin=Depends(get_current_admin)):
         'customer': {'id': u['id'], 'name': u.get('name'), 'email': u.get('email'),
                      'created_at': u.get('created_at'), 'blocked': u.get('blocked', False),
                      'referred_by': u.get('referred_by'),
+                     'personal_discount_rate': float(u.get('personal_discount_rate') or 0),
                      'points_balance': int(u.get('points_balance', 0) or 0)},
         'orders': [{'id': o['id'], 'order_number': o.get('order_number'), 'created_at': o.get('created_at'),
                     'status': o.get('status'), 'total': o.get('total', 0),
@@ -3171,6 +3204,29 @@ async def admin_send_coupon(user_id: str, payload: CouponCreate, admin=Depends(g
                  f'Te mandamos el cupón {code} con {round(rate * 100)}% de descuento en tu próxima compra. '
                  + (payload.note or ''), link='/catalogo')
     return {'code': code, 'discount_rate': rate, 'expires_at': expires}
+
+
+class PersonalRate(BaseModel):
+    rate: float   # 0 = quitar el trato especial; hasta 0.50
+
+
+@api_router.put('/admin/customers/{user_id}/personal-discount')
+async def admin_set_personal_discount(user_id: str, payload: PersonalRate, admin=Depends(get_current_admin)):
+    """Trato especial PERMANENTE para un cliente: compra siempre con ese % sin
+    necesidad de código (el caso de Paz Cambray al 40%). Se recorta al tope de cada
+    producto y los insumos siguen fuera. 0 lo quita."""
+    u = await db.users.find_one({'id': user_id}, {'_id': 0, 'id': 1, 'name': 1, 'role': 1})
+    if not u:
+        raise HTTPException(status_code=404, detail='Cliente no encontrado')
+    if u.get('role') == 'distributor':
+        raise HTTPException(status_code=400, detail='Un distribuidor ya compra con su comisión máxima')
+    rate = max(0.0, min(COMMISSION_CAP, float(payload.rate or 0)))
+    await db.users.update_one({'id': user_id}, {'$set': {'personal_discount_rate': rate}})
+    if rate > 0:
+        await notify(user_id, 'personal_discount', 'Tienes un descuento permanente',
+                     f'A partir de ahora tus compras llevan {round(rate * 100)}% de descuento, '
+                     'sin necesidad de código.', link='/catalogo')
+    return {'id': user_id, 'name': u.get('name'), 'personal_discount_rate': rate}
 
 
 class GiftPoints(BaseModel):
