@@ -213,14 +213,26 @@ def advise(summary, site_visits=0, site_orders=0, site_revenue=0.0, fx=18.0):
                         'body': f'{site_orders} ventas de {clicks} clics. '
                                 f'Costo por venta: ${spend_mxn / site_orders:,.0f} MXN.'})
 
-    # 4. ¿Se recupera el dinero?
-    if site_revenue > 0 and spend_mxn > 0:
-        roas = site_revenue / spend_mxn
+    # 4. ¿Se recupera el dinero? OJO: solo se puede afirmar cuando Meta ATRIBUYE la
+    # compra al anuncio. Si no, lo que vendió el sitio pudo venir de WhatsApp, de
+    # boca en boca o de una venta directa — decir "recuperas $39 por peso" con eso
+    # sería mentirle a Christian y hacer que suba presupuesto por una señal falsa.
+    if summary['purchases'] > 0 and spend_mxn > 0:
+        val_mxn = summary['purchase_value'] * (fx if summary['currency'] == 'USD' else 1)
+        roas = val_mxn / spend_mxn
         out.append({'level': 'ok' if roas >= 2 else 'alto',
                     'title': f'Por cada peso que metes, recuperas ${roas:.2f}',
-                    'body': f'${site_revenue:,.0f} MXN vendidos contra ${spend_mxn:,.0f} MXN gastados. '
+                    'body': f'{summary["purchases"]} compras que Meta atribuye a los anuncios: '
+                            f'${val_mxn:,.0f} MXN contra ${spend_mxn:,.0f} MXN gastados. '
                             + ('Redituable: aquí sí tiene sentido subir presupuesto.' if roas >= 2
                                else 'Todavía no es redituable. No subas el presupuesto aún.')})
+    elif site_revenue > 0:
+        out.append({'level': 'medio', 'title': 'Estas ventas NO vienen de los anuncios',
+                    'body': f'El sitio vendió ${site_revenue:,.0f} MXN en el periodo, pero Meta no '
+                            'atribuye ninguna de esas compras a un anuncio. Pudieron llegar por '
+                            'WhatsApp, de boca en boca o venta directa. NO subas el presupuesto con '
+                            'este dato: primero hay que confirmar que el píxel esté registrando '
+                            'compras, si no seguimos a ciegas.'})
 
     # 5. Campañas que se están comiendo el dinero sin dar nada.
     return out

@@ -1026,11 +1026,26 @@ def test_meta_consejo_avisa_que_llega_gente_y_no_compra():
     assert any(a['level'] == 'alto' for a in avisos)
 
 
-def test_meta_consejo_calcula_el_retorno():
-    s = meta_ads.summarize(meta_ads.parse_csv(CSV_META))
+def test_meta_no_atribuye_al_anuncio_ventas_que_meta_no_atribuyo():
+    # LO MAS IMPORTANTE: si Meta no atribuye NINGUNA compra, el panel NO puede decir
+    # "recuperas X por peso" con las ventas del sitio — pudieron venir de WhatsApp.
+    # Decirlo haria que Christian suba presupuesto por una senal falsa.
+    s = meta_ads.summarize(meta_ads.parse_csv(CSV_META))   # 0 compras atribuidas
     avisos = meta_ads.advise(s, site_orders=3, site_revenue=20000, fx=18)
     cuerpo = ' '.join(a['title'] + a['body'] for a in avisos)
-    assert 'recuperas' in cuerpo               # ROAS calculado contra el gasto en pesos
+    assert 'recuperas' not in cuerpo
+    assert 'NO vienen de los anuncios' in cuerpo
+    assert 'NO subas el presupuesto' in cuerpo
+
+
+def test_meta_si_calcula_el_retorno_cuando_meta_si_atribuye():
+    s = meta_ads.summarize(meta_ads.parse_csv(CSV_META))
+    s['purchases'] = 10
+    s['purchase_value'] = 2000        # USD
+    avisos = meta_ads.advise(s, site_orders=10, site_revenue=36000, fx=18)
+    roas = next(a for a in avisos if 'recuperas' in a['title'])
+    # 2000 USD * 18 = 36,000 MXN contra 9.89 USD * 18 = 178 MXN
+    assert '202' in roas['title'] and roas['level'] == 'ok'
 
 
 def test_meta_sin_gasto_lo_dice_y_no_inventa():

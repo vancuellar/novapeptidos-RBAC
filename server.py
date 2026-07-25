@@ -3006,8 +3006,8 @@ async def admin_meta_dashboard(days: int = 30, admin=Depends(get_current_admin))
     orders = await db.orders.find({'created_at': {'$gte': desde}}, {'_id': 0}).to_list(5000)
     pagadas = [o for o in orders if o.get('status') not in ('cancelado',)]
     evs = await db.events.find({'created_at': {'$gte': desde}, 'type': 'visit'},
-                               {'_id': 0, 'session': 1}).to_list(50000)
-    visitas = len({e.get('session') for e in evs if e.get('session')})
+                               {'_id': 0, 'session_id': 1}).to_list(50000)
+    visitas = len({e.get('session_id') for e in evs if e.get('session_id')})
     ingreso = sum(o.get('total', 0) for o in pagadas)
     return {
         'fuente': 'meta_en_vivo' if live else ('csv' if rows else 'sin_datos'),
