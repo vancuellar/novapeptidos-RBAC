@@ -202,6 +202,10 @@ class Order(BaseModel):
     subtotal: float
     discount: float = 0         # descuento automatico por volumen (10/15/20%)
     discount_rate: float = 0
+    # Renglones que NO recibieron el descuento completo porque su tope de producto
+    # no lo aguanta (o porque son insumos, que nunca entran). Solo para explicarle
+    # al cliente por que su codigo dio menos en esos productos.
+    discount_capped: List[dict] = []
     shipping: float
     total: float
     status: str = 'pendiente'   # pendiente | confirmado | enviado | entregado | cancelado

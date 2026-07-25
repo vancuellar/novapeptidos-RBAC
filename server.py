@@ -879,6 +879,12 @@ async def delete_product(product_id: str, admin=Depends(get_current_admin)):
 # Tope duro de comision de distribuidores (regla de Christian, 2026-07-21).
 COMMISSION_CAP = 0.50
 
+# Insumos: NUNCA entran a ningun descuento ni pagan comision (regla de Christian,
+# 2026-07-25). El agua bacteriostatica es el caso que lo motivo: se vende casi al
+# costo, un descuento encima la deja en perdida. El descuento se aplica a los demas
+# productos y estos quedan a precio de lista.
+NO_DISCOUNT_CATEGORIES = {'suministros', 'accesorios'}
+
 # ----------------- Lealtad (puntos) -----------------
 async def _points_entry(user_id, order, kind, points):
     await db.points.insert_one({
@@ -962,7 +968,7 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     _pdocs = await db.products.find(
         {'$or': [{'id': {'$in': _keys}}, {'sku': {'$in': _keys}}]},
         {'_id': 0, 'id': 1, 'sku': 1, 'name': 1, 'commission_cap': 1,
-         'distributor_eligible': 1}).to_list(500)
+         'distributor_eligible': 1, 'category': 1}).to_list(500)
     _pflags = {}
     for d in _pdocs:
         _pflags[d['id']] = d
@@ -978,7 +984,17 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
 
     def _eligible(item):
         d = _pflags.get(item.product_id, {})
+        if (d.get('category') or '') in NO_DISCOUNT_CATEGORIES:
+            return False   # insumos (agua bacteriostática, viales, jeringas): nunca
         return bool(d.get('distributor_eligible', True)) and not _is_hgh_net(item)
+
+    def _disc_of(item, rate):
+        """Descuento REAL de un renglón: el menor entre el que se pidió y el tope
+        del producto. Regla de Christian (2026-07-25): primero el ROI de la casa.
+        Si el tope no aguanta, se RECORTA (antes se daba cero)."""
+        if not _eligible(item):
+            return 0.0
+        return min(float(rate or 0), _cap_of(item))
 
     discountable = sum(
         item.price * item.quantity for item in payload.items if _eligible(item)
@@ -1006,13 +1022,17 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         discount_rate = code_discount
     else:
         discount_rate = 0.15 if discountable >= 35000 else 0.10
-    if referrer:
-        # Un producto solo acepta el descuento del código si su tope lo aguanta.
-        _take = [it for it in payload.items if _eligible(it) and _cap_of(it) >= discount_rate]
-        _base_desc = sum(it.price * it.quantity for it in _take)
-        discount = round(_base_desc * discount_rate)
-    else:
-        discount = round(discountable * discount_rate)
+    # Descuento RENGLÓN POR RENGLÓN: cada producto recibe el menor entre el descuento
+    # pedido y su propio tope. Los que reciben menos se listan para poder avisarle al
+    # cliente ("producto no participante, se aplicó un descuento alterno").
+    discount = 0
+    discount_capped = []
+    for it in payload.items:
+        r = _disc_of(it, discount_rate)
+        discount += round(it.price * it.quantity * r)
+        if r < discount_rate - 1e-9:
+            discount_capped.append({'name': it.name, 'product_id': it.product_id,
+                                    'applied_rate': round(r, 4), 'asked_rate': round(discount_rate, 4)})
     after_discount = subtotal - discount
     # Lealtad: el canje se limita al saldo real y a la mercancia (el envio va en dinero).
     points_used = 0
@@ -1038,11 +1058,11 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
             if not _eligible(it):
                 continue
             cap = _cap_of(it)
+            disc = _disc_of(it, discount_rate)   # el descuento que de verdad se dio
             amt = it.price * it.quantity
-            if cap >= discount_rate:
-                key = (round(max(0.0, cap - discount_rate), 4), discount_rate)
-            else:
-                key = (round(cap, 4), 0.0)   # sin descuento: el tope entero es comisión
+            # Lo que queda del tope después del descuento es lo máximo que puede
+            # repartirse en comisiones. Si el descuento se comió el tope, es 0.
+            key = (round(max(0.0, cap - disc), 4), round(disc, 4))
             groups[key] = groups.get(key, 0) + amt
         merged = {}
         for (allowed, disc), amount in groups.items():
@@ -1065,6 +1085,7 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         subtotal=subtotal,
         discount=discount,
         discount_rate=discount_rate,
+        discount_capped=discount_capped,
         shipping=shipping,
         total=total,
         referred_by=referrer['id'] if referrer else None,
