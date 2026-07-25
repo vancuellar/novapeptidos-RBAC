@@ -2962,6 +2962,30 @@ async def track_event(payload: TrackEvent):
     return {'ok': True}
 
 
+@api_router.delete('/admin/orders/{order_id}')
+async def admin_delete_order(order_id: str, admin=Depends(get_current_admin)):
+    """BORRA un pedido para siempre. Solo el admin, y no hay deshacer.
+
+    Antes de borrarlo devuelve lo que la orden se llevó: los puntos de lealtad que
+    depositó (o los que el cliente canjeó). Las comisiones viven DENTRO de la orden,
+    así que se van con ella y los reportes dejan de contarla — que es justo lo que
+    se busca al borrar un pedido que nunca existió.
+
+    Para un pedido de verdad casi siempre conviene 'cancelado' en vez de borrar:
+    deja rastro. Borrar es para lo que nunca debió estar ahí."""
+    order = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    if order.get('status') != 'cancelado':
+        await revoke_order_points(order)     # devuelve puntos ganados y canjeados
+    await db.orders.delete_one({'id': order_id})
+    await db.points.delete_many({'order_id': order_id})
+    logger.warning('Admin %s borró el pedido %s (%s, $%s)', admin.get('email'),
+                   order.get('order_number'), (order.get('customer') or {}).get('full_name'),
+                   order.get('total'))
+    return {'deleted': True, 'order_number': order.get('order_number')}
+
+
 # ----------------- Panel de anuncios de Meta -----------------
 class MetaCsv(BaseModel):
     csv: str
