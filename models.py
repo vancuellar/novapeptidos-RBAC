@@ -347,3 +347,18 @@ class GoogleAuthInput(BaseModel):
     privacy_accepted: bool = False
     marketing_email: bool = False
     promos: bool = False
+
+
+class TrackEvent(BaseModel):
+    """Evento del embudo de venta. Sin datos personales: solo un id de sesion
+    anonimo y de donde vino la visita (para medir publicidad)."""
+    type: str                     # visit | product_view | add_to_cart | checkout_start | purchase
+    session_id: str
+    path: str = ''
+    product: str = ''             # SKU o slug, cuando aplica
+    value: float = 0              # monto, en compra
+    order_number: str = ''
+    utm_source: str = ''          # facebook, instagram, google...
+    utm_medium: str = ''
+    utm_campaign: str = ''
+    referrer: str = ''

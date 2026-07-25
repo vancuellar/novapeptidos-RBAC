@@ -18,7 +18,7 @@ from models import (
     RegisterInput, LoginInput, ForgotPasswordInput, ResetPasswordInput,
     ProfileUpdate, ChangePasswordInput,
     ProductCreate, ProductUpdate, Product, Category,
-    OrderCreate, Order, OrderItem, CustomerInfo, OrderStatusUpdate, OrderShippingUpdate,
+    OrderCreate, Order, OrderItem, CustomerInfo, OrderStatusUpdate, OrderShippingUpdate, TrackEvent,
     ProtocolInput, ProtocolUpdate, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
@@ -2869,6 +2869,90 @@ async def admin_view_as(user_id: str, admin=Depends(get_current_admin)):
         raise HTTPException(status_code=400, detail='No se puede ver como otro admin')
     token = create_view_as_token(admin['id'], user_id)
     return {'token': token, 'name': u.get('name'), 'role': u.get('role'), 'minutes': 30}
+
+
+# ----------------- Embudo de venta / efectividad de publicidad -----------------
+EVENT_TYPES = ('visit', 'product_view', 'add_to_cart', 'checkout_start', 'purchase')
+
+
+@api_router.post('/events')
+async def track_event(payload: TrackEvent):
+    """Registra un paso del embudo. Publico y anonimo: sirve para saber si la
+    gente que llega (sobre todo de publicidad) esta comprando o donde se cae."""
+    if payload.type not in EVENT_TYPES:
+        raise HTTPException(status_code=400, detail='Tipo de evento no valido')
+    doc = payload.model_dump()
+    doc['id'] = str(uuid.uuid4())
+    doc['created_at'] = now_iso()
+    await db.events.insert_one(doc)
+    return {'ok': True}
+
+
+@api_router.get('/admin/funnel')
+async def admin_funnel(days: int = 30, admin=Depends(get_current_admin)):
+    """Embudo + origen del trafico. Responde: llega gente? compra? de donde viene?"""
+    desde = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat()
+    evs = await db.events.find({'created_at': {'$gte': desde}}, {'_id': 0}).to_list(50000)
+
+    # Embudo por SESIONES unicas (no por clics): una persona cuenta una vez por paso.
+    pasos = {t: set() for t in EVENT_TYPES}
+    for e in evs:
+        t = e.get('type')
+        if t in pasos:
+            pasos[t].add(e.get('session_id'))
+    embudo = [{'paso': t, 'sesiones': len(pasos[t])} for t in EVENT_TYPES]
+
+    visitas = len(pasos['visit']) or 1
+    compras = len(pasos['purchase'])
+    ingreso = sum(e.get('value', 0) for e in evs if e.get('type') == 'purchase')
+
+    # Por origen: de donde vino y cuanto convirtio (esto mide la publicidad).
+    origen = {}
+    sesion_origen = {}
+    for e in sorted(evs, key=lambda x: x.get('created_at', '')):
+        sid = e.get('session_id')
+        if sid not in sesion_origen:
+            src = e.get('utm_source') or ''
+            if not src:
+                ref = (e.get('referrer') or '').lower()
+                if 'facebook' in ref or 'fb.' in ref: src = 'facebook (sin utm)'
+                elif 'instagram' in ref: src = 'instagram (sin utm)'
+                elif 'google' in ref: src = 'google (sin utm)'
+                elif ref: src = 'otro sitio'
+                else: src = 'directo'
+            sesion_origen[sid] = src
+    for e in evs:
+        src = sesion_origen.get(e.get('session_id'), 'directo')
+        o = origen.setdefault(src, {'origen': src, 'visitas': set(), 'compras': set(), 'ingreso': 0})
+        if e.get('type') == 'visit':
+            o['visitas'].add(e.get('session_id'))
+        if e.get('type') == 'purchase':
+            o['compras'].add(e.get('session_id'))
+            o['ingreso'] += e.get('value', 0)
+    por_origen = sorted(
+        [{'origen': v['origen'], 'visitas': len(v['visitas']), 'compras': len(v['compras']),
+          'ingreso': round(v['ingreso']),
+          'conversion': round(len(v['compras']) / len(v['visitas']) * 100, 1) if v['visitas'] else 0}
+         for v in origen.values()],
+        key=lambda x: -x['visitas'])
+
+    # Productos mas vistos que NO se venden: donde se pierde el interes.
+    vistos = {}
+    for e in evs:
+        if e.get('type') == 'product_view' and e.get('product'):
+            vistos[e['product']] = vistos.get(e['product'], 0) + 1
+    top_vistos = sorted([{'producto': k, 'vistas': v} for k, v in vistos.items()],
+                        key=lambda x: -x['vistas'])[:10]
+
+    return {
+        'dias': days,
+        'embudo': embudo,
+        'conversion_total': round(compras / visitas * 100, 2),
+        'ingreso': round(ingreso),
+        'por_origen': por_origen,
+        'top_vistos': top_vistos,
+        'sin_datos': len(evs) == 0,
+    }
 
 
 # ----------------- Admin: venta directa (2026-07-23) -----------------
