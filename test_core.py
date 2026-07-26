@@ -1215,3 +1215,83 @@ def test_envio_se_mide_sobre_lo_que_el_cliente_PAGA():
 def test_envio_no_revienta_con_basura():
     assert shipping_for(0) == SHIPPING_FLAT
     assert shipping_for(None) == SHIPPING_FLAT
+
+
+# --------------------------------------------------------------------------
+#  Mercado Pago (tarjeta) — Christian, 2026-07-26
+# --------------------------------------------------------------------------
+# Hasta esa fecha el checkout tenia un formulario de tarjeta que validaba el
+# numero en el navegador y lo TIRABA: nadie cobraba y el cliente se iba creyendo
+# que habia pagado. Estas pruebas cuidan lo que reemplaza a eso.
+import hashlib as _hashlib
+import hmac as _hmac
+
+import mercadopago as _mp
+
+
+def _firma(secreto, data_id, request_id, ts='1700000000'):
+    plantilla = f'id:{str(data_id).lower()};request-id:{request_id};ts:{ts};'
+    v1 = _hmac.new(secreto.encode(), plantilla.encode(), _hashlib.sha256).hexdigest()
+    return f'ts={ts},v1={v1}'
+
+
+def test_mercadopago_apagado_si_no_hay_llave(monkeypatch):
+    monkeypatch.delenv('MERCADOPAGO_ACCESS_TOKEN', raising=False)
+    assert _mp.enabled() is False
+    monkeypatch.setenv('MERCADOPAGO_ACCESS_TOKEN', 'APP_USR-loquesea')
+    assert _mp.enabled() is True
+
+
+def test_webhook_acepta_la_firma_buena(monkeypatch):
+    monkeypatch.setenv('MERCADOPAGO_WEBHOOK_SECRET', 's3cr3t0')
+    assert _mp.verify_webhook(_firma('s3cr3t0', '123', 'req-1'), 'req-1', '123') is True
+
+
+def test_webhook_rechaza_firma_falsa_y_sin_firma(monkeypatch):
+    monkeypatch.setenv('MERCADOPAGO_WEBHOOK_SECRET', 's3cr3t0')
+    assert _mp.verify_webhook('ts=1,v1=' + 'a' * 64, 'req-1', '123') is False
+    assert _mp.verify_webhook('', 'req-1', '123') is False
+    assert _mp.verify_webhook('basura', 'req-1', '123') is False
+
+
+def test_webhook_rechaza_si_cambia_el_request_id(monkeypatch):
+    """La firma amarra el id del pago CON el id de la peticion: si alguien
+    reusa una firma vieja en otra peticion, no pasa."""
+    monkeypatch.setenv('MERCADOPAGO_WEBHOOK_SECRET', 's3cr3t0')
+    buena = _firma('s3cr3t0', '123', 'req-1')
+    assert _mp.verify_webhook(buena, 'req-OTRO', '123') is False
+    assert _mp.verify_webhook(buena, 'req-1', '456') is False
+
+
+def test_webhook_no_pasa_nada_sin_secreto_configurado(monkeypatch):
+    """Sin secreto NO se acepta nada. Si no, cualquiera confirmaria pedidos."""
+    monkeypatch.delenv('MERCADOPAGO_WEBHOOK_SECRET', raising=False)
+    assert _mp.verify_webhook(_firma('s3cr3t0', '123', 'req-1'), 'req-1', '123') is False
+
+
+def test_solo_approved_confirma_el_pedido():
+    """'authorized' es dinero apartado, no cobrado. 'in_process' es revision."""
+    assert 'approved' in _mp.SETTLED_STATUSES
+    for estado in ('authorized', 'in_process', 'pending', 'rejected', 'refunded'):
+        assert estado not in _mp.SETTLED_STATUSES
+
+
+def test_solo_atiende_avisos_de_pago():
+    assert _mp.is_payment_event({'type': 'payment'}, {}) is True
+    assert _mp.is_payment_event({}, {'type': 'payment'}) is True
+    assert _mp.is_payment_event({'topic': 'merchant_order'}, {}) is False
+    assert _mp.is_payment_event({}, {}) is False
+
+
+def test_saca_el_id_del_pago_venga_como_venga():
+    assert _mp.extract_payment_id({'data.id': '999'}, {}) == '999'
+    assert _mp.extract_payment_id({'id': '888'}, {}) == '888'
+    assert _mp.extract_payment_id({}, {'data': {'id': 777}}) == '777'
+    assert _mp.extract_payment_id({}, {}) == ''
+
+
+def test_no_le_manda_webhook_a_localhost():
+    """Mercado Pago rechaza la preferencia si la URL de aviso es local."""
+    assert _mp._es_publico('https://api.exygenlabs.com/api/x') is True
+    assert _mp._es_publico('http://localhost:8000/api/x') is False
+    assert _mp._es_publico('http://127.0.0.1:8000/api/x') is False

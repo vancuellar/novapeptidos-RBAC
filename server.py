@@ -36,6 +36,7 @@ import loyalty
 import pyramid
 import auth_factors
 import btcpay
+import mercadopago
 import nowpayments
 from fastapi import Request
 
@@ -1005,7 +1006,11 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     deny_view_as(user)          # en modo "ver como" no se compra nada
     if not payload.items:
         raise HTTPException(status_code=400, detail='El carrito esta vacio')
-    allowed_methods = ['tarjeta', 'spei'] + (['cripto'] if crypto_enabled() else [])
+    # 'tarjeta' SOLO si Mercado Pago esta configurado. Hasta el 2026-07-26 se
+    # aceptaba siempre y no cobraba nada: el cliente veia "Pedido recibido" sin
+    # que nadie le cobrara. Si no hay pasarela, no se ofrece la vía.
+    allowed_methods = ['spei'] + (['tarjeta'] if mercadopago.enabled() else []) \
+        + (['cripto'] if crypto_enabled() else [])
     if payload.payment_method not in allowed_methods:
         raise HTTPException(status_code=400, detail='Metodo de pago no disponible')
     subtotal = sum(item.price * item.quantity for item in payload.items)
@@ -1216,6 +1221,27 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # Cripto: creamos la factura del proveedor encendido y devolvemos su enlace.
     # El pedido queda 'pendiente' hasta que su webhook confirme que llegó el
     # dinero. NOWPayments primero (más simple); BTCPay como respaldo.
+    # Tarjeta: se manda al cliente a la pagina de Mercado Pago. Los datos de la
+    # tarjeta NUNCA pasan por nuestro servidor. El pedido queda 'pendiente' hasta
+    # que su webhook confirme que el dinero entro.
+    if payload.payment_method == 'tarjeta':
+        order_url = f"{SITE_URL}/pedido/{order.order_number}"
+        try:
+            pref = mercadopago.create_preference(
+                order.order_number,
+                [it.model_dump() for it in payload.items],
+                total,
+                payer_email=payload.customer.email or '',
+                success_url=order_url,
+                failure_url=f"{SITE_URL}/carrito",
+                webhook_url=f"{API_BASE_URL}/api/payments/mercadopago/webhook",
+            )
+            await db.orders.update_one(
+                {'id': order.id},
+                {'$set': {'card_preference_id': pref['preference_id'], 'card_provider': 'mercadopago'}})
+            result['card_checkout_url'] = pref['checkout_url']
+        except Exception:
+            logger.exception('MercadoPago preference failed for %s', order.order_number)
     if payload.payment_method == 'cripto':
         order_url = f"{SITE_URL}/pedido/{order.order_number}"
         try:
@@ -1239,8 +1265,13 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     return result
 
 
-async def _confirm_crypto_order(order_number: str):
-    """Marca pagado un pedido de cripto y deposita puntos. Idempotente."""
+async def _confirm_paid_order(order_number: str):
+    """Marca pagado un pedido y deposita puntos. Idempotente.
+
+    La usan cripto (NOWPayments, BTCPay) y tarjeta (Mercado Pago): el pedido solo
+    pasa a 'confirmado' cuando el proveedor AVISA que el dinero llego, nunca
+    cuando el cliente vuelve al sitio — la URL de regreso se puede teclear a mano.
+    """
     order = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
     if order and order.get('status') == 'pendiente':
         await db.orders.update_one({'id': order['id']}, {'$set': {'status': 'confirmado', 'paid_at': now_iso()}})
@@ -1254,6 +1285,7 @@ async def payments_config():
     """El checkout pregunta qué métodos están encendidos hoy, y desde cuánto va
     gratis el envío (para que el carrito enseñe el mismo número que se cobra)."""
     return {'crypto_enabled': crypto_enabled(),
+            'card_enabled': mercadopago.enabled(),
             'shipping_flat': SHIPPING_FLAT,
             'free_shipping_from': FREE_SHIPPING_FROM}
 
@@ -1267,7 +1299,68 @@ async def nowpayments_webhook(request: Request):
         raise HTTPException(status_code=401, detail='firma invalida')
     event = json.loads(raw.decode() or '{}')
     if event.get('payment_status') in nowpayments.SETTLED_STATUSES:
-        await _confirm_crypto_order(event.get('order_id') or '')
+        await _confirm_paid_order(event.get('order_id') or '')
+    return {'ok': True}
+
+
+@api_router.post('/payments/mercadopago/webhook')
+async def mercadopago_webhook(request: Request):
+    """Mercado Pago avisa aqui cuando algo pasa con un pago.
+
+    Tres candados, en este orden:
+      1. Solo avisos de tipo 'payment' (tambien manda de merchant_order y demas).
+      2. La FIRMA `x-signature` tiene que cuadrar. Sin secreto configurado no pasa
+         nada — igual que en las otras pasarelas.
+      3. El estado NO se cree del cuerpo: se le pregunta a la API de Mercado Pago
+         con el id del pago. El cuerpo del aviso se puede falsificar; la respuesta
+         de su API, no.
+
+    Y el monto se compara contra el total del pedido: un pago aprobado por menos
+    de lo que costaba NO confirma nada.
+    """
+    raw = await request.body()
+    try:
+        body = json.loads(raw.decode() or '{}')
+    except ValueError:
+        body = {}
+    query = dict(request.query_params)
+    if not mercadopago.is_payment_event(query, body):
+        return {'ok': True, 'ignorado': 'no es un aviso de pago'}
+
+    payment_id = mercadopago.extract_payment_id(query, body)
+    if not payment_id:
+        return {'ok': True, 'ignorado': 'sin id de pago'}
+
+    if not mercadopago.verify_webhook(request.headers.get('x-signature', ''),
+                                      request.headers.get('x-request-id', ''),
+                                      payment_id):
+        raise HTTPException(status_code=401, detail='firma invalida')
+
+    try:
+        pago = mercadopago.get_payment(payment_id)
+    except Exception:
+        logger.exception('MercadoPago: no se pudo consultar el pago %s', payment_id)
+        raise HTTPException(status_code=502, detail='no se pudo verificar el pago')
+
+    if pago.get('status') not in mercadopago.SETTLED_STATUSES:
+        return {'ok': True, 'estado': pago.get('status')}
+
+    numero = (pago.get('external_reference')
+              or (pago.get('metadata') or {}).get('order_number') or '')
+    if not numero:
+        return {'ok': True, 'ignorado': 'el pago no trae numero de pedido'}
+
+    # Que lo pagado alcance lo que costaba. Un centavo menos y no se confirma.
+    order = await db.orders.find_one({'order_number': numero}, {'_id': 0, 'total': 1})
+    pagado = float(pago.get('transaction_amount') or 0)
+    if order and pagado + 0.01 < float(order.get('total') or 0):
+        logger.warning('MercadoPago: %s pago %s de %s — no se confirma',
+                       numero, pagado, order.get('total'))
+        return {'ok': True, 'ignorado': 'pago incompleto'}
+
+    await db.orders.update_one({'order_number': numero},
+                               {'$set': {'card_payment_id': str(payment_id)}})
+    await _confirm_paid_order(numero)
     return {'ok': True}
 
 
@@ -1282,7 +1375,7 @@ async def btcpay_webhook(request: Request):
     event = json.loads(raw.decode() or '{}')
     if event.get('type') not in btcpay.SETTLED_EVENTS:
         return {'ok': True}
-    await _confirm_crypto_order((event.get('metadata') or {}).get('orderId') or '')
+    await _confirm_paid_order((event.get('metadata') or {}).get('orderId') or '')
     return {'ok': True}
 
 
