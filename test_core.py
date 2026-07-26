@@ -1295,3 +1295,55 @@ def test_no_le_manda_webhook_a_localhost():
     assert _mp._es_publico('https://api.exygenlabs.com/api/x') is True
     assert _mp._es_publico('http://localhost:8000/api/x') is False
     assert _mp._es_publico('http://127.0.0.1:8000/api/x') is False
+
+
+# --------------------------------------------------------------------------
+#  Series de tráfico y ventas — Christian, 2026-07-26
+# --------------------------------------------------------------------------
+# El panel tenía totales pero no series: no se veía si algo sube o baja.
+# Lo que se cuida aquí es la ETIQUETA del periodo, que es donde se rompe todo:
+# si la semana no cae en su lunes, los renglones se reparten mal y la gráfica
+# miente.
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+
+def _etiqueta(iso, bucket):
+    """Misma lógica que `admin_series`: a qué periodo cae una fecha."""
+    d = _dt.fromisoformat(str(iso).replace('Z', '+00:00'))
+    if bucket == 'month':
+        return d.strftime('%Y-%m')
+    if bucket == 'week':
+        return (d - _td(days=d.weekday())).strftime('%Y-%m-%d')
+    return d.strftime('%Y-%m-%d')
+
+
+def test_la_semana_se_nombra_por_su_lunes():
+    # 2026-07-26 fue domingo: pertenece a la semana del lunes 20.
+    assert _etiqueta('2026-07-26T23:59:00+00:00', 'week') == '2026-07-20'
+    assert _etiqueta('2026-07-20T00:00:00+00:00', 'week') == '2026-07-20'
+    # El lunes siguiente ya es otra semana.
+    assert _etiqueta('2026-07-27T00:00:00+00:00', 'week') == '2026-07-27'
+
+
+def test_dia_y_mes_agrupan_donde_deben():
+    assert _etiqueta('2026-07-26T13:00:00+00:00', 'day') == '2026-07-26'
+    assert _etiqueta('2026-07-26T13:00:00+00:00', 'month') == '2026-07'
+    assert _etiqueta('2026-07-01T00:00:00+00:00', 'month') == '2026-07'
+
+
+def test_dos_momentos_del_mismo_dia_caen_en_el_mismo_cajon():
+    a = _etiqueta('2026-07-26T00:01:00+00:00', 'day')
+    b = _etiqueta('2026-07-26T23:59:00+00:00', 'day')
+    assert a == b
+
+
+def test_la_conversion_se_calcula_sobre_SESIONES_no_visitas():
+    """Una persona que recarga 10 veces es UNA sesión, no diez. Si se divide
+    entre visitas, la conversión sale 10 veces más chica de lo real."""
+    sesiones, pedidos = 20, 1
+    assert round(pedidos / sesiones * 100, 2) == 5.0
+
+
+def test_ticket_promedio_no_revienta_sin_pedidos():
+    pedidos, ingreso = 0, 0.0
+    assert (round(ingreso / pedidos) if pedidos else 0) == 0

@@ -3378,6 +3378,101 @@ async def admin_meta_dashboard(days: int = 30, admin=Depends(get_current_admin))
     }
 
 
+@api_router.get('/admin/series')
+async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_current_admin)):
+    """Tráfico y ventas a lo largo del tiempo, por DÍA, SEMANA o MES.
+
+    Christian lo pidió tres veces: el panel tenía totales pero no series, así que
+    no se podía ver si algo sube o baja. Devuelve un renglón por periodo con
+    visitas, sesiones únicas, pedidos e ingreso — todo del MISMO periodo, para que
+    se puedan encimar en la misma gráfica.
+
+    Los periodos VACÍOS también salen. Si no, una semana sin ventas desaparece de
+    la gráfica y la línea salta como si nunca hubiera existido: se ve un negocio
+    que crece cuando en realidad estuvo parado.
+    """
+    bucket = bucket if bucket in ('day', 'week', 'month') else 'day'
+    days = max(1, min(int(days or 30), 730))
+    ahora = datetime.now(timezone.utc)
+    desde_dt = ahora - timedelta(days=days)
+    desde = desde_dt.isoformat()
+
+    def etiqueta(iso: str) -> str:
+        """A qué periodo cae una fecha ISO. La semana se nombra por su LUNES."""
+        try:
+            d = datetime.fromisoformat(str(iso).replace('Z', '+00:00'))
+        except (ValueError, TypeError):
+            return ''
+        if bucket == 'month':
+            return d.strftime('%Y-%m')
+        if bucket == 'week':
+            return (d - timedelta(days=d.weekday())).strftime('%Y-%m-%d')
+        return d.strftime('%Y-%m-%d')
+
+    # Todos los periodos del rango, aunque no haya nada que contar.
+    periodos = []
+    cursor = desde_dt
+    if bucket == 'week':
+        cursor -= timedelta(days=cursor.weekday())
+    while cursor <= ahora:
+        et = etiqueta(cursor.isoformat())
+        if et and (not periodos or periodos[-1] != et):
+            periodos.append(et)
+        cursor += timedelta(days=1 if bucket != 'month' else 28)
+    et_hoy = etiqueta(ahora.isoformat())
+    if et_hoy and et_hoy not in periodos:
+        periodos.append(et_hoy)
+
+    filas = {p: {'periodo': p, 'visitas': 0, 'sesiones': 0, 'pedidos': 0, 'ingreso': 0.0}
+             for p in periodos}
+    sesiones = {p: set() for p in periodos}
+
+    evs = await db.events.find(
+        {'created_at': {'$gte': desde}, 'type': 'visit'},
+        {'_id': 0, 'created_at': 1, 'session_id': 1}).to_list(100000)
+    for e in evs:
+        p = etiqueta(e.get('created_at'))
+        if p in filas:
+            filas[p]['visitas'] += 1
+            if e.get('session_id'):
+                sesiones[p].add(e['session_id'])
+
+    orders = await db.orders.find(
+        {'created_at': {'$gte': desde}},
+        {'_id': 0, 'created_at': 1, 'total': 1, 'status': 1}).to_list(20000)
+    for o in orders:
+        if o.get('status') == 'cancelado':      # una venta cancelada no es una venta
+            continue
+        p = etiqueta(o.get('created_at'))
+        if p in filas:
+            filas[p]['pedidos'] += 1
+            filas[p]['ingreso'] += float(o.get('total') or 0)
+
+    for p in filas:
+        filas[p]['sesiones'] = len(sesiones[p])
+        filas[p]['ingreso'] = round(filas[p]['ingreso'], 2)
+
+    serie = [filas[p] for p in periodos]
+    total_ing = sum(f['ingreso'] for f in serie)
+    total_ped = sum(f['pedidos'] for f in serie)
+    total_ses = sum(f['sesiones'] for f in serie)
+    return {
+        'bucket': bucket,
+        'dias': days,
+        'serie': serie,
+        'totales': {
+            'visitas': sum(f['visitas'] for f in serie),
+            'sesiones': total_ses,
+            'pedidos': total_ped,
+            'ingreso': round(total_ing, 2),
+            # Cuántas de las sesiones acabaron comprando. Es EL número que dice si
+            # la publicidad sirve: 683 clics y 1 pedido no es lo mismo que 10 y 1.
+            'conversion': round(total_ped / total_ses * 100, 2) if total_ses else 0,
+            'ticket': round(total_ing / total_ped) if total_ped else 0,
+        },
+    }
+
+
 @api_router.get('/admin/funnel')
 async def admin_funnel(days: int = 30, admin=Depends(get_current_admin)):
     """Embudo + origen del trafico. Responde: llega gente? compra? de donde viene?"""
