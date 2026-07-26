@@ -3426,6 +3426,11 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
     filas = {p: {'periodo': p, 'visitas': 0, 'sesiones': 0, 'pedidos': 0, 'ingreso': 0.0}
              for p in periodos}
     sesiones = {p: set() for p in periodos}
+    # Únicas de TODO el rango, aparte de las de cada cajón. Una sesión que cruza
+    # la medianoche es única en el rango pero cae en dos días: si el total fuera
+    # la suma de los cajones, el mismo mes daría una conversión distinta al verlo
+    # por día que por semana. Y no puede.
+    sesiones_rango = set()
 
     evs = await db.events.find(
         {'created_at': {'$gte': desde}, 'type': 'visit'},
@@ -3436,6 +3441,8 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
             filas[p]['visitas'] += 1
             if e.get('session_id'):
                 sesiones[p].add(e['session_id'])
+        if e.get('session_id'):
+            sesiones_rango.add(e['session_id'])
 
     orders = await db.orders.find(
         {'created_at': {'$gte': desde}},
@@ -3455,7 +3462,7 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
     serie = [filas[p] for p in periodos]
     total_ing = sum(f['ingreso'] for f in serie)
     total_ped = sum(f['pedidos'] for f in serie)
-    total_ses = sum(f['sesiones'] for f in serie)
+    total_ses = len(sesiones_rango)
     return {
         'bucket': bucket,
         'dias': days,
