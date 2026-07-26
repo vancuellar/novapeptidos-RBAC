@@ -30,6 +30,8 @@ from auth import (
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
 import coa_store
 import meta_ads
+import marketing
+import director
 import recovery
 from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
 import loyalty
@@ -1001,6 +1003,30 @@ async def my_points(user=Depends(get_current_user)):
             'earn_rate': loyalty.EARN_RATE, 'ledger': ledger[:100]}
 
 
+# Pedidos que NO cuentan como venta en ningun reporte de marketing.
+NO_CUENTAN = ('cancelado',)
+
+
+async def _es_primera_compra(email: str) -> bool:
+    """¿Es la PRIMERA compra de este correo?
+
+    Es la pieza que hace honesto el costo por cliente. Si un cliente que ya
+    compraba vuelve a comprar, esa venta no es un cliente que el anuncio haya
+    conseguido: contarla como tal abarata el costo artificialmente y termina
+    justificando gasto en campañas que en realidad no traen gente nueva.
+    """
+    if not email:
+        return False
+    # Sin distinguir mayusculas: el correo se guarda tal como lo escribio el
+    # cliente, asi que "Ana@X.com" y "ana@x.com" son la MISMA persona. Buscarlo
+    # exacto contaria a un cliente viejo como nuevo cada vez que teclea distinto.
+    previo = await db.orders.find_one(
+        {'customer.email': {'$regex': f'^{re.escape(email.strip())}$', '$options': 'i'},
+         'status': {'$nin': list(NO_CUENTAN)}},
+        {'_id': 0, 'id': 1})
+    return previo is None
+
+
 @api_router.post('/orders')
 async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     deny_view_as(user)          # en modo "ver como" no se compra nada
@@ -1188,6 +1214,8 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         commissions=commissions,
         points_used=points_used,
         points_earned=points_earned,
+        attribution=(payload.attribution.model_dump() if payload.attribution else {}),
+        first_order=await _es_primera_compra(payload.customer.email),
     )
     await db.orders.insert_one(order.model_dump())
     # Ese carrito SI se cerro: su intento deja de estar pendiente y la IA ya no le escribe.
@@ -3339,24 +3367,74 @@ async def admin_meta_import(payload: MetaCsv, admin=Depends(get_current_admin)):
     return {'imported': len(rows), 'summary': meta_ads.summarize(rows)}
 
 
+# --------------------------------------------------------------- Meta en vivo
+# Christian: "la info de Meta debe estar live siempre, quiero ver siempre la
+# más actual disponible". Dos cosas hacen falta para cumplirlo de verdad:
+#
+#  1. Pedirle a Meta un rango que INCLUYA HOY (lo resuelve meta_ads.rango()).
+#  2. NO servir jamás el CSV viejo disfrazado de dato fresco. Antes, si la API
+#     fallaba, el panel caía al último CSV y lo mostraba sin decir nada: se veían
+#     números de hace semanas con cara de actuales. Eso es peor que no mostrar
+#     nada, porque se decide dinero con ellos.
+#
+# La caché de 60 s no es por lentitud: es para no chocar con el límite de
+# llamadas de Meta cuando el panel se refresca o se abren varias pestañas.
+_META_CACHE = {'filas': [], 'at': 0.0, 'days': None}
+META_CACHE_SEG = 60
+
+
+async def _meta_filas(days: int = 30, forzar: bool = False):
+    """(filas, estado). `estado` dice SIEMPRE de dónde salió el dato y qué tan viejo es."""
+    import time as _time
+    ahora_ts = _time.time()
+    if meta_ads.live_configured():
+        fresca = (not forzar and _META_CACHE['days'] == days
+                  and ahora_ts - _META_CACHE['at'] < META_CACHE_SEG and _META_CACHE['filas'])
+        if fresca:
+            return _META_CACHE['filas'], {
+                'fuente': 'meta_en_vivo', 'actualizado': _iso_de(_META_CACHE['at']),
+                'edad_segundos': int(ahora_ts - _META_CACHE['at']), 'aviso': ''}
+        try:
+            filas = await meta_ads.fetch_live(days)
+            _META_CACHE.update({'filas': filas, 'at': ahora_ts, 'days': days})
+            return filas, {'fuente': 'meta_en_vivo', 'actualizado': now_iso(),
+                           'edad_segundos': 0, 'aviso': ''}
+        except Exception as e:
+            logger.warning('Meta en vivo falló: %s', e)
+            filas = await db.meta_ads.find({}, {'_id': 0}).to_list(500)
+            viejo = filas[0].get('imported_at', '') if filas else ''
+            return filas, {
+                'fuente': 'csv_viejo' if filas else 'sin_datos',
+                'actualizado': viejo,
+                'edad_segundos': None,
+                # A la vista y en español: el panel debe pintar esto en rojo.
+                'aviso': (f'No se pudo hablar con Meta ({e}). Lo que ves es el último '
+                          f'archivo subido{" el " + viejo[:10] if viejo else ""}, NO el dato de hoy.'),
+            }
+    filas = await db.meta_ads.find({}, {'_id': 0}).to_list(500)
+    viejo = filas[0].get('imported_at', '') if filas else ''
+    return filas, {
+        'fuente': 'csv' if filas else 'sin_datos',
+        'actualizado': viejo, 'edad_segundos': None,
+        'aviso': ('Sin token de Meta: esto es el último archivo subido, no el dato en vivo.'
+                  if filas else 'No hay datos de Meta todavía.'),
+    }
+
+
+def _iso_de(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
 @api_router.get('/admin/meta/dashboard')
 async def admin_meta_dashboard(days: int = 30, admin=Depends(get_current_admin)):
     """Lo que Meta gastó, cruzado con lo que el sitio de verdad vendió.
 
     Fuente EN VIVO si hay token de Meta; si no, el último CSV subido. La salida es
-    idéntica en los dos casos, así que el panel no cambia cuando llegue el token."""
-    live = meta_ads.live_configured()
-    if live:
-        try:
-            rows = await meta_ads.fetch_live(days)
-        except Exception as e:                      # token vencido, Meta caído, etc.
-            logger.warning('Meta en vivo falló, uso el CSV: %s', e)
-            live = False
-            rows = []
-        if not rows:
-            live = False
-    if not live:
-        rows = await db.meta_ads.find({}, {'_id': 0}).to_list(500)
+    idéntica en los dos casos, así que el panel no cambia cuando llegue el token.
+
+    `estado` dice siempre de dónde salió el dato: el panel NUNCA debe pintar un
+    CSV de hace semanas como si fuera de hoy."""
+    rows, estado = await _meta_filas(days)
     summary = meta_ads.summarize(rows)
     # Cruce con la realidad: qué vendió el sitio en el mismo periodo.
     desde = summary.get('date_start') or (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()[:10]
@@ -3367,14 +3445,170 @@ async def admin_meta_dashboard(days: int = 30, admin=Depends(get_current_admin))
     visitas = len({e.get('session_id') for e in evs if e.get('session_id')})
     ingreso = sum(o.get('total', 0) for o in pagadas)
     return {
-        'fuente': 'meta_en_vivo' if live else ('csv' if rows else 'sin_datos'),
-        'actualizado': (rows[0].get('imported_at') if rows and not live else now_iso()),
+        **estado,
         'resumen': summary,
         'campanas': sorted(rows, key=lambda r: -r.get('spend', 0)),
         'sitio': {'visitas': visitas, 'pedidos': len(pagadas), 'ingreso': ingreso},
         'recomendaciones': meta_ads.advise(summary, site_visits=visitas,
                                            site_orders=len(pagadas), site_revenue=ingreso),
         'apagar': meta_ads.dead_weight(rows),
+    }
+
+
+# ------------------------------------------------------- área de marketing
+# El panel de anuncios sabía cuánto se gastó y cuánto se vendió, pero nunca lo
+# unía. Aquí se une para poder contestar la pregunta que importa: cuánto costó
+# cada cliente que DE VERDAD compró. Ver marketing.py para las reglas que
+# impiden que ese número se abarate solo.
+
+FX_DEFAULT = 18.0   # pesos por dólar; Meta cobra en USD y el sitio vende en MXN
+
+
+def _fx():
+    try:
+        return float(os.environ.get('META_FX_MXN') or FX_DEFAULT)
+    except ValueError:
+        return FX_DEFAULT
+
+
+async def _pedidos_y_sesiones(days: int):
+    """Lo que pasó del lado del SITIO en la ventana: pedidos válidos y sesiones
+    únicas por campaña (para poder sacar conversión por campaña)."""
+    desde = (datetime.now(timezone.utc) - timedelta(days=max(1, days) - 1)).isoformat()[:10]
+    pedidos = await db.orders.find({'created_at': {'$gte': desde}}, {'_id': 0}).to_list(20000)
+    pedidos = [o for o in pedidos if o.get('status') not in NO_CUENTAN]
+
+    evs = await db.events.find(
+        {'created_at': {'$gte': desde}, 'type': 'visit'},
+        {'_id': 0, 'session_id': 1, 'utm_campaign': 1, 'utm_source': 1,
+         'utm_content': 1, 'fbclid': 1, 'referrer': 1}
+    ).to_list(100000)
+    sesiones = {}
+    for e in evs:
+        c = marketing.campana_del_pedido(e)
+        if c:
+            sesiones.setdefault(c, set()).add(e.get('session_id'))
+    return desde, pedidos, {c: len(s) for c, s in sesiones.items()}
+
+
+@api_router.get('/admin/marketing/resumen')
+async def admin_marketing_resumen(days: int = 30, admin=Depends(get_current_admin)):
+    """Costo por cliente CON COMPRA HECHA, campaña por campaña.
+
+    Es lo que Christian pidió: no "cuánto costó un clic" sino cuánto costó cada
+    persona que terminó pagando. Cada campaña trae además su veredicto en una
+    palabra, y lo que no se pudo atribuir se muestra aparte en vez de repartirse.
+    """
+    filas, estado = await _meta_filas(days)
+    desde, pedidos, sesiones = await _pedidos_y_sesiones(days)
+    reporte = marketing.cruzar(filas, pedidos, sesiones, fx=_fx())
+    return {
+        **estado,
+        'periodo': {'desde': desde, 'hasta': datetime.now(timezone.utc).isoformat()[:10], 'dias': days},
+        'fx': _fx(),
+        **reporte,
+        # No solo Meta: de dónde llegó CADA venta (WhatsApp, Google, directo…) y
+        # cuánto costaron las de distribuidor, cuyo costo real es su comisión.
+        'canales': marketing.canales(pedidos, reporte['total']['gasto_mxn']),
+        # Lo que hay que pegar en cada anuncio para que la campaña se pueda medir.
+        'enlaces': [{'campana': f['campana'], 'slug': f['slug'],
+                     'url': marketing.enlace(SITE_URL, f['campana'])}
+                    for f in reporte['campanas']],
+    }
+
+
+@api_router.get('/admin/marketing/campana/{campaign_id}')
+async def admin_marketing_campana(campaign_id: str, days: int = 30,
+                                  admin=Depends(get_current_admin)):
+    """La radiografía de UNA campaña: día a día, anuncio por anuncio, y a quién
+    se le mostró. Todo del mismo token; no hace falta ningún permiso nuevo."""
+    filas, estado = await _meta_filas(days)
+    fila = next((r for r in filas if str(r.get('campaign_id')) == str(campaign_id)), None)
+    if not fila:
+        raise HTTPException(status_code=404, detail='No encuentro esa campaña en el periodo.')
+
+    _, pedidos, sesiones = await _pedidos_y_sesiones(days)
+    cruce = marketing.cruzar([fila], pedidos, sesiones, fx=_fx())
+    resumen = cruce['campanas'][0]
+
+    # Los cuatro cortes van en paralelo: son cuatro viajes a Meta y en serie se
+    # siente lento justo cuando Christian está decidiendo si apaga algo.
+    dia, anuncios, edad, donde = await asyncio.gather(
+        meta_ads.fetch_dia_a_dia(campaign_id, days),
+        meta_ads.fetch_anuncios(campaign_id, days),
+        meta_ads.fetch_corte(campaign_id, 'age,gender', days),
+        meta_ads.fetch_corte(campaign_id, 'publisher_platform', days),
+        return_exceptions=True,
+    )
+    def _ok(x):
+        # Si un corte truena, se devuelve vacío: la radiografía sirve igual con
+        # tres de cuatro, y tirar todo por un permiso faltante sería peor.
+        return [] if isinstance(x, Exception) else x
+
+    slug = resumen['slug']
+    pedidos_campana = [
+        {'order_number': o.get('order_number'), 'total': o.get('total'),
+         'status': o.get('status'), 'created_at': o.get('created_at'),
+         'nuevo': bool(o.get('first_order')),
+         'anuncio': (o.get('attribution') or {}).get('utm_content', '')}
+        for o in pedidos if marketing.campana_del_pedido(o.get('attribution')) == slug
+    ]
+    pedidos_campana.sort(key=lambda o: o.get('created_at') or '', reverse=True)
+
+    return {
+        **estado,
+        'campana': resumen,
+        'dia_a_dia': _ok(dia),
+        'anuncios': _ok(anuncios),
+        'por_edad_sexo': _ok(edad),
+        'por_plataforma': _ok(donde),
+        # Los pedidos REALES que salieron de esta campaña, con nombre y apellido
+        # de número de pedido. Es lo que convierte el reporte en algo verificable.
+        'pedidos': pedidos_campana,
+        'enlace_sugerido': marketing.enlace(SITE_URL, resumen['campana']),
+    }
+
+
+class DirectorPedido(BaseModel):
+    objetivo: str = 'conseguir clientes nuevos'
+    presupuesto_mxn: float = 0
+    days: int = 90          # el director mira MÁS atrás que el panel: para
+                            # aprender conviene todo el historial que haya
+
+
+@api_router.post('/admin/marketing/director')
+async def admin_marketing_director(payload: DirectorPedido, admin=Depends(get_current_admin)):
+    """Modo "director de marketing": arma una campaña nueva desde cero.
+
+    La IA NO inventa los datos: `director.briefing()` arma los hechos desde la
+    base (qué se vendió, qué campaña ganó, cuánto costó cada cliente) y eso es lo
+    único que ve el modelo. Si no hay historial suficiente, el briefing lo dice y
+    la propuesta sale marcada como tal en vez de fingir seguridad.
+
+    Devuelve una PROPUESTA para que Christian apruebe. No publica nada en Meta:
+    eso necesita permisos de escritura, revisión de la app y gasta dinero real.
+    """
+    days = max(7, min(int(payload.days or 90), 365))
+    filas, estado = await _meta_filas(min(days, 90))
+    _, pedidos, sesiones = await _pedidos_y_sesiones(days)
+    cruce = marketing.cruzar(filas, pedidos, sesiones, fx=_fx())
+    productos = await db.products.find({}, {'_id': 0}).to_list(1000)
+
+    brief = director.briefing(cruce['campanas'], pedidos, productos, fx=_fx())
+    try:
+        propuesta = await director.proponer(brief, payload.objetivo, payload.presupuesto_mxn)
+    except Exception as e:
+        logger.warning('Director de marketing falló: %s', e)
+        raise HTTPException(status_code=503, detail=f'La IA no respondió: {e}')
+
+    nombre = propuesta.get('nombre') or 'campana-nueva'
+    return {
+        **estado,
+        'propuesta': propuesta,
+        # El briefing se devuelve completo a propósito: Christian tiene que poder
+        # ver en qué se basó la IA, no solo lo que le dijo.
+        'briefing': brief,
+        'enlace': marketing.enlace(SITE_URL, nombre),
     }
 
 
