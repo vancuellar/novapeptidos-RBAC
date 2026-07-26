@@ -329,6 +329,38 @@ class ProtocolInput(BaseModel):
     remind: bool = True                  # avisar cuando se acerque el final
 
 
+class PerfilSalud(BaseModel):
+    """Los datos del cliente con los que se personaliza su seguimiento.
+
+    Christian, 2026-07-26: el sitio debe llevar un seguimiento calendarizado con
+    el peso, el porcentaje de grasa y lo que su médico le haya indicado.
+
+    ⚠️ EL CANDADO: `consulto_medico` y `tiene_analisis` NO son letra chica, son
+    requisito. El sitio no decide dosis — acompaña la que el cliente y su médico
+    ya decidieron. Por eso el seguimiento no se puede configurar sin confirmar
+    primero que hubo consulta y análisis previos. Si el disclaimer vive escondido
+    al pie de página no sirve de nada; aquí es parte del flujo.
+
+    Nada de esto es obligatorio para comprar: solo para usar el seguimiento.
+    """
+    model_config = ConfigDict(extra='ignore')
+    peso_kg: Optional[float] = None
+    estatura_cm: Optional[float] = None
+    grasa_pct: Optional[float] = None
+    sexo: str = ''                       # 'm' | 'f' | '' (para rangos de laboratorio)
+    edad: Optional[int] = None
+    objetivo: str = ''                   # texto libre del cliente
+    # El candado
+    consulto_medico: bool = False
+    tiene_analisis: bool = False
+    # Lo que le indicó su médico, tal cual. Es la fuente que manda sobre
+    # cualquier cosa que sugiera el sitio.
+    indicacion_medica: str = ''
+    medico_nombre: str = ''
+    medico_especialidad: str = ''
+    actualizado: str = ''
+
+
 class ProtocolUpdate(BaseModel):
     vial_mg: Optional[float] = None
     vials: Optional[int] = None

@@ -65,11 +65,23 @@ def briefing(campanas=None, pedidos=None, productos=None, fx=18.0):
     holgura = {p.get('sku') or p.get('slug'): p.get('commission_cap', 0)
                for p in productos if p.get('sku') or p.get('slug')}
 
+    # Cuánto se ha vendido de cada uno, para poder marcar los DESAPROVECHADOS.
+    vendidos = {d['sku']: d['ingreso'] for d in por_sku.values()}
     catalogo = [{'sku': p.get('sku') or p.get('slug'), 'nombre': p.get('name'),
                  'precio': p.get('price'), 'categoria': p.get('category'),
                  'existencia': p.get('stock', 0),
-                 'holgura_comision': p.get('commission_cap', 0)}
+                 'holgura_comision': p.get('commission_cap', 0),
+                 'ingreso_historico': round(vendidos.get(p.get('sku') or p.get('slug'), 0))}
                 for p in productos if p.get('stock', 0) > 0][:60]
+
+    # Christian, 2026-07-26: "GHK-Cu lo publicitan mucho, démosle más importancia".
+    # El problema de fondo: el director propone por lo que YA se vendió, así que un
+    # producto con buen margen que nadie ha empujado nunca se propone solo — se
+    # queda fuera para siempre por no haber estado dentro. Estos son los que tienen
+    # holgura de comisión y existencia, pero poco o ningún ingreso.
+    desaprovechados = sorted(
+        [c for c in catalogo if c['ingreso_historico'] == 0 and c['holgura_comision'] >= 0.35],
+        key=lambda c: -c['holgura_comision'])[:10]
 
     razones = []
     if len(pedidos) < MIN_PEDIDOS_PARA_APRENDER:
@@ -100,6 +112,9 @@ def briefing(campanas=None, pedidos=None, productos=None, fx=18.0):
             'angulos_ya_usados': [c['campana'] for c in campanas][:15],
         },
         'catalogo': catalogo,
+        # Buen margen, con existencia, y CERO ingreso: nadie los ha empujado.
+        # Sin esta lista el director solo repetiría los éxitos que ya tiene.
+        'desaprovechados': desaprovechados,
         'holgura': holgura,
         'fx': fx,
     }
@@ -112,9 +127,13 @@ REGLAS QUE NO SE ROMPEN:
 - Los productos son SOLO para investigación. NUNCA prometas efectos en personas,
   resultados de salud, pérdida de peso ni nada terapéutico. Nada de "baja de peso",
   "cura", "rejuvenece", "dosis recomendada".
-- No inventes cifras. Usa SOLO los números del briefing. Si el briefing dice que no
-  hay datos suficientes, dilo en `advertencia` y propón algo conservador y barato
-  de probar.
+- No inventes cifras. Usa SOLO los números del briefing.
+- El briefing trae `desaprovechados`: productos con buen margen y existencia que NO
+  han vendido nada porque nadie los ha empujado. Si propones siempre el mismo
+  producto ganador, el catálogo nunca crece. Cuando uno de esos encaje con el
+  objetivo, propónlo y dilo: "es un producto que no hemos empujado y tiene margen".
+- Si el briefing dice que no hay datos suficientes, dilo en `advertencia` y propón
+  algo conservador y barato de probar.
 - En México la venta de estos compuestos toca terreno delicado (COFEPRIS). NUNCA
   afirmes que algo es legal, aprobado, o que no requiere receta ni licencia.
 - Meta rechaza anuncios con promesas de salud, imágenes de "antes y después" y
@@ -131,7 +150,10 @@ Devuelve SOLO un JSON válido, sin texto alrededor y sin ```. Con esta forma exa
  "angulo": "la idea central, distinta a los ángulos ya usados",
  "anuncios": [
    {"formato": "video|imagen", "gancho": "primeros 3 segundos",
-    "titulo": "", "texto": "", "llamado": "", "idea_visual": ""}
+    "titulo": "", "texto": "", "llamado": "", "idea_visual": "",
+    "version_web":      {"destino": "sitio web", "texto": "", "llamado": ""},
+    "version_whatsapp": {"destino": "whatsapp", "texto": "", "llamado": "",
+                         "cupon": "WA-XXXX-MMM"}}
  ],
  "presupuesto": {"diario_mxn": 0, "dias": 0, "total_mxn": 0,
                  "clientes_esperados": 0, "en_que_me_baso": ""},
@@ -139,7 +161,21 @@ Devuelve SOLO un JSON válido, sin texto alrededor y sin ```. Con esta forma exa
  "cuando_apagar": "la regla concreta para matarla si no jala",
  "siguiente_prueba": "qué probar después si esta funciona"
 }
-Dame 3 anuncios distintos entre sí (distinto gancho, no la misma idea reescrita)."""
+Dame 3 anuncios distintos entre sí (distinto gancho, no la misma idea reescrita).
+
+CADA ANUNCIO VA EN DOS VERSIONES (orden de Christian, 2026-07-26):
+- `version_web`: manda al sitio web. Es la única que se puede medir hasta el peso,
+  porque el enlace lleva utm y la venta queda atribuida a la campaña.
+- `version_whatsapp`: manda a la mensajería de WhatsApp. Convierte distinto —hay
+  un humano contestando— pero **no se puede rastrear**: no hay URL, no hay utm.
+  Por eso ESTA VERSIÓN SIEMPRE LLEVA UN CUPÓN propio en el texto (formato
+  `WA-<PRODUCTO>-<MES>`, p. ej. `WA-RETA-JUL`). Cuando el cliente lo use al
+  comprar, esa venta queda atribuida al anuncio. Sin el cupón, WhatsApp es un
+  agujero negro: se ve el gasto y nunca se sabe qué trajo.
+
+Las dos versiones comparten el gancho y la idea visual; cambia el cierre —una
+invita a ver el producto en el sitio, la otra a escribir por WhatsApp— y solo la
+de WhatsApp menciona el cupón."""
 
 
 def prompt(brief, objetivo='conseguir clientes nuevos', presupuesto_mxn=0):

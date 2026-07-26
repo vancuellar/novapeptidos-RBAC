@@ -19,7 +19,7 @@ from models import (
     ProfileUpdate, ChangePasswordInput,
     ProductCreate, ProductUpdate, Product, Category,
     OrderCreate, Order, OrderItem, CustomerInfo, OrderStatusUpdate, OrderShippingUpdate, TrackEvent,
-    ProtocolInput, ProtocolUpdate, LabReportInput,
+    ProtocolInput, ProtocolUpdate, PerfilSalud, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
 )
@@ -2530,6 +2530,39 @@ async def download_coa(lot: str, user=Depends(get_current_user)):
     return FileResponse(path, media_type='application/pdf', filename=f'COA-{entry["lot"]}.pdf')
 
 
+# ------------------------------------------------ perfil de salud del cliente
+# El seguimiento personalizado que pidió Christian: peso, % de grasa y lo que le
+# indicó su médico. Con eso el calendario deja de ser genérico.
+#
+# ⚠️ El candado (`consulto_medico` + `tiene_analisis`) es parte del flujo, no
+# letra chica al pie. El sitio NO decide dosis: acompaña la que el cliente y su
+# médico ya decidieron. `puede_seguir` es lo que el frontend debe consultar
+# antes de dejar configurar nada.
+
+@api_router.get('/me/perfil-salud')
+async def get_perfil_salud(user=Depends(get_current_user)):
+    p = await db.perfiles_salud.find_one({'user_id': user['id']}, {'_id': 0, 'user_id': 0}) or {}
+    return {
+        'perfil': p,
+        'puede_seguir': bool(p.get('consulto_medico') and p.get('tiene_analisis')),
+        # Lo que falta para poder usar el seguimiento, dicho en claro.
+        'falta': [m for m, ok in (
+            ('Confirmar que ya consultaste a un médico', p.get('consulto_medico')),
+            ('Confirmar que tienes análisis previos', p.get('tiene_analisis')),
+        ) if not ok],
+    }
+
+
+@api_router.put('/me/perfil-salud')
+async def set_perfil_salud(payload: PerfilSalud, user=Depends(get_current_user)):
+    deny_view_as(user)          # en modo "ver como" el admin no escribe nada
+    doc = payload.model_dump()
+    doc['actualizado'] = now_iso()
+    await db.perfiles_salud.update_one({'user_id': user['id']},
+                                       {'$set': {**doc, 'user_id': user['id']}}, upsert=True)
+    return await get_perfil_salud(user)
+
+
 @api_router.get('/me/protocols')
 async def list_protocols(user=Depends(get_current_user)):
     rows = await db.protocols.find({'user_id': user['id']}, {'_id': 0}).to_list(200)
@@ -3490,6 +3523,57 @@ async def _pedidos_y_sesiones(days: int):
     return desde, pedidos, {c: len(s) for c, s in sesiones.items()}
 
 
+# Qué trajo cada cupón. Christian, 2026-07-26: "cada anuncio de WhatsApp y cada
+# correo de seguimiento debe llevar su propio cupón, para poder medir de dónde
+# viene la venta".
+#
+# Es la única forma de medir lo que NO pasa por un enlace: WhatsApp no tiene URL
+# donde pegar un utm, y un correo puede reenviarse. El cupón sí viaja con la
+# persona hasta el checkout.
+#
+# El prefijo dice el origen:
+#   VUELVE-*  → correo de carrito abandonado (ya existía, `created_by`)
+#   WA-*      → anuncio que manda a WhatsApp
+#   GIFT-*    → regalo del admin
+ORIGEN_POR_PREFIJO = {
+    'VUELVE': 'correo de carrito abandonado',
+    'WA': 'anuncio de WhatsApp',
+    'GIFT': 'regalo del admin',
+}
+
+
+async def _ventas_por_cupon(desde: str):
+    """Cuánto trajo cada origen de cupón, y cuántos se mandaron sin usarse."""
+    cupones = await db.discount_codes.find({'created_at': {'$gte': desde}}, {'_id': 0}).to_list(5000)
+    usados = {c.get('used_order') for c in cupones if c.get('used') and c.get('used_order')}
+    pedidos = await db.orders.find(
+        {'order_number': {'$in': list(usados)}, 'status': {'$nin': list(NO_CUENTAN)}},
+        {'_id': 0, 'order_number': 1, 'total': 1, 'first_order': 1}).to_list(5000) if usados else []
+    por_pedido = {o['order_number']: o for o in pedidos}
+
+    grupos = {}
+    for c in cupones:
+        origen = ORIGEN_POR_PREFIJO.get(str(c.get('code', '')).split('-')[0].upper(), 'otro')
+        g = grupos.setdefault(origen, {'origen': origen, 'mandados': 0, 'usados': 0,
+                                       'clientes_nuevos': 0, 'ingreso_mxn': 0.0})
+        g['mandados'] += 1
+        o = por_pedido.get(c.get('used_order'))
+        if o:
+            g['usados'] += 1
+            g['ingreso_mxn'] += float(o.get('total') or 0)
+            if o.get('first_order'):
+                g['clientes_nuevos'] += 1
+    filas = []
+    for g in grupos.values():
+        filas.append({**g, 'ingreso_mxn': round(g['ingreso_mxn']),
+                      'ingreso': round(marketing.a_usd(g['ingreso_mxn'], _fx()), 2),
+                      # De cada 100 cupones mandados, cuántos se usaron. Es la
+                      # medida de si la oferta sirve o solo estamos regalando.
+                      'uso_pct': round(g['usados'] / g['mandados'] * 100, 1) if g['mandados'] else 0})
+    filas.sort(key=lambda f: -f['ingreso'])
+    return filas
+
+
 @api_router.get('/admin/marketing/resumen')
 async def admin_marketing_resumen(days: int = 30, admin=Depends(get_current_admin)):
     """Costo por cliente CON COMPRA HECHA, campaña por campaña.
@@ -3510,6 +3594,7 @@ async def admin_marketing_resumen(days: int = 30, admin=Depends(get_current_admi
         # No solo Meta: de dónde llegó CADA venta (WhatsApp, Google, directo…) y
         # cuánto costaron las de distribuidor, cuyo costo real es su comisión.
         'canales': marketing.canales(pedidos, reporte['total']['gasto'], _fx()),
+        'cupones': await _ventas_por_cupon(desde),
         # Lo que hay que pegar en cada anuncio para que la campaña se pueda medir.
         'enlaces': [{'campana': f['campana'], 'slug': f['slug'],
                      'url': marketing.enlace(SITE_URL, f['campana'])}

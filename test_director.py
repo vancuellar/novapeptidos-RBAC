@@ -110,3 +110,39 @@ def test_si_no_es_json_lo_dice_en_vez_de_reventar():
 
 def test_parsea_json_limpio():
     assert D.parsear(json.dumps({'nombre': 'A'}))['nombre'] == 'A'
+
+
+def test_el_sistema_pide_las_dos_versiones_de_cada_anuncio():
+    # Christian, 2026-07-26: cada anuncio en dos copias, una al sitio y otra a
+    # WhatsApp. Si alguien borra esto sin querer, esta prueba lo caza.
+    s = D.SISTEMA.lower()
+    assert 'version_web' in s and 'version_whatsapp' in s
+
+
+def test_la_version_de_whatsapp_exige_cupon():
+    # Es lo unico que hace medible a WhatsApp: sin URL no hay utm, asi que la
+    # venta solo se puede atribuir por el codigo que use el cliente al comprar.
+    s = D.SISTEMA.lower()
+    assert 'cupon' in s or 'cupón' in s
+    assert 'wa-' in s
+
+
+def test_marca_los_productos_desaprovechados():
+    # Christian, 2026-07-26 (a raiz de GHK-Cu): el director proponia por lo que YA
+    # se habia vendido, asi que un producto con buen margen que nadie empujo nunca
+    # se proponia solo. Quedaba fuera para siempre por no haber estado dentro.
+    productos = [
+        {'sku': 'GANADOR', 'name': 'Ganador', 'price': 100, 'stock': 10, 'commission_cap': 0.5},
+        {'sku': 'OLVIDADO', 'name': 'Olvidado', 'price': 100, 'stock': 10, 'commission_cap': 0.5},
+        {'sku': 'FLACO', 'name': 'Sin margen', 'price': 100, 'stock': 10, 'commission_cap': 0.1},
+    ]
+    pedidos = [_pedido(5000, sku='GANADOR', nombre='Ganador')]
+    d = D.briefing([], pedidos, productos)['desaprovechados']
+    skus = [x['sku'] for x in d]
+    assert 'OLVIDADO' in skus          # margen bueno y cero ventas
+    assert 'GANADOR' not in skus       # ese ya vende
+    assert 'FLACO' not in skus         # sin margen no vale la pena empujarlo
+
+
+def test_el_sistema_le_dice_que_no_repita_siempre_al_ganador():
+    assert 'desaprovechados' in D.SISTEMA.lower()
