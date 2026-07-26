@@ -26,7 +26,17 @@ def enabled() -> bool:
 
 def create_invoice(order_number: str, amount: float, success_url: str, cancel_url: str, ipn_url: str) -> dict:
     """Crea una factura alojada. Devuelve la URL a la que mandamos al cliente.
-    price_currency = MXN; NOWPayments cotiza la cripto al momento del pago."""
+
+    PRECIO CONGELADO (`is_fixed_rate`, decisión de Christian 2026-07-26): la cripto
+    se cotiza AL CREAR la factura y ese tipo de cambio se respeta. Sin esto,
+    NOWPayments cotizaba al momento del pago: si el cliente se tardaba y la moneda
+    se movía, nos llegaban menos pesos de los que costaba el pedido.
+
+    El precio a cambio se paga en tiempo: con tarifa fija NOWPayments solo da
+    **10 minutos** para pagar (sin congelar daba 20). Es su mínimo; no es
+    configurable desde aquí. Pasados los 10 min la factura expira y el cliente
+    tiene que volver a empezar — el pedido sigue 'pendiente' y no se le cobra nada.
+    """
     resp = requests.post(
         f'{API}/invoice',
         headers={'x-api-key': os.environ['NOWPAYMENTS_API_KEY'], 'Content-Type': 'application/json'},
@@ -34,6 +44,7 @@ def create_invoice(order_number: str, amount: float, success_url: str, cancel_ur
             'price_amount': round(float(amount), 2),
             'price_currency': 'mxn',
             'order_id': order_number,
+            'is_fixed_rate': True,
             'ipn_callback_url': ipn_url,
             'success_url': success_url,
             'cancel_url': cancel_url,
