@@ -3461,14 +3461,13 @@ async def admin_meta_dashboard(days: int = 30, admin=Depends(get_current_admin))
 # cada cliente que DE VERDAD compró. Ver marketing.py para las reglas que
 # impiden que ese número se abarate solo.
 
-FX_DEFAULT = 18.0   # pesos por dólar; Meta cobra en USD y el sitio vende en MXN
-
-
+# ⚠️ TC FIJO 17.5 — el mismo de la maestra de precios. Christian: "usemos todo a
+# 17.50 a menos que yo te diga que hay que recalibrar precios". NO se actualiza
+# solo: el día que cambie hay que recalibrar los precios junto con esto.
 def _fx():
-    try:
-        return float(os.environ.get('META_FX_MXN') or FX_DEFAULT)
-    except ValueError:
-        return FX_DEFAULT
+    return marketing.TC_MAESTRA
+
+
 
 
 async def _pedidos_y_sesiones(days: int):
@@ -3501,6 +3500,7 @@ async def admin_marketing_resumen(days: int = 30, admin=Depends(get_current_admi
     """
     filas, estado = await _meta_filas(days)
     desde, pedidos, sesiones = await _pedidos_y_sesiones(days)
+
     reporte = marketing.cruzar(filas, pedidos, sesiones, fx=_fx())
     return {
         **estado,
@@ -3509,7 +3509,7 @@ async def admin_marketing_resumen(days: int = 30, admin=Depends(get_current_admi
         **reporte,
         # No solo Meta: de dónde llegó CADA venta (WhatsApp, Google, directo…) y
         # cuánto costaron las de distribuidor, cuyo costo real es su comisión.
-        'canales': marketing.canales(pedidos, reporte['total']['gasto_mxn']),
+        'canales': marketing.canales(pedidos, reporte['total']['gasto'], _fx()),
         # Lo que hay que pegar en cada anuncio para que la campaña se pueda medir.
         'enlaces': [{'campana': f['campana'], 'slug': f['slug'],
                      'url': marketing.enlace(SITE_URL, f['campana'])}

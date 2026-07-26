@@ -405,6 +405,31 @@ def _basico(d):
     }
 
 
+async def fetch_gasto_diario(days=30):
+    """Gasto por CAMPAÑA y por DÍA.
+
+    Hace falta para convertir con el tipo de cambio del día en que se pagó: las
+    filas normales vienen sumadas del periodo entero, y con una sola tasa las
+    campañas del principio y del final del mes quedan medidas con distinta vara.
+    """
+    if not live_configured():
+        return []
+    import httpx, json as _json
+    params = {
+        'access_token': os.environ['META_TOKEN'],
+        'level': 'campaign',
+        'time_range': _json.dumps(rango(days)),
+        'time_increment': 1,
+        'fields': 'campaign_id,campaign_name,spend,account_currency',
+        'limit': 1000,
+    }
+    async with httpx.AsyncClient(timeout=40) as client:
+        data = await _pedir(client, f'{_cuenta()}/insights', params)
+    return [{'fecha': d.get('date_start', ''), 'campaign': d.get('campaign_name', ''),
+             'campaign_id': d.get('campaign_id', ''), 'gasto': _num(d.get('spend')),
+             'moneda': d.get('account_currency', 'MXN')} for d in data]
+
+
 async def fetch_dia_a_dia(campaign_id, days=30):
     """Una fila por DÍA. Es lo que deja ver cuándo se cayó o despegó algo.
 
