@@ -889,6 +889,23 @@ COMMISSION_CAP = 0.50
 # productos y estos quedan a precio de lista.
 NO_DISCOUNT_CATEGORIES = {'suministros', 'accesorios'}
 
+# ENVIO (Christian, 2026-07-26). Mandar un paquete dentro de Mexico cuesta ~$250.
+# Absorberlo en un pedido de \$879 se comia el 28% del ingreso. En vez de dejar de
+# vender las presentaciones chicas — que son la puerta de entrada del cliente
+# nuevo — el envio se regala solo a partir de cierto monto. Abajo de eso se cobra.
+# El umbral es el mismo que el de las ofertas de carrito abandonado, a proposito.
+SHIPPING_FLAT = 250          # lo que de verdad cuesta el envio nacional
+FREE_SHIPPING_FROM = 2500    # de aqui para arriba, va por cuenta de la casa
+
+
+def shipping_for(merchandise_paid):
+    """Cuanto se le cobra de envio a un pedido.
+
+    Se mide sobre lo que el cliente PAGA de mercancia (ya con descuento), no sobre
+    el precio de lista: si no, un codigo grande dejaria el envio gratis cobrando
+    mucho menos. Primero el ROI."""
+    return 0 if float(merchandise_paid or 0) >= FREE_SHIPPING_FROM else SHIPPING_FLAT
+
 
 def buyer_own_rate(user):
     """Descuento PROPIO de quien compra, sin necesidad de código (Christian, 2026-07-25).
@@ -1113,7 +1130,8 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         balance = int((fresh or {}).get('points_balance', 0) or 0)
         points_used = loyalty.clamp_redeem(payload.points_to_use, balance, after_discount)
     paid_merchandise = after_discount - points_used
-    shipping = payload.shipping if payload.shipping else 0   # el envio se cotiza por separado
+    # El envio lo decide el SERVIDOR, no lo que mande el navegador.
+    shipping = shipping_for(paid_merchandise)
     total = paid_merchandise + shipping
     points_earned = loyalty.earn(paid_merchandise, user is not None and loyalty.eligible(user))
     # Pirámide: el vendedor gana (su tasa − el descuento que dio) y cada upline su
@@ -1233,8 +1251,11 @@ async def _confirm_crypto_order(order_number: str):
 
 @api_router.get('/payments/config')
 async def payments_config():
-    """El checkout pregunta qué métodos están encendidos hoy."""
-    return {'crypto_enabled': crypto_enabled()}
+    """El checkout pregunta qué métodos están encendidos hoy, y desde cuánto va
+    gratis el envío (para que el carrito enseñe el mismo número que se cobra)."""
+    return {'crypto_enabled': crypto_enabled(),
+            'shipping_flat': SHIPPING_FLAT,
+            'free_shipping_from': FREE_SHIPPING_FROM}
 
 
 @api_router.post('/payments/nowpayments/webhook')

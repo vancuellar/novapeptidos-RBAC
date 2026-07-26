@@ -1189,3 +1189,29 @@ def test_recovery_no_escribe_si_ya_compro_ni_sin_correo():
         {'status': 'convertido', 'email': 'x@y.com', 'contacted': False}, 9999) is False
     assert recovery.should_contact(
         {'status': 'pendiente', 'email': '  ', 'contacted': False}, 9999) is False
+
+
+# ---------- Envio: gratis desde cierto monto ----------
+from server import shipping_for, SHIPPING_FLAT, FREE_SHIPPING_FROM
+
+
+def test_envio_se_cobra_en_pedidos_chicos():
+    # Mandar un paquete cuesta ~$250: en un pedido de $879 eso es el 28%.
+    assert shipping_for(879) == SHIPPING_FLAT
+    assert shipping_for(2499) == SHIPPING_FLAT
+
+
+def test_envio_gratis_desde_el_umbral():
+    assert shipping_for(FREE_SHIPPING_FROM) == 0
+    assert shipping_for(10000) == 0
+
+
+def test_envio_se_mide_sobre_lo_que_el_cliente_PAGA():
+    # Un pedido de lista $3,000 con 35% de descuento paga $1,950: NO va gratis.
+    # Si se midiera sobre el precio de lista, se regalaria el envio cobrando menos.
+    assert shipping_for(1950) == SHIPPING_FLAT
+
+
+def test_envio_no_revienta_con_basura():
+    assert shipping_for(0) == SHIPPING_FLAT
+    assert shipping_for(None) == SHIPPING_FLAT
