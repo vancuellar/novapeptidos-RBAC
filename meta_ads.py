@@ -283,6 +283,38 @@ def live_configured():
     return bool(os.environ.get('META_TOKEN') and os.environ.get('META_AD_ACCOUNT'))
 
 
+def _cuenta():
+    acct = os.environ['META_AD_ACCOUNT']
+    return acct if acct.startswith('act_') else 'act_' + acct
+
+
+def rango(days=30):
+    """Ventana de fechas que INCLUYE HOY.
+
+    ⚠️ Antes se usaba `date_preset=last_30d`, que en Meta significa los 30 días
+    ANTERIORES a hoy: el día en curso quedaba fuera. Christian pidió ver siempre
+    lo más actual disponible, y lo de hoy es justo lo que más le sirve para
+    decidir si apaga algo. Con `time_range` explícito sí entra el día en curso
+    (parcial, pero real).
+    """
+    from datetime import datetime, timezone, timedelta
+    hoy = datetime.now(timezone.utc).date()
+    desde = hoy - timedelta(days=max(0, int(days or 30)) - 1)
+    return {'since': desde.isoformat(), 'until': hoy.isoformat()}
+
+
+async def _pedir(client, ruta, params):
+    """Una llamada a la API, con el error de Meta legible si truena."""
+    r = await client.get(f'{GRAPH}/{ruta}', params=params)
+    if r.status_code >= 400:
+        try:
+            msg = r.json().get('error', {}).get('message', r.text[:200])
+        except Exception:
+            msg = r.text[:200]
+        raise RuntimeError(f'Meta respondió {r.status_code}: {msg}')
+    return r.json().get('data', [])
+
+
 async def fetch_live(days=30):
     """Trae las mismas filas que `parse_csv`, pero de la API de Meta.
 
@@ -291,21 +323,20 @@ async def fetch_live(days=30):
     if not live_configured():
         return []
     import httpx
-    acct = os.environ['META_AD_ACCOUNT']
-    if not acct.startswith('act_'):
-        acct = 'act_' + acct
+    import json as _json
+    acct = _cuenta()
     params = {
         'access_token': os.environ['META_TOKEN'],
         'level': 'campaign',
-        'date_preset': 'last_30d' if days > 7 else 'last_7d',
-        'fields': ('campaign_name,spend,impressions,reach,clicks,cpc,inline_link_clicks,'
-                   'actions,action_values,account_currency'),
+        'time_range': _json.dumps(rango(days)),
+        # `campaign_id` es lo que permite abrir la radiografia de una campaña:
+        # sin él solo tenemos el nombre, y los nombres se repiten y se editan.
+        'fields': ('campaign_id,campaign_name,spend,impressions,reach,clicks,cpc,ctr,frequency,'
+                   'inline_link_clicks,actions,action_values,account_currency'),
         'limit': 200,
     }
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(f'{GRAPH}/{acct}/insights', params=params)
-        r.raise_for_status()
-        data = r.json().get('data', [])
+        data = await _pedir(client, f'{acct}/insights', params)
     rows = []
     for d in data:
         acts = {a['action_type']: _num(a.get('value')) for a in d.get('actions', [])}
@@ -323,6 +354,9 @@ async def fetch_live(days=30):
         landings = int(acts.get('landing_page_view', 0))
         rows.append({
             'campaign': d.get('campaign_name', ''),
+            'campaign_id': d.get('campaign_id', ''),
+            'ctr': _num(d.get('ctr')),
+            'frequency': round(_num(d.get('frequency')), 2),
             'link_clicks': link_clicks,
             'landing_page_views': landings,
             'status': 'active',
@@ -342,3 +376,150 @@ async def fetch_live(days=30):
             'date_end': d.get('date_stop', ''),
         })
     return rows
+
+
+# --------------------------------------------------------------------------
+# RADIOGRAFÍA DE UNA CAMPAÑA
+# --------------------------------------------------------------------------
+# Todo esto sale del MISMO token que ya está puesto: es la misma llamada de
+# insights, cambiando el nivel y los cortes. No hace falta ningún permiso nuevo.
+
+def _basico(d):
+    """Las cifras que se repiten en todos los cortes."""
+    acts = {a['action_type']: _num(a.get('value')) for a in d.get('actions', [])}
+    vals = {a['action_type']: _num(a.get('value')) for a in d.get('action_values', [])}
+    spend = _num(d.get('spend'))
+    link_clicks = int(_num(d.get('inline_link_clicks')) or acts.get('link_click', 0))
+    impresiones = int(_num(d.get('impressions')))
+    return {
+        'gasto': round(spend, 2),
+        'moneda': d.get('account_currency', 'MXN'),
+        'impresiones': impresiones,
+        'alcance': int(_num(d.get('reach'))),
+        'clics_enlace': link_clicks,
+        'paginas_cargadas': int(acts.get('landing_page_view', 0)),
+        'cpc': round(spend / link_clicks, 2) if link_clicks else 0.0,
+        'cpm': round(spend / impresiones * 1000, 2) if impresiones else 0.0,
+        'meta_compras': int(acts.get('purchase', 0)),
+        'meta_valor': round(vals.get('purchase', 0.0), 2),
+    }
+
+
+async def fetch_gasto_diario(days=30):
+    """Gasto por CAMPAÑA y por DÍA.
+
+    Hace falta para convertir con el tipo de cambio del día en que se pagó: las
+    filas normales vienen sumadas del periodo entero, y con una sola tasa las
+    campañas del principio y del final del mes quedan medidas con distinta vara.
+    """
+    if not live_configured():
+        return []
+    import httpx, json as _json
+    params = {
+        'access_token': os.environ['META_TOKEN'],
+        'level': 'campaign',
+        'time_range': _json.dumps(rango(days)),
+        'time_increment': 1,
+        'fields': 'campaign_id,campaign_name,spend,account_currency',
+        'limit': 1000,
+    }
+    async with httpx.AsyncClient(timeout=40) as client:
+        data = await _pedir(client, f'{_cuenta()}/insights', params)
+    return [{'fecha': d.get('date_start', ''), 'campaign': d.get('campaign_name', ''),
+             'campaign_id': d.get('campaign_id', ''), 'gasto': _num(d.get('spend')),
+             'moneda': d.get('account_currency', 'MXN')} for d in data]
+
+
+async def fetch_dia_a_dia(campaign_id, days=30):
+    """Una fila por DÍA. Es lo que deja ver cuándo se cayó o despegó algo.
+
+    Los días sin gasto también salen (los rellena el que llama): si un día muerto
+    desaparece, la línea salta y parece que nunca dejó de funcionar.
+    """
+    if not live_configured() or not campaign_id:
+        return []
+    import httpx, json as _json
+    params = {
+        'access_token': os.environ['META_TOKEN'],
+        'level': 'campaign',
+        'time_range': _json.dumps(rango(days)),
+        'time_increment': 1,
+        'fields': ('spend,impressions,reach,clicks,inline_link_clicks,actions,'
+                   'action_values,account_currency'),
+        'limit': 500,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        data = await _pedir(client, f'{campaign_id}/insights', params)
+    return [{'fecha': d.get('date_start', ''), **_basico(d)} for d in data]
+
+
+async def fetch_anuncios(campaign_id, days=30):
+    """Un renglón por ANUNCIO, con su creativo (la imagen o el video real).
+
+    Es el corte que de verdad sirve: dentro de una campaña que "va mal" casi
+    siempre hay un anuncio que gana y otro que se está comiendo el dinero.
+    """
+    if not live_configured() or not campaign_id:
+        return []
+    import httpx, json as _json
+    tok = os.environ['META_TOKEN']
+    params = {
+        'access_token': tok,
+        'level': 'ad',
+        'time_range': _json.dumps(rango(days)),
+        'fields': ('ad_id,ad_name,adset_name,spend,impressions,reach,clicks,'
+                   'inline_link_clicks,actions,action_values,account_currency'),
+        'limit': 200,
+    }
+    async with httpx.AsyncClient(timeout=40) as client:
+        data = await _pedir(client, f'{campaign_id}/insights', params)
+        anuncios = [{'ad_id': d.get('ad_id', ''), 'anuncio': d.get('ad_name', ''),
+                     'conjunto': d.get('adset_name', ''), **_basico(d)} for d in data]
+        # La miniatura y el texto viven en el creativo, no en las métricas: es
+        # otra llamada por anuncio. Sin esto la radiografía es una tabla de
+        # números y no se ve QUÉ anuncio es.
+        for a in anuncios:
+            if not a['ad_id']:
+                continue
+            try:
+                r = await client.get(f'{GRAPH}/{a["ad_id"]}', params={
+                    'access_token': tok,
+                    'fields': 'creative{thumbnail_url,image_url,title,body,object_story_spec}',
+                })
+                cre = (r.json() or {}).get('creative', {}) if r.status_code < 400 else {}
+                a['miniatura'] = cre.get('thumbnail_url') or cre.get('image_url') or ''
+                a['titulo'] = cre.get('title') or ''
+                a['texto'] = cre.get('body') or ''
+            except Exception:
+                a['miniatura'] = a['titulo'] = a['texto'] = ''
+    anuncios.sort(key=lambda a: -a['gasto'])
+    return anuncios
+
+
+async def fetch_corte(campaign_id, breakdown, days=30):
+    """Cómo se repartió el gasto por edad, sexo o dónde se mostró el anuncio.
+
+    `breakdown`: 'age', 'gender', 'age,gender', 'publisher_platform',
+    'platform_position', 'country', 'region', 'impression_device'.
+    """
+    if not live_configured() or not campaign_id:
+        return []
+    import httpx, json as _json
+    params = {
+        'access_token': os.environ['META_TOKEN'],
+        'level': 'campaign',
+        'time_range': _json.dumps(rango(days)),
+        'breakdowns': breakdown,
+        'fields': ('spend,impressions,reach,clicks,inline_link_clicks,actions,'
+                   'action_values,account_currency'),
+        'limit': 200,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        data = await _pedir(client, f'{campaign_id}/insights', params)
+    campos = breakdown.split(',')
+    out = []
+    for d in data:
+        etiqueta = ' · '.join(str(d.get(c, '')) for c in campos if d.get(c))
+        out.append({'segmento': etiqueta or '(sin dato)', **_basico(d)})
+    out.sort(key=lambda x: -x['gasto'])
+    return out

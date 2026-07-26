@@ -181,6 +181,32 @@ class CustomerInfo(BaseModel):
     notes: str = ''
 
 
+class Attribution(BaseModel):
+    """De dónde salió el cliente. PRIMER TOQUE: el anuncio que lo TRAJO, no la
+    última pestaña que tenía abierta.
+
+    Sin esto guardado en el pedido, el gasto de Meta y las ventas viven en dos
+    mundos que no se tocan: se puede saber cuánto se gastó y cuánto se vendió,
+    pero NO cuánto costó cada cliente que de verdad compró. Christian, 2026-07-26.
+
+    `utm_content` es el ANUNCIO concreto dentro de la campaña, y `fbclid` es la
+    red de seguridad: Meta se lo pega solo a los enlaces de sus anuncios aunque
+    nadie los haya etiquetado.
+    """
+    model_config = ConfigDict(extra='ignore')
+    utm_source: str = ''
+    utm_medium: str = ''
+    utm_campaign: str = ''
+    utm_content: str = ''
+    utm_term: str = ''
+    fbclid: str = ''
+    referrer: str = ''
+    landing_path: str = ''
+    first_seen: str = ''
+    visitor_id: str = ''
+    session_id: str = ''
+
+
 class OrderCreate(BaseModel):
     items: List[OrderItem]
     customer: CustomerInfo
@@ -189,6 +215,7 @@ class OrderCreate(BaseModel):
     discount: float = 0                      # informativo; el servidor recalcula con su propia regla
     distributor_code: Optional[str] = None   # referido por un distribuidor (atribuye la venta)
     points_to_use: int = 0                   # puntos de lealtad a canjear; el servidor valida saldo
+    attribution: Optional[Attribution] = None
 
 
 class Order(BaseModel):
@@ -231,6 +258,12 @@ class Order(BaseModel):
     shipped_at: Optional[str] = None
     delivered_at: Optional[str] = None
     eta: str = ''                       # texto libre: '3-5 días hábiles'
+    # Marketing: de dónde vino este cliente y si era su PRIMERA compra.
+    # `first_order` es la pieza que hace honesto el costo por cliente: si un
+    # cliente que ya compraba vuelve a comprar, esa venta NO es un cliente que
+    # el anuncio haya conseguido, y contarla abarata el costo artificialmente.
+    attribution: dict = Field(default_factory=dict)
+    first_order: bool = False
     created_at: str = Field(default_factory=now_iso)
 
 
@@ -366,4 +399,12 @@ class TrackEvent(BaseModel):
     utm_source: str = ''          # facebook, instagram, google...
     utm_medium: str = ''
     utm_campaign: str = ''
+    # El ANUNCIO concreto dentro de la campaña, y el clic de Meta. `fbclid` es la
+    # red de seguridad de toda la medición: Meta se lo pega a los enlaces de sus
+    # anuncios aunque nadie los haya etiquetado, así que sin él una publicación
+    # impulsada es indistinguible del tráfico directo.
+    utm_content: str = ''
+    utm_term: str = ''
+    fbclid: str = ''
     referrer: str = ''
+    landing_path: str = ''
