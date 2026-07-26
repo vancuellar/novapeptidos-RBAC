@@ -3431,10 +3431,11 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
     # la suma de los cajones, el mismo mes daría una conversión distinta al verlo
     # por día que por semana. Y no puede.
     sesiones_rango = set()
+    visitantes_rango = set()
 
     evs = await db.events.find(
         {'created_at': {'$gte': desde}, 'type': 'visit'},
-        {'_id': 0, 'created_at': 1, 'session_id': 1}).to_list(100000)
+        {'_id': 0, 'created_at': 1, 'session_id': 1, 'visitor_id': 1}).to_list(100000)
     for e in evs:
         p = etiqueta(e.get('created_at'))
         if p in filas:
@@ -3443,6 +3444,8 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
                 sesiones[p].add(e['session_id'])
         if e.get('session_id'):
             sesiones_rango.add(e['session_id'])
+        if e.get('visitor_id'):
+            visitantes_rango.add(e['visitor_id'])
 
     orders = await db.orders.find(
         {'created_at': {'$gte': desde}},
@@ -3470,6 +3473,9 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
         'totales': {
             'visitas': sum(f['visitas'] for f in serie),
             'sesiones': total_ses,
+            # Personas distintas. Una que vuelve tres veces son 3 sesiones pero
+            # UN visitante. Los eventos viejos no lo traen, por eso puede salir 0.
+            'visitantes': len(visitantes_rango),
             'pedidos': total_ped,
             'ingreso': round(total_ing, 2),
             # Cuántas de las sesiones acabaron comprando. Es EL número que dice si

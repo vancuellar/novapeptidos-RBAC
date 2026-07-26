@@ -128,6 +128,8 @@ def summarize(rows):
     """Los totales que manda el panel."""
     spend = sum(r['spend'] for r in rows)
     clicks = sum(r['clicks'] for r in rows)
+    link_clicks = sum(r.get('link_clicks', 0) for r in rows)
+    landings = sum(r.get('landing_page_views', 0) for r in rows)
     impressions = sum(r['impressions'] for r in rows)
     purchases = sum(r['purchases'] for r in rows)
     value = sum(r['purchase_value'] for r in rows)
@@ -139,7 +141,13 @@ def summarize(rows):
         'impressions': impressions,
         'reach': sum(r['reach'] for r in rows),
         'clicks': clicks,
-        'cpc': round(spend / clicks, 4) if clicks else 0.0,
+        'link_clicks': link_clicks,
+        'landing_page_views': landings,
+        # El CPC honesto es sobre los clics AL ENLACE, no sobre todos.
+        'cpc': round(spend / link_clicks, 4) if link_clicks else (round(spend / clicks, 4) if clicks else 0.0),
+        # De cada 100 que le dieron clic al enlace, cuantos llegaron a ver la
+        # pagina. Si esto va bajo, el problema es el sitio o el anuncio, no la puja.
+        'landing_rate': round(landings / link_clicks * 100, 1) if link_clicks else 0.0,
         'cpm': round(spend / impressions * 1000, 2) if impressions else 0.0,
         'purchases': purchases,
         'purchase_value': round(value, 2),
@@ -290,7 +298,7 @@ async def fetch_live(days=30):
         'access_token': os.environ['META_TOKEN'],
         'level': 'campaign',
         'date_preset': 'last_30d' if days > 7 else 'last_7d',
-        'fields': ('campaign_name,spend,impressions,reach,clicks,cpc,'
+        'fields': ('campaign_name,spend,impressions,reach,clicks,cpc,inline_link_clicks,'
                    'actions,action_values,account_currency'),
         'limit': 200,
     }
@@ -304,8 +312,19 @@ async def fetch_live(days=30):
         vals = {a['action_type']: _num(a.get('value')) for a in d.get('action_values', [])}
         spend = _num(d.get('spend'))
         clicks = int(_num(d.get('clicks')))
+        # ⚠️ `clicks` de Meta son TODOS los clics: reacciones, comentarios, abrir la
+        # foto, entrar al perfil. En una publicación impulsada, la mayoría NO son
+        # visitas al sitio. Lo que de verdad importa:
+        #   link_click        -> le dieron clic al enlace
+        #   landing_page_view -> el navegador ALCANZÓ a cargar la página
+        # Entre uno y otro se cae mucha gente (clic sin querer, se aburren, red
+        # lenta). Mostrar `clicks` como si fueran visitas engaña.
+        link_clicks = int(_num(d.get('inline_link_clicks')) or acts.get('link_click', 0))
+        landings = int(acts.get('landing_page_view', 0))
         rows.append({
             'campaign': d.get('campaign_name', ''),
+            'link_clicks': link_clicks,
+            'landing_page_views': landings,
             'status': 'active',
             'currency': d.get('account_currency', 'USD'),
             'spend': round(spend, 2),

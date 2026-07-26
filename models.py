@@ -357,7 +357,8 @@ class TrackEvent(BaseModel):
     """Evento del embudo de venta. Sin datos personales: solo un id de sesion
     anonimo y de donde vino la visita (para medir publicidad)."""
     type: str                     # visit | product_view | add_to_cart | checkout_start | purchase
-    session_id: str
+    session_id: str               # caduca a los 30 min sin actividad: es UNA visita
+    visitor_id: str = ''          # permanente: sirve para saber si alguien vuelve
     path: str = ''
     product: str = ''             # SKU o slug, cuando aplica
     value: float = 0              # monto, en compra
