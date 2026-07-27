@@ -1,0 +1,134 @@
+"""Credenciales de pasarelas que Christian puede pegar desde el Admin.
+
+Por qué existe
+--------------
+Las llaves de Mercado Pago (y las de cualquier otra pasarela) vivían solo en el
+`.env` del servidor. Eso obliga a entrar por SSH cada vez que cambian, y
+Christian trabaja desde el teléfono. Este módulo permite pegarlas desde el
+panel de Admin.
+
+Reglas que no se rompen:
+
+  - **El `.env` manda.** Si la variable está en el entorno, se usa esa y la base
+    de datos se ignora. Así un despliegue nunca queda a merced de lo que haya
+    en Mongo, y se puede revertir quitando el valor del Admin.
+  - **Solo escritura.** El valor NUNCA se devuelve al navegador. El Admin solo
+    puede ver si está configurado y los últimos 4 caracteres, para confirmar que
+    pegó el correcto sin exponerlo.
+  - **Se guarda cifrado** con Fernet, usando una llave derivada del JWT_SECRET.
+    No es un HSM: si alguien tiene la base Y el secreto de la app, lo abre. Pero
+    evita que un dump de Mongo entregue las llaves de cobro en claro.
+"""
+
+import base64
+import hashlib
+import os
+
+from cryptography.fernet import Fernet, InvalidToken
+
+COLECCION = 'gateway_secrets'
+
+# Lo único que se acepta guardar. Una llave que no esté aquí se rechaza, para
+# que el endpoint no se convierta en un almacén de cualquier cosa.
+PERMITIDAS = {
+    'MERCADOPAGO_ACCESS_TOKEN',
+    'MERCADOPAGO_WEBHOOK_SECRET',
+    'NOWPAYMENTS_API_KEY',
+    'NOWPAYMENTS_IPN_SECRET',
+    'BTCPAY_API_KEY',
+    'BTCPAY_WEBHOOK_SECRET',
+}
+
+
+def _fernet() -> Fernet:
+    semilla = os.environ.get('JWT_SECRET', 'nova-peptides-secret-key-change-me')
+    llave = base64.urlsafe_b64encode(hashlib.sha256(semilla.encode()).digest())
+    return Fernet(llave)
+
+
+def cifrar(valor: str) -> str:
+    return _fernet().encrypt(valor.encode()).decode()
+
+
+def descifrar(blob: str) -> str | None:
+    try:
+        return _fernet().decrypt(blob.encode()).decode()
+    except (InvalidToken, AttributeError, ValueError):
+        return None
+
+
+def pista(valor: str) -> str:
+    """Lo único que se le enseña al Admin: los últimos 4 caracteres."""
+    v = valor or ''
+    return ('•' * 8 + v[-4:]) if len(v) > 4 else '•' * 8
+
+
+async def guardar(db, nombre: str, valor: str) -> bool:
+    if nombre not in PERMITIDAS:
+        return False
+    valor = (valor or '').strip()
+    if not valor:
+        await db[COLECCION].delete_one({'nombre': nombre})
+        return True
+    await db[COLECCION].update_one(
+        {'nombre': nombre},
+        {'$set': {'nombre': nombre, 'cifrado': cifrar(valor), 'pista': pista(valor)}},
+        upsert=True,
+    )
+    return True
+
+
+async def leer(db, nombre: str) -> str | None:
+    """El valor efectivo: primero el entorno, luego la base."""
+    del_entorno = os.environ.get(nombre)
+    if del_entorno:
+        return del_entorno
+    if db is None:
+        return None
+    doc = await db[COLECCION].find_one({'nombre': nombre})
+    return descifrar(doc['cifrado']) if doc and doc.get('cifrado') else None
+
+
+# --------------------------------------------------------------------- cache
+# Las pasarelas (mercadopago.py, btcpay.py) leen sus llaves desde funciones
+# sincronas, y Mongo es async. En vez de reescribir esas rutas, se mantiene un
+# cache en memoria que se recarga al arrancar y cada vez que el Admin guarda.
+_CACHE: dict = {}
+
+
+def valor(nombre: str) -> str:
+    """El valor efectivo, sincrono. El entorno siempre manda sobre el cache."""
+    return os.environ.get(nombre) or _CACHE.get(nombre) or ''
+
+
+async def recargar(db) -> int:
+    """Rellena el cache desde la base. Devuelve cuantas llaves cargo."""
+    _CACHE.clear()
+    if db is None:
+        return 0
+    async for d in db[COLECCION].find({}, {'_id': 0}):
+        claro = descifrar(d.get('cifrado') or '')
+        if claro and d.get('nombre') in PERMITIDAS:
+            _CACHE[d['nombre']] = claro
+    return len(_CACHE)
+
+
+async def estado(db) -> list:
+    """Para el Admin: qué está configurado y de dónde sale. Sin valores."""
+    docs = {}
+    if db is not None:
+        async for d in db[COLECCION].find({}, {'_id': 0}):
+            docs[d['nombre']] = d
+    out = []
+    for nombre in sorted(PERMITIDAS):
+        env = bool(os.environ.get(nombre))
+        doc = docs.get(nombre)
+        out.append({
+            'nombre': nombre,
+            'configurado': env or bool(doc),
+            'origen': 'servidor' if env else ('panel' if doc else None),
+            'pista': (('•' * 8 + os.environ[nombre][-4:]) if env
+                      else (doc.get('pista') if doc else None)),
+            'editable': not env,
+        })
+    return out

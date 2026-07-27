@@ -29,6 +29,8 @@ from auth import (
 )
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
 import coa_store
+import ficha_store
+import secretos
 import meta_ads
 import marketing
 import director
@@ -2530,6 +2532,112 @@ async def download_coa(lot: str, user=Depends(get_current_user)):
     return FileResponse(path, media_type='application/pdf', filename=f'COA-{entry["lot"]}.pdf')
 
 
+# ------------------------------------------------------ fichas técnicas (RUO)
+# Las fichas NO se publican: no hay índice ni carpeta navegable. Se entregan
+# por dos vías, y solo por esas dos.
+#
+#   1. A quien compró ese producto (igual que los COA).
+#   2. A quien la pida por el chat, con un enlace firmado que caduca.
+#
+# El contenido lo genera `fichas-tecnicas/build_fichas.py` y por regla no
+# lleva dosis, pautas de administración, farmacocinética humana ni sellos de
+# agencias. Ver ficha_store.py.
+
+
+@api_router.get('/me/fichas')
+async def mis_fichas(user=Depends(get_current_user)):
+    """Fichas técnicas de los productos que el usuario compró."""
+    slugs = await _user_product_slugs(user['id'])
+    return ficha_store.para_slugs(slugs)
+
+
+@api_router.get('/me/ficha/{slug}')
+async def descargar_mi_ficha(slug: str, user=Depends(get_current_user)):
+    """Descarga la ficha de un producto que el usuario compró."""
+    slugs = await _user_product_slugs(user['id'])
+    if slug not in slugs or not ficha_store.existe(slug):
+        # 404 y no 403: a quien no compró no se le confirma qué fichas hay.
+        raise HTTPException(status_code=404, detail='Ficha no encontrada')
+    path = ficha_store.ruta_de(slug)
+    if not path:
+        raise HTTPException(status_code=404, detail='Ficha no encontrada')
+    return FileResponse(path, media_type='application/pdf',
+                        filename=ficha_store.nombre_descarga(slug))
+
+
+@api_router.post('/ficha/solicitar')
+async def solicitar_ficha(payload: dict, request: Request):
+    """Emite un enlace con caducidad para una ficha. La usa el chat de IA.
+
+    No exige cuenta a propósito: el objetivo es que quien pregunta por datos
+    técnicos los reciba. Queda registrado quién lo pidió, y el enlace muere
+    solo, así que no equivale a publicar el PDF.
+    """
+    slug = (payload or {}).get('slug') or ''
+    if not ficha_store.existe(slug):
+        raise HTTPException(status_code=404, detail='Ficha no encontrada')
+
+    token = ficha_store.emitir_enlace(slug)
+    if not token:
+        raise HTTPException(status_code=404, detail='Ficha no encontrada')
+
+    await db.ficha_requests.insert_one({
+        'slug': slug,
+        'email': ((payload or {}).get('email') or '').strip().lower() or None,
+        'session_id': (payload or {}).get('session_id'),
+        'ip': (request.client.host if request.client else None),
+        'created_at': datetime.now(timezone.utc),
+    })
+    return {'url': f'/api/ficha/descargar?t={token}',
+            'expira_en_horas': ficha_store.ENLACE_HORAS}
+
+
+# --------------------------------------------- credenciales de pasarelas de pago
+# Christian trabaja desde el teléfono y no puede entrar por SSH cada vez que rota
+# una llave. Estas rutas le dejan pegarlas desde el Admin.
+#
+# El `.env` del servidor SIEMPRE manda: si la variable está en el entorno, la de
+# la base se ignora. El valor nunca se devuelve al navegador, solo si está
+# configurado y sus últimos 4 caracteres. Ver secretos.py.
+
+
+@api_router.get('/admin/credenciales')
+async def credenciales_estado(admin=Depends(get_current_admin)):
+    """Qué pasarelas están configuradas. Nunca devuelve los valores."""
+    return await secretos.estado(db)
+
+
+@api_router.put('/admin/credenciales')
+async def credenciales_guardar(payload: dict, admin=Depends(get_current_admin)):
+    """Guarda o borra una credencial. Mandar '' borra la que hubiera."""
+    nombre = (payload or {}).get('nombre') or ''
+    if nombre not in secretos.PERMITIDAS:
+        raise HTTPException(status_code=400, detail='Credencial no reconocida')
+    if os.environ.get(nombre):
+        raise HTTPException(
+            status_code=409,
+            detail='Esa llave viene del servidor y manda sobre el panel. Para '
+                   'editarla desde aquí, primero hay que quitarla del .env.')
+    await secretos.guardar(db, nombre, (payload or {}).get('valor') or '')
+    # Sin recargar, la pasarela seguiría usando la llave vieja hasta el próximo
+    # reinicio: el cache es lo que leen mercadopago.py y compañía.
+    await secretos.recargar(db)
+    return {'ok': True, 'estado': await secretos.estado(db)}
+
+
+@api_router.get('/ficha/descargar')
+async def descargar_ficha_con_enlace(t: str = ''):
+    """Descarga por enlace firmado. Sin token válido no hay archivo."""
+    slug = ficha_store.validar_enlace(t)
+    if not slug:
+        raise HTTPException(status_code=404, detail='Enlace no válido o vencido')
+    path = ficha_store.ruta_de(slug)
+    if not path:
+        raise HTTPException(status_code=404, detail='Ficha no encontrada')
+    return FileResponse(path, media_type='application/pdf',
+                        filename=ficha_store.nombre_descarga(slug))
+
+
 # ------------------------------------------------ perfil de salud del cliente
 # El seguimiento personalizado que pidió Christian: peso, % de grasa y lo que le
 # indicó su médico. Con eso el calendario deja de ser genérico.
@@ -2990,6 +3098,12 @@ async def arrancar_recuperacion():
 @app.on_event('startup')
 async def seed_db():
     try:
+        # Llaves de pasarelas que Christian pegó desde el Admin. El .env manda,
+        # así que esto solo llena lo que no venga del entorno. Ver secretos.py.
+        cargadas = await secretos.recargar(db)
+        if cargadas:
+            logger.info('Credenciales de pasarela cargadas del panel: %s', cargadas)
+
         admin_email = os.environ.get('ADMIN_EMAIL')
         admin_password = os.environ.get('ADMIN_PASSWORD')
         if admin_email and admin_password and not await db.users.find_one({'email': admin_email.lower()}):
