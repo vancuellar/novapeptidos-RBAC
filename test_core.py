@@ -428,6 +428,26 @@ def test_loyalty_earn():
     assert loyalty.earn(0, True) == 0
     assert loyalty.earn(1070, False) == 0
     assert loyalty.earn(None, True) == 0
+    # Sin descuento explicito se sigue ganando igual que antes.
+    assert loyalty.earn(1070, True, 0.0) == 32
+
+
+def test_loyalty_sin_puntos_con_descuento_maximo():
+    """Con el 40% —el descuento mas alto que existe— el pedido NO genera puntos.
+
+    Orden de Christian (2026-07-27) a raiz de una venta directa a Paz Cambray:
+    el 40% ya es el techo de lo que la casa regala; sumarle el 3% de puntos
+    encima es descontar dos veces sobre el mismo margen.
+    """
+    assert loyalty.earn(10000, True, 0.40) == 0
+    assert loyalty.earn(10000, True, 0.50) == 0      # por si algun dia se da mas
+    assert loyalty.earn(10000, True, 0.35) == 300    # abajo del techo si gana
+    assert loyalty.earn(10000, True, 0.15) == 300
+    # El float no debe traicionar al 0.40 exacto.
+    assert loyalty.earn(10000, True, 0.1 + 0.3) == 0
+    assert loyalty.earns_points(0.399) is True
+    assert loyalty.earns_points(0.40) is False
+    assert loyalty.earns_points(None) is True        # sin dato, se gana
 
 
 def test_order_email_ticket_elements():
