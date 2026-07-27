@@ -29,6 +29,7 @@ from auth import (
 )
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
 import coa_store
+import ficha_store
 import meta_ads
 import marketing
 import director
@@ -2528,6 +2529,79 @@ async def download_coa(lot: str, user=Depends(get_current_user)):
     if not path:
         raise HTTPException(status_code=404, detail='El archivo del COA no está disponible')
     return FileResponse(path, media_type='application/pdf', filename=f'COA-{entry["lot"]}.pdf')
+
+
+# ------------------------------------------------------ fichas técnicas (RUO)
+# Las fichas NO se publican: no hay índice ni carpeta navegable. Se entregan
+# por dos vías, y solo por esas dos.
+#
+#   1. A quien compró ese producto (igual que los COA).
+#   2. A quien la pida por el chat, con un enlace firmado que caduca.
+#
+# El contenido lo genera `fichas-tecnicas/build_fichas.py` y por regla no
+# lleva dosis, pautas de administración, farmacocinética humana ni sellos de
+# agencias. Ver ficha_store.py.
+
+
+@api_router.get('/me/fichas')
+async def mis_fichas(user=Depends(get_current_user)):
+    """Fichas técnicas de los productos que el usuario compró."""
+    slugs = await _user_product_slugs(user['id'])
+    return ficha_store.para_slugs(slugs)
+
+
+@api_router.get('/me/ficha/{slug}')
+async def descargar_mi_ficha(slug: str, user=Depends(get_current_user)):
+    """Descarga la ficha de un producto que el usuario compró."""
+    slugs = await _user_product_slugs(user['id'])
+    if slug not in slugs or not ficha_store.existe(slug):
+        # 404 y no 403: a quien no compró no se le confirma qué fichas hay.
+        raise HTTPException(status_code=404, detail='Ficha no encontrada')
+    path = ficha_store.ruta_de(slug)
+    if not path:
+        raise HTTPException(status_code=404, detail='Ficha no encontrada')
+    return FileResponse(path, media_type='application/pdf',
+                        filename=ficha_store.nombre_descarga(slug))
+
+
+@api_router.post('/ficha/solicitar')
+async def solicitar_ficha(payload: dict, request: Request):
+    """Emite un enlace con caducidad para una ficha. La usa el chat de IA.
+
+    No exige cuenta a propósito: el objetivo es que quien pregunta por datos
+    técnicos los reciba. Queda registrado quién lo pidió, y el enlace muere
+    solo, así que no equivale a publicar el PDF.
+    """
+    slug = (payload or {}).get('slug') or ''
+    if not ficha_store.existe(slug):
+        raise HTTPException(status_code=404, detail='Ficha no encontrada')
+
+    token = ficha_store.emitir_enlace(slug)
+    if not token:
+        raise HTTPException(status_code=404, detail='Ficha no encontrada')
+
+    await db.ficha_requests.insert_one({
+        'slug': slug,
+        'email': ((payload or {}).get('email') or '').strip().lower() or None,
+        'session_id': (payload or {}).get('session_id'),
+        'ip': (request.client.host if request.client else None),
+        'created_at': datetime.now(timezone.utc),
+    })
+    return {'url': f'/api/ficha/descargar?t={token}',
+            'expira_en_horas': ficha_store.ENLACE_HORAS}
+
+
+@api_router.get('/ficha/descargar')
+async def descargar_ficha_con_enlace(t: str = ''):
+    """Descarga por enlace firmado. Sin token válido no hay archivo."""
+    slug = ficha_store.validar_enlace(t)
+    if not slug:
+        raise HTTPException(status_code=404, detail='Enlace no válido o vencido')
+    path = ficha_store.ruta_de(slug)
+    if not path:
+        raise HTTPException(status_code=404, detail='Ficha no encontrada')
+    return FileResponse(path, media_type='application/pdf',
+                        filename=ficha_store.nombre_descarga(slug))
 
 
 # ------------------------------------------------ perfil de salud del cliente

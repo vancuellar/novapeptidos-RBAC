@@ -236,12 +236,41 @@ def catalog_block(products) -> str:
     return 'CATALOGO EXYGEN (lo que SI vendemos, con precio real):\n' + '\n'.join(lineas)
 
 
+def fichas_block() -> str:
+    """Le dice al asistente de qué compuestos hay ficha técnica y cómo ofrecerla.
+
+    Las fichas no están publicadas en el sitio: no hay página ni índice. La única
+    forma de que alguien reciba una es que el chat la ofrezca (enlace firmado con
+    caducidad) o que la compre. Por eso el asistente necesita saber cuáles existen.
+    """
+    try:
+        import ficha_store
+        slugs = ficha_store.slugs_disponibles()
+    except Exception:
+        return ''
+    if not slugs:
+        return ''
+    return (
+        'FICHAS TECNICAS DISPONIBLES (slug interno): ' + ', '.join(slugs) + '.\n'
+        'Si alguien pide informacion tecnica, la ficha de un compuesto, su numero CAS, '
+        'formula, peso molecular o secuencia, OFRECESELA: son documentos que no estan '
+        'publicados en el sitio y se mandan a quien los pide. Di que se la puedes enviar '
+        'y pide el correo. NUNCA inventes el contenido de una ficha ni cites un CAS, una '
+        'formula o una pureza de memoria: si no lo tienes delante, ofrece la ficha en vez '
+        'de improvisar el dato. Las fichas no traen dosis ni pautas de administracion, y '
+        'eso no cambia: si preguntan dosis, sigue aplicando la regla de no darlas.'
+    )
+
+
 def build_chat(session_id: str, product_context: str = None, language: str = None,
                products=None) -> dict:
     system = SYSTEM_PROMPT
     catalogo = catalog_block(products)
     if catalogo:
         system += '\n\n' + catalogo
+    fichas = fichas_block()
+    if fichas:
+        system += '\n\n' + fichas
     if product_context:
         system += f"\n\nCONTEXTO: el usuario esta viendo el producto: {product_context}."
     system += f"\n\nIDIOMA DE RESPUESTA (OBLIGATORIO): {language_instruction(language)}"
