@@ -1037,7 +1037,9 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # 'tarjeta' SOLO si Mercado Pago esta configurado. Hasta el 2026-07-26 se
     # aceptaba siempre y no cobraba nada: el cliente veia "Pedido recibido" sin
     # que nadie le cobrara. Si no hay pasarela, no se ofrece la vía.
-    allowed_methods = ['spei'] + (['tarjeta'] if mercadopago.enabled() else []) \
+    # OXXO viaja por Mercado Pago igual que tarjeta (mismo webhook, misma
+    # verificación), así que se enciende y se apaga con la misma llave.
+    allowed_methods = ['spei'] + (['tarjeta', 'oxxo'] if mercadopago.enabled() else []) \
         + (['cripto'] if crypto_enabled() else [])
     if payload.payment_method not in allowed_methods:
         raise HTTPException(status_code=400, detail='Metodo de pago no disponible')
@@ -1257,7 +1259,7 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # Tarjeta: se manda al cliente a la pagina de Mercado Pago. Los datos de la
     # tarjeta NUNCA pasan por nuestro servidor. El pedido queda 'pendiente' hasta
     # que su webhook confirme que el dinero entro.
-    if payload.payment_method == 'tarjeta':
+    if payload.payment_method in ('tarjeta', 'oxxo'):
         order_url = f"{SITE_URL}/pedido/{order.order_number}"
         try:
             pref = mercadopago.create_preference(
@@ -1268,6 +1270,7 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
                 success_url=order_url,
                 failure_url=f"{SITE_URL}/carrito",
                 webhook_url=f"{API_BASE_URL}/api/payments/mercadopago/webhook",
+                metodo=payload.payment_method,
             )
             await db.orders.update_one(
                 {'id': order.id},
@@ -1319,6 +1322,7 @@ async def payments_config():
     gratis el envío (para que el carrito enseñe el mismo número que se cobra)."""
     return {'crypto_enabled': crypto_enabled(),
             'card_enabled': mercadopago.enabled(),
+            'oxxo_enabled': mercadopago.enabled(),   # viaja por la misma pasarela
             'shipping_flat': SHIPPING_FLAT,
             'free_shipping_from': FREE_SHIPPING_FROM}
 

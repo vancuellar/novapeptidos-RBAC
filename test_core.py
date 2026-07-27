@@ -1310,6 +1310,40 @@ def test_saca_el_id_del_pago_venga_como_venga():
     assert _mp.extract_payment_id({}, {}) == ''
 
 
+def test_oxxo_apaga_binary_mode_y_los_demas_medios(monkeypatch):
+    """OXXO nace 'pendiente' (el cliente paga en la tienda horas después), así
+    que binary_mode DEBE ir apagado — con él encendido Mercado Pago no genera
+    el voucher. Y los demás medios se excluyen: el botón dice OXXO, la página
+    de pago no debe volver a ofrecer tarjeta."""
+    capturado = {}
+
+    class _Resp:
+        status_code = 200
+        def json(self):
+            return {'id': 'pref-1', 'init_point': 'https://mp/x'}
+
+    def _post(url, headers=None, json=None, timeout=None):
+        capturado.update(json)
+        return _Resp()
+
+    monkeypatch.setenv('MERCADOPAGO_ACCESS_TOKEN', 'APP_USR-x')
+    monkeypatch.setattr(_mp.requests, 'post', _post)
+
+    _mp.create_preference('EX-1', [], 100.0, '', 'https://s', 'https://f',
+                          'https://api.exygenlabs.com/api/w', metodo='oxxo')
+    assert capturado['binary_mode'] is False
+    excluidos = {t['id'] for t in capturado['payment_methods']['excluded_payment_types']}
+    assert 'credit_card' in excluidos and 'ticket' not in excluidos
+    assert 'auto_return' not in capturado    # solo aplica a pagos síncronos
+
+    capturado.clear()   # cada llamada se examina limpia
+    _mp.create_preference('EX-2', [], 100.0, '', 'https://s', 'https://f',
+                          'https://api.exygenlabs.com/api/w')   # tarjeta, como siempre
+    assert capturado['binary_mode'] is True
+    assert capturado.get('auto_return') == 'approved'
+    assert 'payment_methods' not in capturado or not capturado.get('payment_methods')
+
+
 def test_no_le_manda_webhook_a_localhost():
     """Mercado Pago rechaza la preferencia si la URL de aviso es local."""
     assert _mp._es_publico('https://api.exygenlabs.com/api/x') is True
