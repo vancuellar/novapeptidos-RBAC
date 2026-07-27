@@ -1166,7 +1166,10 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # El envio lo decide el SERVIDOR, no lo que mande el navegador.
     shipping = shipping_for(paid_merchandise)
     total = paid_merchandise + shipping
-    points_earned = loyalty.earn(paid_merchandise, user is not None and loyalty.eligible(user))
+    # `discount_rate` es el descuento CONCEDIDO: con el máximo (40%) el pedido no
+    # genera puntos. Ver la regla en loyalty.py.
+    points_earned = loyalty.earn(paid_merchandise, user is not None and loyalty.eligible(user),
+                                 discount_rate)
     # Pirámide: el vendedor gana (su tasa − el descuento que dio) y cada upline su
     # DIFERENCIAL, sobre la mercancía con descuento (`discountable`). Se bloquea en
     # pesos al crear la orden; los reportes suman lo guardado.
@@ -4008,7 +4011,8 @@ async def admin_create_order(payload: ManualOrderCreate, admin=Depends(get_curre
     subtotal = sum(i.price * i.quantity for i in payload.items)
     discount = round(subtotal * rate)
     total = subtotal - discount
-    points_earned = loyalty.earn(total, loyalty.eligible(u))
+    # La venta directa es justo donde se da el 40%: con ese descuento no hay puntos.
+    points_earned = loyalty.earn(total, loyalty.eligible(u), rate)
     order = Order(
         order_number=gen_order_number(),
         user_id=u['id'],
