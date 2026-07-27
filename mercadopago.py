@@ -57,13 +57,29 @@ def _es_publico(url: str) -> bool:
     return bool(host) and host not in ('localhost', '127.0.0.1') and not host.endswith('.local')
 
 
+# Lo que se APAGA cuando el cliente eligió pagar en OXXO: todo lo que no sea
+# 'ticket' (el voucher que se imprime y se paga en la tienda). Si no se apaga,
+# la página de Mercado Pago le vuelve a ofrecer tarjeta y el botón "OXXO" del
+# checkout sería mentira.
+TIPOS_NO_OXXO = ('credit_card', 'debit_card', 'prepaid_card', 'bank_transfer',
+                 'atm', 'digital_currency', 'digital_wallet')
+
+
 def create_preference(order_number: str, items, total: float, payer_email: str,
-                      success_url: str, failure_url: str, webhook_url: str) -> dict:
+                      success_url: str, failure_url: str, webhook_url: str,
+                      metodo: str = 'tarjeta') -> dict:
     """Crea la preferencia de pago y devuelve la URL a la que mandamos al cliente.
 
     `items` va con el detalle real del carrito para que el cliente vea en Mercado
     Pago lo mismo que tenía en el nuestro. El monto que manda es el TOTAL que
     calculó el servidor — nunca lo que diga el navegador.
+
+    `metodo` = 'tarjeta' u 'oxxo'. Con 'oxxo' se apagan los demás medios y —la
+    parte que NO es opcional— se apaga `binary_mode`: un pago en OXXO nace
+    'pendiente' por naturaleza (el cliente se lleva el voucher y paga en la
+    tienda horas después). Con binary_mode encendido Mercado Pago rechaza esa
+    espera y el voucher no se puede ni generar. El pedido queda 'pendiente'
+    hasta que el webhook avise 'approved', igual que SPEI.
     """
     detalle = [{
         'title': (it.get('name') or 'Producto')[:250],
@@ -84,15 +100,23 @@ def create_preference(order_number: str, items, total: float, payer_email: str,
             'currency_id': 'MXN',
         })
 
+    es_oxxo = metodo == 'oxxo'
     cuerpo = {
         'items': detalle,
         'external_reference': order_number,
         'statement_descriptor': 'EXYGEN LABS',
-        'binary_mode': True,       # o aprobado o rechazado: nada de 'pendiente' eterno
+        # Tarjeta: o aprobado o rechazado, nada de 'pendiente' eterno.
+        # OXXO: 'pendiente' ES el estado normal mientras el cliente va a pagar.
+        'binary_mode': not es_oxxo,
         'back_urls': {'success': success_url, 'pending': success_url, 'failure': failure_url},
-        'auto_return': 'approved',
         'metadata': {'order_number': order_number},
     }
+    if es_oxxo:
+        cuerpo['payment_methods'] = {
+            'excluded_payment_types': [{'id': t} for t in TIPOS_NO_OXXO],
+        }
+    else:
+        cuerpo['auto_return'] = 'approved'   # solo aplica a pagos síncronos
     if payer_email:
         cuerpo['payer'] = {'email': payer_email}
     if _es_publico(webhook_url):
