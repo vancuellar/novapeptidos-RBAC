@@ -30,6 +30,7 @@ from auth import (
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
 import coa_store
 import ficha_store
+import secretos
 import meta_ads
 import marketing
 import director
@@ -2591,6 +2592,39 @@ async def solicitar_ficha(payload: dict, request: Request):
             'expira_en_horas': ficha_store.ENLACE_HORAS}
 
 
+# --------------------------------------------- credenciales de pasarelas de pago
+# Christian trabaja desde el teléfono y no puede entrar por SSH cada vez que rota
+# una llave. Estas rutas le dejan pegarlas desde el Admin.
+#
+# El `.env` del servidor SIEMPRE manda: si la variable está en el entorno, la de
+# la base se ignora. El valor nunca se devuelve al navegador, solo si está
+# configurado y sus últimos 4 caracteres. Ver secretos.py.
+
+
+@api_router.get('/admin/credenciales')
+async def credenciales_estado(admin=Depends(get_current_admin)):
+    """Qué pasarelas están configuradas. Nunca devuelve los valores."""
+    return await secretos.estado(db)
+
+
+@api_router.put('/admin/credenciales')
+async def credenciales_guardar(payload: dict, admin=Depends(get_current_admin)):
+    """Guarda o borra una credencial. Mandar '' borra la que hubiera."""
+    nombre = (payload or {}).get('nombre') or ''
+    if nombre not in secretos.PERMITIDAS:
+        raise HTTPException(status_code=400, detail='Credencial no reconocida')
+    if os.environ.get(nombre):
+        raise HTTPException(
+            status_code=409,
+            detail='Esa llave viene del servidor y manda sobre el panel. Para '
+                   'editarla desde aquí, primero hay que quitarla del .env.')
+    await secretos.guardar(db, nombre, (payload or {}).get('valor') or '')
+    # Sin recargar, la pasarela seguiría usando la llave vieja hasta el próximo
+    # reinicio: el cache es lo que leen mercadopago.py y compañía.
+    await secretos.recargar(db)
+    return {'ok': True, 'estado': await secretos.estado(db)}
+
+
 @api_router.get('/ficha/descargar')
 async def descargar_ficha_con_enlace(t: str = ''):
     """Descarga por enlace firmado. Sin token válido no hay archivo."""
@@ -3064,6 +3098,12 @@ async def arrancar_recuperacion():
 @app.on_event('startup')
 async def seed_db():
     try:
+        # Llaves de pasarelas que Christian pegó desde el Admin. El .env manda,
+        # así que esto solo llena lo que no venga del entorno. Ver secretos.py.
+        cargadas = await secretos.recargar(db)
+        if cargadas:
+            logger.info('Credenciales de pasarela cargadas del panel: %s', cargadas)
+
         admin_email = os.environ.get('ADMIN_EMAIL')
         admin_password = os.environ.get('ADMIN_PASSWORD')
         if admin_email and admin_password and not await db.users.find_one({'email': admin_email.lower()}):

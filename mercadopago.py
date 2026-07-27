@@ -35,12 +35,19 @@ TIMEOUT = 20
 SETTLED_STATUSES = {'approved'}
 
 
+def _token() -> str:
+    """El access token. Sale del .env, y si no está, de lo que Christian pegó en
+    el Admin (ver secretos.py). El .env siempre manda."""
+    import secretos
+    return secretos.valor('MERCADOPAGO_ACCESS_TOKEN')
+
+
 def enabled() -> bool:
-    return bool(os.environ.get('MERCADOPAGO_ACCESS_TOKEN'))
+    return bool(_token())
 
 
 def _headers():
-    return {'Authorization': f"Bearer {os.environ['MERCADOPAGO_ACCESS_TOKEN']}",
+    return {'Authorization': f'Bearer {_token()}',
             'Content-Type': 'application/json'}
 
 
@@ -120,7 +127,8 @@ def verify_webhook(signature_header: str, request_id: str, data_id: str) -> bool
     OJO: el `data.id` va en MINÚSCULAS en la plantilla. Con mayúsculas la firma
     no cuadra y todos los pagos se rechazarían en silencio.
     """
-    secreto = os.environ.get('MERCADOPAGO_WEBHOOK_SECRET', '')
+    import secretos
+    secreto = secretos.valor('MERCADOPAGO_WEBHOOK_SECRET')
     if not secreto or not signature_header or not data_id:
         return False
     partes = dict(
