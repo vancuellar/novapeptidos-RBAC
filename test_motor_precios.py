@@ -327,3 +327,181 @@ def test_la_venta_directa_tambien_descuenta_lo_que_se_llevo():
     assert '_descontar_inventario_vivo(' in cuerpo, 'no baja el inventario VIVO'
     assert "{'sku': item.product_id}" in cuerpo, \
         'busca distinto que la devolución: el inventario se desbalancea'
+
+
+# ---------- El inventario vivo: la llave que nunca casaba ----------
+
+class _Stock:
+    """Lo mínimo de `db.stock`: buscar por `key`, exigir `qty >= n`, `$inc` y `$set`."""
+
+    def __init__(self, filas):
+        self.filas = filas
+
+    @staticmethod
+    def _casa(doc, query):
+        for clave, valor in query.items():
+            if isinstance(valor, dict) and '$gte' in valor:
+                if int(doc.get(clave) or 0) < valor['$gte']:
+                    return False
+            elif isinstance(valor, dict) and '$in' in valor:
+                if doc.get(clave) not in valor['$in']:
+                    return False
+            elif doc.get(clave) != valor:
+                return False
+        return True
+
+    async def update_one(self, query, cambio):
+        for doc in self.filas:
+            if self._casa(doc, query):
+                for campo, delta in cambio.get('$inc', {}).items():
+                    doc[campo] = int(doc.get(campo) or 0) + delta
+                for campo, valor in cambio.get('$set', {}).items():
+                    doc[campo] = valor
+                return type('R', (), {'matched_count': 1, 'modified_count': 1})()
+        return type('R', (), {'matched_count': 0, 'modified_count': 0})()
+
+    async def delete_many(self, query):
+        antes = len(self.filas)
+        self.filas = [d for d in self.filas if not self._casa(d, query)]
+        return type('R', (), {'deleted_count': antes - len(self.filas)})()
+
+
+def _con_stock(filas, corutina):
+    import asyncio
+    import server as _srv
+    stock = _Stock(filas)
+    original = _srv.db
+    _srv.db = type('DB', (), {'stock': stock})()
+    try:
+        asyncio.new_event_loop().run_until_complete(corutina(_srv))
+    finally:
+        _srv.db = original
+    return stock
+
+
+_DOC_BRONCHOGEN = {'id': 'd6a0a69f-uuid', 'sku': 'BRONCHOGEN-10MG',
+                   'slug': 'bronchogen-10-mg', 'presentation': '10 mg'}
+
+
+@pytest.mark.parametrize('slug,pres,familia', [
+    ('bronchogen-10-mg', '10 mg', 'bronchogen'),
+    ('hgh-24-iu', '24 IU', 'hgh'),
+    ('lemon-bottle-10-ml', '10 mL', 'lemon-bottle'),
+    ('hgh-fragment-176-191-15-mg', '15 mg', 'hgh-fragment-176-191'),
+    ('snap-8-100-mg', '100 mg', 'snap-8'),
+    ('sin-presentacion', '', 'sin-presentacion'),
+])
+def test_la_familia_del_slug(slug, pres, familia):
+    import server as _srv
+    assert _srv._familia_del_slug(slug, pres) == familia
+
+
+def test_la_llave_del_inventario_vivo_incluye_la_del_panel():
+    """El Panel guarda `fallback-bronchogen::10 mg`; en `db.products` ese producto es
+    `bronchogen-10-mg` con su UUID y su SKU. Ninguna de las tres llaves que se probaban
+    puede ser jamás esa cadena."""
+    import server as _srv
+    llaves = _srv.llaves_de_inventario_vivo('d6a0a69f-uuid', _DOC_BRONCHOGEN)
+    assert 'fallback-bronchogen::10 mg' in llaves, llaves
+
+
+def test_el_inventario_vivo_SI_baja_en_un_producto_con_presentaciones():
+    """⛔ EL RIESGO DE VENDER LO QUE YA NO HAY. En todo producto con presentaciones —o
+    sea, casi todo el catálogo— `_descontar_inventario_vivo` no encontraba renglón y
+    `db.stock.qty` no bajaba NUNCA. Y `db.stock` es lo que la ficha del sitio usa para
+    pintar "EN MANO / entrega inmediata": se anunciaba existencia física de piezas ya
+    vendidas, indefinidamente y sin que nada lo dijera."""
+    filas = [{'key': 'fallback-bronchogen::10 mg', 'qty': 20, 'in_hand': True}]
+    stock = _con_stock(filas, lambda s: s._descontar_inventario_vivo(
+        'd6a0a69f-uuid', _DOC_BRONCHOGEN, -3))
+    assert stock.filas[0]['qty'] == 17, stock.filas
+
+
+def test_el_inventario_vivo_nunca_queda_en_negativo():
+    """Un inventario vivo negativo no es un dato: es una mentira con signo, y se pinta en
+    la ficha del producto como si fuera real."""
+    filas = [{'key': 'fallback-bronchogen::10 mg', 'qty': 2}]
+    stock = _con_stock(filas, lambda s: s._descontar_inventario_vivo(
+        'd6a0a69f-uuid', _DOC_BRONCHOGEN, -5))
+    assert stock.filas[0]['qty'] == 0, stock.filas
+
+
+def test_devolver_al_cancelar_usa_la_MISMA_llave_que_al_vender():
+    """Si vender y cancelar buscan de formas distintas, el inventario se desbalancea con
+    cada ciclo — ya pasó y dejó Orexin A en 43 cuando tenía 40."""
+    filas = [{'key': 'fallback-bronchogen::10 mg', 'qty': 20}]
+    stock = _con_stock(filas, lambda s: s._descontar_inventario_vivo(
+        'BRONCHOGEN-10MG', _DOC_BRONCHOGEN, -4))
+    assert stock.filas[0]['qty'] == 16
+    _con_stock(stock.filas, lambda s: s._descontar_inventario_vivo(
+        'd6a0a69f-uuid', _DOC_BRONCHOGEN, 4))
+    assert stock.filas[0]['qty'] == 20, stock.filas
+
+
+def test_el_checkout_le_pasa_al_inventario_vivo_el_slug_y_la_presentacion():
+    """Sin `slug` ni `presentation` en la proyección no se puede armar la llave del
+    Panel, y el arreglo de arriba queda muerto en el camino real."""
+    src = _fuente()
+    ini = src.index('_pdocs = await db.products.find(')
+    trozo = src[ini:ini + 700]
+    assert "'slug': 1" in trozo and "'presentation': 1" in trozo, trozo
+
+
+def test_borrar_un_producto_se_lleva_su_renglon_de_inventario_vivo():
+    """Una llave huérfana en `db.stock` es existencia de algo que ya no existe: el Panel
+    la sigue mostrando y no hay contra qué reconciliarla."""
+    filas = [{'key': 'fallback-bronchogen::10 mg', 'qty': 20},
+             {'key': 'fallback-otro::5 mg', 'qty': 7}]
+    import server as _srv
+    stock = _Stock(filas)
+    assert _srv.llaves_de_inventario_vivo('d6a0a69f-uuid', _DOC_BRONCHOGEN)
+    import asyncio
+    asyncio.new_event_loop().run_until_complete(stock.delete_many(
+        {'key': {'$in': _srv.llaves_de_inventario_vivo('d6a0a69f-uuid', _DOC_BRONCHOGEN)}}))
+    assert [f['key'] for f in stock.filas] == ['fallback-otro::5 mg'], stock.filas
+
+
+# ---------- La venta directa: el precio lo pone el servidor ----------
+
+def test_la_venta_directa_retasa_contra_el_catalogo():
+    """⛔ El checkout público se blindó el 2026-07-27 y la VENTA DIRECTA se quedó fuera:
+    sumaba `i.price` tal como venía en la petición, así que se podía registrar un pedido
+    de $0 —y de paso disparar los puntos de lealtad y el descuento de inventario— con
+    sólo mandar el precio que uno quisiera."""
+    src = _fuente()
+    ini = src.index('async def admin_create_order(')
+    fin = src.index('async def ', ini + 10)
+    cuerpo = src[ini:fin]
+    assert 'db.products.find(' in cuerpo, 'la venta directa no consulta el catálogo'
+    assert 'i.price = float(real)' in cuerpo, 'la venta directa no retasa el renglón'
+    # y retasa ANTES de sumar: el orden es toda la protección
+    assert cuerpo.index('i.price = float(real)') < cuerpo.index('subtotal = sum('), cuerpo
+
+
+def test_la_venta_directa_no_acepta_un_producto_que_no_existe():
+    src = _fuente()
+    ini = src.index('async def admin_create_order(')
+    cuerpo = src[ini:src.index('async def ', ini + 10)]
+    assert '_huerfanos' in cuerpo, 'un producto sin ficha no se puede tasar y sí se vendía'
+    assert 'Cantidad inválida' in cuerpo, 'una cantidad negativa seguía sumando al total'
+
+
+def test_el_inventario_vivo_del_panel_no_admite_cantidades_negativas():
+    src = _fuente()
+    ini = src.index('async def set_stock(')
+    cuerpo = src[ini:src.index('@api_router', ini)]
+    assert "max(0, int(payload['qty']))" in cuerpo, cuerpo
+
+
+# ---------- Envío: la política es deliberada ----------
+
+def test_el_envio_no_se_cobra_a_proposito_y_nunca_se_resta():
+    """Christian decidió no cobrar envío. Lo que se comprueba aquí no es el número, es
+    que el envío sólo pueda SUMAR: no existe ningún descuento de $250 en ninguna parte,
+    así que no hay forma de que se aplique donde no corresponde ni dos veces."""
+    src = _fuente()
+    assert 'COBRAR_ENVIO = False' in src, 'cambió la política de envío sin decirlo'
+    assert 'shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0' in src
+    assert 'total = paid_merchandise + shipping' in src, 'el envío tiene que SUMAR'
+    assert '- 250' not in src and '-250' not in src.replace('-2500', ''), \
+        'apareció una resta de 250: el envío no es un descuento'

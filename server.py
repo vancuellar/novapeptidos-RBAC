@@ -898,9 +898,17 @@ async def update_product(product_id: str, payload: ProductUpdate, admin=Depends(
 
 @api_router.delete('/admin/products/{product_id}')
 async def delete_product(product_id: str, admin=Depends(get_current_admin)):
+    doc = await db.products.find_one({'id': product_id},
+                                     {'_id': 0, 'id': 1, 'sku': 1, 'slug': 1,
+                                      'presentation': 1})
     result = await db.products.delete_one({'id': product_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail='Producto no encontrado')
+    # Y su renglón de inventario vivo se va con él. Si se queda, `db.stock` acumula
+    # llaves huérfanas —existencias de productos que ya no existen— que el Panel sigue
+    # mostrando y nadie puede reconciliar contra nada.
+    await db.stock.delete_many(
+        {'key': {'$in': llaves_de_inventario_vivo(product_id, doc)}})
     return {'ok': True}
 
 
@@ -1096,21 +1104,77 @@ async def my_checkout_data(user=Depends(get_current_user)):
     }
 
 
+def _familia_del_slug(slug, presentacion):
+    """El slug del producto PADRE: el del renglón sin su presentación pegada.
+
+        'bronchogen-10-mg'  + '10 mg' -> 'bronchogen'
+        'hgh-24-iu'         + '24 IU' -> 'hgh'
+        'lemon-bottle-10-ml'+ '10 mL' -> 'lemon-bottle'
+    """
+    slug = (slug or '').strip().lower()
+    cola = re.sub(r'[^a-z0-9]+', '-', (presentacion or '').strip().lower()).strip('-')
+    if cola and slug.endswith('-' + cola):
+        return slug[:-(len(cola) + 1)]
+    return slug
+
+
+def llaves_de_inventario_vivo(product_id, doc):
+    """Todas las formas en que `db.stock` puede tener guardada ESTA presentación.
+
+    ⛔ EL AGUJERO QUE QUEDABA. En `db.products` cada presentación es su propio documento
+    (`bronchogen-10-mg`, con su UUID y su SKU), pero el Panel guarda el inventario vivo
+    con la llave del producto AGRUPADO del sitio: `fallback-bronchogen::10 mg`. Ninguna
+    de las tres llaves que se probaban —product_id, sku, id— puede ser jamás esa cadena,
+    así que en TODO producto con presentaciones (o sea, casi todo el catálogo) el
+    descuento no encontraba nada y `db.stock` no bajaba NUNCA. Y `db.stock` es justo lo
+    que la ficha del sitio usa para pintar "EN MANO / entrega inmediata": se seguía
+    anunciando existencia física de piezas que ya se vendieron, indefinidamente.
+    """
+    llaves = [product_id]
+    doc = doc or {}
+    for k in ('sku', 'id'):
+        if doc.get(k) and doc[k] not in llaves:
+            llaves.append(doc[k])
+    pres = (doc.get('presentation') or '').strip()
+    if pres:
+        familia = _familia_del_slug(doc.get('slug'), pres)
+        for base in (f'fallback-{familia}' if familia else '', familia,
+                     (doc.get('slug') or '').strip()):
+            llave = f'{base}::{pres}'
+            if base and llave not in llaves:
+                llaves.append(llave)
+    return [k for k in llaves if k]
+
+
 async def _descontar_inventario_vivo(product_id, doc, delta):
     """Mueve el inventario VIVO (`db.stock`) de UNA presentación. Devuelve si acertó.
 
-    La llave de `db.stock` es `<slug>::<presentación>` (así la escribe el Panel), pero el
-    carrito manda a veces el id, a veces un UUID y a veces el SKU. Cuando no coincidía,
-    `update_one` no encontraba el documento y devolvía "0 modificados" sin quejarse: el
-    pedido salía, el inventario vivo se quedaba igual, y el siguiente cliente compraba
-    algo que ya no existe. Se prueban las llaves conocidas y, si ninguna existe, se avisa
-    — porque el silencio aquí se ve exactamente igual que el éxito."""
-    candidatas = [product_id]
-    if doc:
-        for k in ('sku', 'id'):
-            if doc.get(k) and doc[k] not in candidatas:
-                candidatas.append(doc[k])
+    La llave de `db.stock` la escribe el Panel como `<producto agrupado>::<presentación>`,
+    pero el carrito manda a veces el id, a veces un UUID y a veces el SKU. Cuando no
+    coincidía, `update_one` no encontraba el documento y devolvía "0 modificados" sin
+    quejarse: el pedido salía, el inventario vivo se quedaba igual, y el sitio seguía
+    ofreciendo como "en mano" algo que ya no existe. Se prueban TODAS las llaves posibles
+    (ver `llaves_de_inventario_vivo`) y, si ninguna existe, se avisa — porque el silencio
+    aquí se ve exactamente igual que el éxito.
+
+    Y nunca por debajo de cero: un inventario vivo en negativo no es un dato, es una
+    mentira con signo. Si el pedido se lleva más de lo que había en mano, queda en 0 y
+    se GRITA, que es lo que de verdad hay que revisar."""
+    candidatas = llaves_de_inventario_vivo(product_id, doc)
     for llave in candidatas:
+        if delta < 0:
+            r = await db.stock.update_one({'key': llave, 'qty': {'$gte': -delta}},
+                                          {'$inc': {'qty': delta}})
+            if r.matched_count:
+                return True
+            # el renglón existe pero no alcanza: se vendió más de lo que había en mano
+            r = await db.stock.update_one({'key': llave}, {'$set': {'qty': 0}})
+            if r.matched_count:
+                logger.warning('INVENTARIO VIVO EN CORTO: %s no tenía las %s piezas de '
+                               'este pedido. Queda en 0 — revisa qué se está vendiendo '
+                               'sin existencia física.', llave, -delta)
+                return True
+            continue
         r = await db.stock.update_one({'key': llave}, {'$inc': {'qty': delta}})
         if r.matched_count:
             return True
@@ -1195,8 +1259,9 @@ async def restore_order_stock(order):
         # La devolución usa el MISMO resolvedor de llaves que el descuento. Si cada lado
         # busca de una forma distinta, el inventario se desbalancea con cada cancelación
         # — ya pasó una vez y dejó Orexin A en 43 cuando tenía 40.
-        doc = await db.products.find_one({'$or': [{'id': pid}, {'sku': pid}]},
-                                         {'_id': 0, 'id': 1, 'sku': 1})
+        doc = await db.products.find_one(
+            {'$or': [{'id': pid}, {'sku': pid}]},
+            {'_id': 0, 'id': 1, 'sku': 1, 'slug': 1, 'presentation': 1})
         await _descontar_inventario_vivo(pid, doc, qty)
     await db.orders.update_one({'id': order['id']}, {'$set': {'stock_restored': True}})
 
@@ -1288,9 +1353,12 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     _keys = [it.product_id for it in payload.items]
     _pdocs = await db.products.find(
         {'$or': [{'id': {'$in': _keys}}, {'sku': {'$in': _keys}}]},
+        # `slug` y `presentation` NO son adorno: con ellos se arma la llave del
+        # inventario vivo (`fallback-<familia>::<presentación>`). Sin ellos el descuento
+        # de `db.stock` no encuentra nada y no baja nunca.
         {'_id': 0, 'id': 1, 'sku': 1, 'name': 1, 'commission_cap': 1,
          'distributor_eligible': 1, 'category': 1, 'stock': 1, 'price': 1,
-         'hidden': 1}).to_list(500)
+         'hidden': 1, 'slug': 1, 'presentation': 1}).to_list(500)
     _pflags = {}
     for d in _pdocs:
         _pflags[d['id']] = d
@@ -1753,7 +1821,10 @@ async def set_stock(payload: dict, admin=Depends(get_current_admin)):
         raise HTTPException(status_code=400, detail='Falta key')
     update = {}
     if 'qty' in payload:
-        update['qty'] = int(payload['qty'])
+        # Nunca en negativo. La UI ya lo acota, pero un botón no es una compuerta: la
+        # ruta se puede llamar a mano, y un inventario vivo negativo se muestra en la
+        # ficha del producto como si fuera un dato.
+        update['qty'] = max(0, int(payload['qty']))
     if 'in_hand' in payload:
         update['in_hand'] = bool(payload['in_hand'])
     await db.stock.update_one({'key': key}, {'$set': update}, upsert=True)
@@ -4425,6 +4496,40 @@ async def admin_create_order(payload: ManualOrderCreate, admin=Depends(get_curre
     if payload.status not in ('pendiente', 'confirmado', 'enviado', 'entregado'):
         raise HTTPException(status_code=400, detail='Estado no válido')
     rate = max(0.0, min(0.60, payload.discount_rate))
+    # ⛔ EL PRECIO LO PONE EL SERVIDOR, TAMBIÉN AQUÍ.
+    # El checkout público ya se blindó el 2026-07-27 (`create_order` retasa cada renglón
+    # contra el catálogo), pero la VENTA DIRECTA se quedó fuera: sumaba `i.price` tal cual
+    # venía en la petición. Con eso se podía registrar un pedido de $0 —o negativo— y de
+    # paso disparar los puntos de lealtad y el descuento de inventario. El descuento se
+    # pide con `discount_rate`, que sí está acotado; el PRECIO no se negocia.
+    if not payload.items:
+        raise HTTPException(status_code=400, detail='Un pedido sin renglones no es un pedido')
+    _claves = [i.product_id for i in payload.items]
+    _docs = await db.products.find(
+        {'$or': [{'id': {'$in': _claves}}, {'sku': {'$in': _claves}}]},
+        {'_id': 0, 'id': 1, 'sku': 1, 'price': 1, 'slug': 1, 'presentation': 1}
+    ).to_list(500)
+    _catalogo = {}
+    for d in _docs:
+        _catalogo[d['id']] = d
+        if d.get('sku'):
+            _catalogo[d['sku']] = d
+    _huerfanos = [i.name for i in payload.items if i.product_id not in _catalogo]
+    if _huerfanos:
+        raise HTTPException(
+            status_code=400,
+            detail=f'No reconocemos estos productos: {", ".join(_huerfanos)}. '
+                   'Sin catálogo no hay precio que cobrar.')
+    for i in payload.items:
+        if i.quantity is None or int(i.quantity) < 1:
+            raise HTTPException(status_code=400, detail=f'Cantidad inválida en {i.name}')
+        real = _catalogo[i.product_id].get('price')
+        if not real or float(real) <= 0:
+            raise HTTPException(status_code=400, detail=f'{i.name} no tiene precio')
+        if abs(float(i.price or 0) - float(real)) > 0.01:
+            logger.warning('Venta directa con precio distinto al del catálogo en %s: '
+                           'mandaron %s, vale %s', i.product_id, i.price, real)
+        i.price = float(real)
     subtotal = sum(i.price * i.quantity for i in payload.items)
     discount = round(subtotal * rate)
     total = subtotal - discount
@@ -4458,9 +4563,8 @@ async def admin_create_order(payload: ManualOrderCreate, admin=Depends(get_curre
             continue
         await db.products.update_one({'$or': [{'id': item.product_id}, {'sku': item.product_id}]},
                                      {'$inc': {'stock': -int(item.quantity)}})
-        doc = await db.products.find_one({'$or': [{'id': item.product_id}, {'sku': item.product_id}]},
-                                         {'_id': 0, 'id': 1, 'sku': 1})
-        await _descontar_inventario_vivo(item.product_id, doc, -int(item.quantity))
+        await _descontar_inventario_vivo(item.product_id, _catalogo.get(item.product_id),
+                                         -int(item.quantity))
     if payload.status in loyalty.PAID_STATUSES:
         fresh = await db.orders.find_one({'id': order.id}, {'_id': 0})
         await award_order_points(fresh)
