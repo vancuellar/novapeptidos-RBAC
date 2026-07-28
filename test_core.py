@@ -1521,3 +1521,19 @@ def test_descontar_y_devolver_inventario_buscan_igual():
                       descuento.index("'$inc': {'stock': -item.quantity}")]
     assert "'sku': item.product_id" in linea, \
         'el descuento de inventario no busca por SKU y la devolución sí: se infla el stock'
+
+
+def test_el_envio_gratis_nunca_pasa_del_10_por_ciento_de_la_compra():
+    """Regla de Christian: la casa regala el envío SOLO mientras no pase del 10% de la
+    compra. Por eso el umbral se deriva del costo del envío y no se escribe a mano."""
+    from server import FREE_SHIPPING_FROM, SHIPPING_FLAT, TOPE_ENVIO_SOBRE_COMPRA, shipping_for
+
+    assert SHIPPING_FLAT / FREE_SHIPPING_FROM <= TOPE_ENVIO_SOBRE_COMPRA + 1e-9, \
+        'en el umbral, el envío ya se come más del 10% de la compra'
+    # justo abajo del umbral se COBRA; justo arriba, no
+    assert shipping_for(FREE_SHIPPING_FROM - 1) == SHIPPING_FLAT
+    assert shipping_for(FREE_SHIPPING_FROM) == 0
+    # y en cualquier pedido con envío gratis, el envío pesa 10% o menos
+    for compra in (FREE_SHIPPING_FROM, FREE_SHIPPING_FROM * 2, 50000):
+        assert shipping_for(compra) == 0
+        assert SHIPPING_FLAT / compra <= TOPE_ENVIO_SOBRE_COMPRA + 1e-9

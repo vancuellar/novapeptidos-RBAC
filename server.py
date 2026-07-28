@@ -902,7 +902,12 @@ NO_DISCOUNT_CATEGORIES = {'suministros', 'accesorios'}
 # nuevo — el envio se regala solo a partir de cierto monto. Abajo de eso se cobra.
 # El umbral es el mismo que el de las ofertas de carrito abandonado, a proposito.
 SHIPPING_FLAT = 250          # lo que de verdad cuesta el envio nacional
-FREE_SHIPPING_FROM = 2500    # de aqui para arriba, va por cuenta de la casa
+# REGLA DE CHRISTIAN: el envio va por cuenta de la casa SOLO mientras no pase del 10% de
+# la compra. Arriba de eso se cobra. Por eso el umbral se DERIVA del costo del envio en vez
+# de escribirse a mano: si algun dia el envio sube a $300, el umbral sube solo a $3,000 y la
+# regla se sigue cumpliendo. Escrito a mano se desalineaba en silencio (2026-07-27).
+TOPE_ENVIO_SOBRE_COMPRA = 0.10
+FREE_SHIPPING_FROM = int(SHIPPING_FLAT / TOPE_ENVIO_SOBRE_COMPRA)   # 250 / 10% = 2,500
 
 
 def shipping_for(merchandise_paid):
