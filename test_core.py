@@ -1413,6 +1413,9 @@ import server as _srv
 
 
 def test_producto_nace_visible_y_acepta_ocultarse():
+    # Los dos que se ocultan: Dysport (toxina botulínica, venta con receta) y HUMSC
+    # (células madre: producto biológico bajo registro sanitario). Ninguno es un
+    # péptido de investigación, así que no van en una tienda RUO.
     p = Product(name='Dysport', slug='dysport', category='bienestar', price=789)
     assert p.hidden is False                                    # por defecto se ve
     assert ProductUpdate(hidden=True).hidden is True            # el admin puede ocultarlo
