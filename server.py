@@ -833,6 +833,8 @@ async def list_products(
     if price_q:
         query['price'] = price_q
 
+    # Los ocultos no salen NUNCA del catálogo público (ver `hidden` en models.py).
+    query['hidden'] = {'$ne': True}
     cursor = db.products.find(query, {'_id': 0})
     products = await cursor.to_list(500)
 
@@ -848,7 +850,7 @@ async def list_products(
 @api_router.get('/products/{slug}')
 async def get_product(slug: str):
     product = await db.products.find_one({'slug': slug}, {'_id': 0})
-    if not product:
+    if not product or product.get('hidden'):
         raise HTTPException(status_code=404, detail='Producto no encontrado')
     return product
 

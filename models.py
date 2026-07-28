@@ -113,6 +113,11 @@ class ProductBase(BaseModel):
     # también en estas otras (p. ej. un combo en su categoría funcional Y en
     # "stacks"). Christian 2026-07-23.
     extra_categories: List[str] = []
+    # Fuera del catálogo público sin borrarlo: no se lista ni se abre por slug, pero
+    # sigue en la base con su SKU y su historial de pedidos. Se agregó para Dysport
+    # (toxina botulínica: venta con receta en México y no es un péptido de
+    # investigación) — Christian, 2026-07-27.
+    hidden: bool = False
 
 
 class ProductCreate(ProductBase):
@@ -126,6 +131,11 @@ class Product(ProductBase):
 
 
 class ProductUpdate(BaseModel):
+    # `hidden` saca el producto del catálogo público SIN borrarlo: sigue en la base,
+    # con su historial de pedidos y su SKU, pero no se lista ni se puede abrir por
+    # slug. Se agregó para Dysport (toxina botulínica: en México es venta con receta
+    # y no es un péptido de investigación) — Christian, 2026-07-27.
+    hidden: Optional[bool] = None
     sku: Optional[str] = None
     commission_cap: Optional[float] = None
     distributor_eligible: Optional[bool] = None

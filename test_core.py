@@ -1401,3 +1401,53 @@ def test_la_conversion_se_calcula_sobre_SESIONES_no_visitas():
 def test_ticket_promedio_no_revienta_sin_pedidos():
     pedidos, ingreso = 0, 0.0
     assert (round(ingreso / pedidos) if pedidos else 0) == 0
+
+
+# ---------- Productos ocultos del catálogo público ----------
+# Dysport (toxina botulínica) se saca de la vista sin borrarlo: en México es venta
+# con receta y no es un péptido de investigación. Christian, 2026-07-27.
+import asyncio
+
+from models import Product, ProductUpdate
+import server as _srv
+
+
+def test_producto_nace_visible_y_acepta_ocultarse():
+    p = Product(name='Dysport', slug='dysport', category='bienestar', price=789)
+    assert p.hidden is False                                    # por defecto se ve
+    assert ProductUpdate(hidden=True).hidden is True            # el admin puede ocultarlo
+    # y ocultar NO es lo mismo que borrar: el producto conserva su SKU y su identidad
+    assert Product(name='Dysport', slug='dysport', category='bienestar',
+                   price=789, sku='DYSPORT-500U', hidden=True).sku == 'DYSPORT-500U'
+
+
+def test_el_catalogo_publico_filtra_los_ocultos():
+    """La lista pública y la ficha por slug NUNCA devuelven un producto oculto."""
+    guardadas = []
+
+    class _Cursor:
+        async def to_list(self, _n):
+            return []
+
+    class _Products:
+        def find(self, query, _proj):
+            guardadas.append(query)
+            return _Cursor()
+
+        async def find_one(self, query, _proj=None):
+            return {'slug': query['slug'], 'name': 'Dysport', 'hidden': True}
+
+    class _DB:
+        products = _Products()
+
+    original = _srv.db
+    _srv.db = _DB()
+    try:
+        asyncio.new_event_loop().run_until_complete(_srv.list_products())
+        assert guardadas[-1].get('hidden') == {'$ne': True}, 'la lista no filtra ocultos'
+
+        with pytest.raises(HTTPException) as e:
+            asyncio.new_event_loop().run_until_complete(_srv.get_product('dysport'))
+        assert e.value.status_code == 404      # oculto se comporta como inexistente
+    finally:
+        _srv.db = original
