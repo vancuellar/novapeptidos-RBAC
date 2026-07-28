@@ -119,14 +119,19 @@ def test_el_inventario_se_valida_SUMANDO_los_renglones_del_mismo_producto():
     puede añadir otro renglón. Lo encontró el barrido adversarial del 28-jul, y es el
     MISMO hueco que se creyó cerrado el 25-jul: entonces se tapó el "pediste 99,999", no
     el "pediste 40 dos veces"."""
+    import server as _srv
+    pflags = _catalogo(stock=40)
+    agrupado = _srv._agrupar_por_producto(
+        [_Item('OREXINA-10MG', 'Orexin A 10 mg', 40),
+         _Item('OREXINA-10MG', 'Orexin A 10 mg', 40)], pflags)
+    assert len(agrupado) == 1 and list(agrupado.values())[0]['total'] == 80, agrupado
+    # y el checkout compara contra ESE total agrupado, no renglón por renglón
     src = _fuente()
     m = re.search(r"faltantes = \[\].*?status_code=409", src, re.S)
     assert m, 'no encontré la validación de inventario del checkout'
-    cuerpo = m.group(0)
-    assert 'pedido_por_producto' in cuerpo, (
-        'el checkout sigue validando renglón por renglón: dos renglones del mismo '
+    assert '_agrupar_por_producto(' in m.group(0), (
+        'el checkout volvió a validar renglón por renglón: dos renglones del mismo '
         'producto se llevan el doble del inventario')
-    assert "+= int(it.quantity)" in cuerpo, 'no está sumando las cantidades'
 
 
 def test_el_descuento_de_inventario_avisa_cuando_no_encuentra_el_renglon():
@@ -164,3 +169,161 @@ def test_si_los_puntos_pagan_todo_no_hay_comision_ni_puntos_nuevos():
     assert 'points_earned = 0' in m.group(0), 'sigue depositando puntos'
     assert 'if referrer and not pagado_todo_con_puntos:' in src, (
         'la comisión se sigue pagando aunque los puntos hayan cubierto todo')
+
+
+# ---------- El pedido: el mismo producto con DOS nombres (UUID y SKU) ----------
+
+class _Item:
+    """Un renglón del carrito, con lo poco que mira el inventario."""
+
+    def __init__(self, product_id, name, quantity):
+        self.product_id, self.name, self.quantity = product_id, name, quantity
+
+
+def _catalogo(stock=40):
+    """Orexin A, con su UUID y su SKU — las dos llaves que acepta el checkout."""
+    doc = {'id': 'a1b2c3d4-uuid', 'sku': 'OREXINA-10MG', 'name': 'Orexin A 10 mg',
+           'stock': stock, 'price': 9359.0}
+    return {doc['id']: doc, doc['sku']: doc}
+
+
+def test_el_mismo_producto_con_UUID_y_con_SKU_es_UN_solo_producto():
+    """El hueco que quedó vivo después del 28-jul.
+
+    Sumar por `it.product_id` no basta: el MISMO producto viaja a veces con su UUID y a
+    veces con su SKU, y el checkout acepta las dos llaves a propósito (el carrito manda
+    cualquiera). Agrupando por el texto, `40 del UUID` y `40 del SKU` son dos productos
+    distintos, cada uno pasa la prueba contra el MISMO inventario (40 ≤ 40 y otra vez
+    40 ≤ 40)... y el descuento sí los junta, porque busca por id O sku. Ochenta piezas de
+    las cuarenta que hay, y sin tope: siempre se puede añadir otro renglón."""
+    import server as _srv
+    pflags = _catalogo(stock=40)
+    agrupado = _srv._agrupar_por_producto(
+        [_Item('a1b2c3d4-uuid', 'Orexin A 10 mg', 40),
+         _Item('OREXINA-10MG', 'Orexin A 10 mg', 40)], pflags)
+    assert len(agrupado) == 1, f'los cuenta como dos productos distintos: {agrupado}'
+    assert agrupado['a1b2c3d4-uuid']['total'] == 80, agrupado
+    # y con eso el checkout ya ve que pide 80 de las 40 que hay
+    hay = int(agrupado['a1b2c3d4-uuid']['doc']['stock'])
+    assert agrupado['a1b2c3d4-uuid']['total'] > hay, 'el pedido pasaría con 80 de 40'
+
+
+def test_un_producto_que_no_se_resuelve_no_se_junta_con_otro():
+    """Sin ficha en el catálogo no hay a quién parecerse: cada uno va por su lado y el
+    checkout no le inventa un límite (a esas alturas ya lo rechazó por huérfano)."""
+    import server as _srv
+    agrupado = _srv._agrupar_por_producto(
+        [_Item('no-existe-1', 'X', 2), _Item('no-existe-2', 'Y', 3)], {})
+    assert set(agrupado) == {'no-existe-1', 'no-existe-2'}
+
+
+# ---------- La carrera entre revisar y descontar ----------
+
+class _Productos:
+    """Lo mínimo de una colección de Mongo para probar la reserva: `$or`, `$gte` y `$inc`."""
+
+    def __init__(self, docs):
+        self.docs = docs
+
+    @staticmethod
+    def _casa(doc, query):
+        for clave, valor in query.items():
+            if clave == '$or':
+                if not any(all(doc.get(k) == v for k, v in cond.items()) for cond in valor):
+                    return False
+            elif isinstance(valor, dict) and '$gte' in valor:
+                if int(doc.get(clave) or 0) < valor['$gte']:
+                    return False
+            elif doc.get(clave) != valor:
+                return False
+        return True
+
+    async def update_one(self, query, cambio):
+        for doc in self.docs:
+            if self._casa(doc, query):
+                for campo, delta in cambio.get('$inc', {}).items():
+                    doc[campo] = int(doc.get(campo) or 0) + delta
+                return type('R', (), {'matched_count': 1, 'modified_count': 1})()
+        return type('R', (), {'matched_count': 0, 'modified_count': 0})()
+
+
+def _con_db_falsa(docs, corutina):
+    """Corre `corutina` con `server.db.products` apuntando a un catálogo de mentiras."""
+    import asyncio
+    import server as _srv
+    productos = _Productos(docs)
+    original = _srv.db
+    _srv.db = type('DB', (), {'products': productos})()
+    try:
+        return asyncio.new_event_loop().run_until_complete(corutina(_srv))
+    finally:
+        _srv.db = original
+
+
+def test_dos_pedidos_a_la_vez_no_se_llevan_la_misma_ultima_pieza():
+    """La carrera entre revisar y descontar.
+
+    El stock se miraba arriba y se restaba mucho después, y entre las dos cosas cabía
+    otro pedido entero: dos clientes veían la última pieza, los dos pasaban la revisión y
+    el inventario terminaba en −1. No hace falta mala fe, basta con dos personas
+    comprando a la vez — que es justo lo que pasa cuando un anuncio pega."""
+    doc = {'id': 'uuid-1', 'sku': 'SKU-1', 'name': 'Orexin A', 'stock': 1}
+
+    async def dos_pedidos(_srv):
+        pedido = {'uuid-1': {'total': 1, 'nombre': 'Orexin A', 'doc': doc}}
+        primero = await _srv._reservar_inventario(pedido)
+        segundo = await _srv._reservar_inventario(pedido)
+        return primero, segundo
+
+    (res1, ago1), (res2, ago2) = _con_db_falsa([doc], dos_pedidos)
+    assert not ago1 and res1 == [('uuid-1', 1)], 'el primero debería llevarse la pieza'
+    assert ago2 == ['Orexin A'], 'el segundo se llevó una pieza que ya no existía'
+    assert doc['stock'] == 0, f'el inventario quedó en {doc["stock"]}'
+
+
+def test_si_un_renglon_no_alcanza_se_devuelve_lo_ya_apartado():
+    """Un pedido que no salió no puede dejar piezas secuestradas: quedarían invisibles
+    para todos los demás clientes hasta que alguien contara a mano."""
+    a = {'id': 'uuid-A', 'sku': 'A', 'name': 'Sí hay', 'stock': 10}
+    b = {'id': 'uuid-B', 'sku': 'B', 'name': 'No hay', 'stock': 1}
+
+    async def pedido_imposible(_srv):
+        return await _srv._reservar_inventario({
+            'uuid-A': {'total': 5, 'nombre': 'Sí hay', 'doc': a},
+            'uuid-B': {'total': 4, 'nombre': 'No hay', 'doc': b},
+        })
+
+    reservado, agotados = _con_db_falsa([a, b], pedido_imposible)
+    assert agotados == ['No hay']
+    assert reservado == [], 'dice que apartó algo de un pedido que no salió'
+    assert a['stock'] == 10, f'se quedó con 5 piezas apartadas: {a["stock"]}'
+    assert b['stock'] == 1
+
+
+def test_la_reserva_encuentra_el_producto_tanto_por_id_como_por_sku():
+    """La llave con la que se agrupa es el `id`, pero el catálogo de respaldo guarda los
+    productos por SKU. Si la reserva sólo buscara por una, no restaría nada y devolvería
+    "no hay" en un producto que sí hay."""
+    doc = {'sku': 'SOLO-SKU', 'name': 'Sin UUID', 'stock': 3}
+
+    async def reservar(_srv):
+        return await _srv._reservar_inventario(
+            {'SOLO-SKU': {'total': 2, 'nombre': 'Sin UUID', 'doc': doc}})
+
+    reservado, agotados = _con_db_falsa([doc], reservar)
+    assert not agotados and reservado == [('SOLO-SKU', 2)]
+    assert doc['stock'] == 1
+
+
+def test_la_venta_directa_tambien_descuenta_lo_que_se_llevo():
+    """No descontaba, y `restore_order_stock` SÍ devuelve al cancelar o al borrar: cada
+    venta directa cancelada le regalaba al inventario piezas que nunca salieron. Es la
+    misma asimetría que dejó Orexin A en 43 cuando tenía 40, viva en el otro camino."""
+    src = _fuente()
+    ini = src.index('async def admin_create_order(')
+    cuerpo = src[ini:src.index('async def', ini + 10)]
+    assert "'$inc': {'stock':" in cuerpo, (
+        'la venta directa no baja el inventario, pero cancelarla sí lo sube')
+    assert '_descontar_inventario_vivo(' in cuerpo, 'no baja el inventario VIVO'
+    assert "{'sku': item.product_id}" in cuerpo, \
+        'busca distinto que la devolución: el inventario se desbalancea'

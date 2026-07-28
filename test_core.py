@@ -1510,17 +1510,25 @@ def test_descontar_y_devolver_inventario_buscan_igual():
 
     El carrito manda el SKU, así que el pedido no bajaba las piezas y la cancelación
     sí las sumaba: cada ciclo INFLABA el inventario. Se descubrió el 2026-07-27 al
-    borrar tres pedidos de prueba y ver Orexin A en 43 cuando tenía 40."""
+    borrar tres pedidos de prueba y ver Orexin A en 43 cuando tenía 40.
+
+    Hoy el descuento vive en `_reservar_inventario` (aparta y compara en un solo paso),
+    pero la regla es la misma: los dos lados tienen que buscar el producto IGUAL."""
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server.py'),
                encoding='utf-8').read()
-    ini = src.index("async def create_order(")
-    fin = src.index("async def", ini + 10)
-    descuento = src[ini:fin]
-    assert "'$inc': {'stock': -item.quantity}" in descuento
-    linea = descuento[descuento.index("'$inc': {'stock': -item.quantity}") - 300:
-                      descuento.index("'$inc': {'stock': -item.quantity}")]
-    assert "'sku': item.product_id" in linea, \
-        'el descuento de inventario no busca por SKU y la devolución sí: se infla el stock'
+
+    def cuerpo(nombre):
+        ini = src.index(f'async def {nombre}(')
+        return src[ini:src.index('async def', ini + 10)]
+
+    for quien in ('_reservar_inventario', '_devolver_reserva', 'restore_order_stock'):
+        c = cuerpo(quien)
+        assert "'$inc': {'stock'" in c, f'{quien} ya no mueve el inventario del catálogo'
+        assert "{'sku':" in c and "{'id':" in c, \
+            f'{quien} no busca por id O sku como los demás: el inventario se desbalancea'
+    # y el checkout ya NO vuelve a restar renglón por renglón: restaría dos veces
+    assert "'$inc': {'stock': -item.quantity}" not in cuerpo('create_order'), \
+        'el checkout descuenta otra vez además de la reserva: las piezas bajan al doble'
 
 
 def test_el_envio_gratis_nunca_pasa_del_10_por_ciento_de_la_compra():
@@ -1838,3 +1846,33 @@ def test_la_segunda_linea_de_direccion_viaja_en_el_pedido():
     assert CustomerInfo(full_name='Ana', email='a@b.com', phone='1',
                         address='x').address_2 == ''      # opcional, nunca obligatoria
     assert AddressInput().address_2 == ''
+
+
+def test_el_navegador_no_puede_poner_el_envio_del_pedido():
+    """`OrderCreate` ACEPTA un campo `shipping` (el navegador lo manda), y el día que se
+    vuelva a cobrar envío ése es el agujero obvio: mandar `shipping: 0` y llevarse el
+    paquete gratis. El servidor no lo lee — lo calcula él — y esto lo deja clavado.
+
+    Es el mismo error que ya costó dinero con el PRECIO: hasta el 27-jul el subtotal se
+    calculaba con `item.price` tal como venía en la petición."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server.py'),
+               encoding='utf-8').read()
+    ini = src.index('async def create_order(')
+    cuerpo = src[ini:src.index('async def', ini + 10)]
+    assert 'payload.shipping' not in cuerpo, \
+        'el envío del pedido sale de la petición: el navegador decide cuánto paga'
+    assert 'shipping = shipping_for(' in cuerpo, 'el envío ya no lo calcula el servidor'
+
+
+def test_el_envio_gratis_y_la_oferta_de_carrito_abandonado_usan_el_MISMO_umbral():
+    """Los dos son $2,500 A PROPÓSITO (`server.py` lo dice: "el umbral es el mismo que el
+    de las ofertas de carrito abandonado"). Pero uno se DERIVA del costo del envío y el
+    otro está escrito a mano en `recovery.py`: el día que el envío suba a $300, el de
+    envío gratis se moverá solo a $3,000 y el de los cupones se quedará en $2,500, sin
+    que nadie se entere. Es exactamente cómo se desalineó el umbral el 2026-07-27."""
+    import recovery
+    from server import FREE_SHIPPING_FROM
+
+    assert recovery.MIN_FOR_OFFER == FREE_SHIPPING_FROM, (
+        f'el envío gratis empieza en ${FREE_SHIPPING_FROM:,} y el cupón de carrito '
+        f'abandonado en ${recovery.MIN_FOR_OFFER:,}: uno de los dos se movió solo')

@@ -1120,6 +1120,66 @@ async def _descontar_inventario_vivo(product_id, doc, delta):
     return False
 
 
+def _agrupar_por_producto(items, pflags):
+    """Junta los renglones del carrito POR PRODUCTO REAL, no por lo que mandó el navegador.
+
+    Dos trampas, las dos ya pagadas:
+      · el mismo producto repetido en varios renglones (40 y 40 son 80, no 40 ≤ 40 dos
+        veces);
+      · el mismo producto escrito de dos formas — su UUID en un renglón y su SKU en otro.
+        `pflags` acepta las dos llaves justo porque el carrito manda cualquiera, así que
+        agrupar por el texto los cuenta como productos distintos y cada uno pasa la prueba
+        contra el MISMO inventario. El descuento, en cambio, sí los junta (busca por id O
+        sku): ochenta piezas de las cuarenta que hay.
+    """
+    agrupado = {}
+    for it in items:
+        d = pflags.get(it.product_id)
+        clave = d['id'] if d else it.product_id
+        agrupado.setdefault(clave, {'total': 0, 'nombre': it.name, 'doc': d})
+        agrupado[clave]['total'] += int(it.quantity)
+    return agrupado
+
+
+async def _reservar_inventario(pedido_por_producto):
+    """Aparta las piezas de UN pedido. Devuelve (lo apartado, los que ya no alcanzan).
+
+    ⛔ COMPARAR Y RESTAR TIENEN QUE SER EL MISMO PASO. Antes se miraba el stock arriba
+    (`hay = d['stock']`) y se restaba mucho después, y entre las dos cosas cabía otro
+    pedido entero: dos clientes miraban la última pieza, los dos pasaban la revisión, y
+    el inventario terminaba en −1 — el segundo compró algo que ya no existía. No hace
+    falta mala fe: basta con dos personas comprando a la vez, que es justo lo que pasa
+    cuando un anuncio pega.
+
+    Aquí la condición viaja DENTRO del update (`stock >= lo que pides`): si otro pedido
+    se llevó las piezas mientras tanto, Mongo no encuentra el documento, no resta nada y
+    lo decimos. Y si un renglón del pedido falla, se devuelve lo que ya se había apartado
+    de los otros: un pedido que no salió no puede dejar piezas secuestradas."""
+    reservado, agotados = [], []
+    for clave, acum in pedido_por_producto.items():
+        if not acum.get('doc'):
+            continue          # producto que no resolvimos: no inventamos un limite
+        n = int(acum['total'])
+        r = await db.products.update_one(
+            {'$or': [{'id': clave}, {'sku': clave}], 'stock': {'$gte': n}},
+            {'$inc': {'stock': -n}})
+        if r.matched_count:
+            reservado.append((clave, n))
+        else:
+            agotados.append(acum['nombre'])
+    if agotados:
+        await _devolver_reserva(reservado)
+        reservado = []
+    return reservado, agotados
+
+
+async def _devolver_reserva(reservado):
+    """Deshace lo apartado por un pedido que no llegó a existir."""
+    for clave, n in reservado:
+        await db.products.update_one({'$or': [{'id': clave}, {'sku': clave}]},
+                                     {'$inc': {'stock': n}})
+
+
 async def restore_order_stock(order):
     """Devuelve al inventario lo que la orden se habia llevado. Se llama al
     CANCELAR y al BORRAR: antes el stock se descontaba y nunca regresaba, asi que
@@ -1292,15 +1352,22 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # inventario queda en negativo. Lo encontró el barrido adversarial del 28-jul, y es
     # el mismo agujero que se creyó cerrado el 25-jul — entonces se tapó el "pediste
     # 99,999", no el "pediste 40 dos veces".
+    #
+    # ⚠️ Y SE AGRUPA POR EL PRODUCTO RESUELTO, NO POR EL TEXTO QUE MANDÓ EL CARRITO.
+    # Sumar por `it.product_id` seguía dejando el agujero abierto: el MISMO producto
+    # viaja a veces con su UUID y a veces con su SKU (`_pflags` acepta los dos justo
+    # porque el carrito manda cualquiera de ellos). Dos renglones, uno con cada nombre,
+    # se contaban como dos productos distintos, cada uno pasaba la prueba contra el
+    # MISMO inventario (40 ≤ 40 y otra vez 40 ≤ 40)... y el descuento sí los juntaba,
+    # porque busca por `id` O por `sku`. Ochenta piezas de las cuarenta que hay, otra
+    # vez. Lo encontró el segundo barrido adversarial del 28-jul.
     faltantes = []
-    pedido_por_producto = {}
     for it in payload.items:
         if it.quantity is None or it.quantity < 1:
             raise HTTPException(status_code=400, detail=f'Cantidad invalida en {it.name}')
-        pedido_por_producto.setdefault(it.product_id, {'total': 0, 'nombre': it.name})
-        pedido_por_producto[it.product_id]['total'] += int(it.quantity)
-    for pid, acum in pedido_por_producto.items():
-        d = _pflags.get(pid)
+    pedido_por_producto = _agrupar_por_producto(payload.items, _pflags)
+    for clave, acum in pedido_por_producto.items():
+        d = acum['doc']
         if not d:
             continue          # producto que no resolvimos: no inventamos un limite
         hay = int(d.get('stock') or 0)
@@ -1445,7 +1512,21 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         # vacía: una constancia fabricada por el servidor no prueba nada.
         terms_accepted_at=(payload.terms_accepted_at or '').strip()[:40],
     )
-    await db.orders.insert_one(order.model_dump())
+    # ⛔ LAS PIEZAS SE APARTAN JUSTO ANTES DE GRABAR EL PEDIDO, y comparando y restando en
+    # el MISMO paso (ver `_reservar_inventario`). Aquí y no antes: entre la revisión de
+    # arriba y esta línea no queda nada que pueda fallar y dejar piezas apartadas de un
+    # pedido que nunca existió.
+    reservado, agotados = await _reservar_inventario(pedido_por_producto)
+    if agotados:
+        # Alguien se los llevó mientras este cliente llenaba sus datos. Es la respuesta
+        # honesta: mejor un "ya no hay" que cobrar algo que no se puede mandar.
+        raise HTTPException(status_code=409,
+                            detail='Se agotó mientras comprabas: ' + '; '.join(agotados))
+    try:
+        await db.orders.insert_one(order.model_dump())
+    except Exception:
+        await _devolver_reserva(reservado)      # sin pedido no hay nada que apartar
+        raise
     # Ese carrito SI se cerro: su intento deja de estar pendiente y la IA ya no le escribe.
     asyncio.create_task(_cerrar_intentos(payload.customer.email))
     # Con sesion iniciada, estos datos quedan como los suyos para la proxima compra.
@@ -1466,13 +1547,14 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         await db.users.update_one({'id': user['id']}, {'$inc': {'points_balance': -points_used}})
         await _points_entry(user['id'], order.model_dump(), 'redeem', -points_used)
     for item in payload.items:
-        # Por `id` O por `sku`: el carrito manda el SKU. Descontar solo por `id` mientras
-        # `restore_order_stock` devuelve por id O sku dejaba el inventario ASIMÉTRICO —
-        # el pedido no bajaba las piezas y la cancelación sí las sumaba, así que cada
-        # ciclo INFLABA el inventario. Encontrado el 2026-07-27 al limpiar unas pruebas:
-        # tres pedidos borrados dejaron Orexin A en 43 cuando tenía 40.
-        await db.products.update_one({'$or': [{'id': item.product_id}, {'sku': item.product_id}]},
-                                     {'$inc': {'stock': -item.quantity}})
+        # El inventario del catálogo YA se apartó arriba, agrupado por producto y en un
+        # solo paso condicionado (`_reservar_inventario`). Aquí no se vuelve a restar: se
+        # restaba renglón por renglón y buscando por `id` O `sku`, que junta lo que la
+        # revisión separaba — descontar dos veces las mismas piezas. La devolución
+        # (`restore_order_stock`) sigue buscando igual, por id O sku, para que cobrar y
+        # cancelar se muevan la misma cantidad: cuando cada lado buscaba distinto, cada
+        # ciclo INFLABA el inventario (Orexin A en 43 cuando tenía 40, el 2026-07-27).
+        #
         # Inventario vivo por presentacion. La llave NO siempre es el product_id: en el
         # catálogo de respaldo sí (`fallback-orexin-a::10 mg`), pero cuando el producto
         # viene del backend el carrito manda un UUID o el SKU y entonces esta línea NO
@@ -4361,6 +4443,24 @@ async def admin_create_order(payload: ManualOrderCreate, admin=Depends(get_curre
         points_used=0, points_earned=points_earned,
     )
     await db.orders.insert_one(order.model_dump())
+    # ⛔ LA VENTA DIRECTA TAMBIÉN SE LLEVA PIEZAS. No las descontaba, y `restore_order_stock`
+    # sí las DEVUELVE al cancelar o al borrar: cada venta directa cancelada le regalaba al
+    # inventario piezas que nunca salieron de él. Es exactamente la asimetría que dejó
+    # Orexin A en 43 cuando tenía 40, viva todavía en este otro camino. Y mientras tanto el
+    # sitio seguía ofreciendo piezas que Christian ya vendió en persona.
+    #
+    # A diferencia del checkout, aquí NO se condiciona a que haya: esto registra una venta
+    # que YA ocurrió, y no tiene sentido negarle al admin apuntar la realidad. Si el
+    # inventario queda corto, el checkout público lo verá y dejará de venderlo — que es
+    # justo lo que debe pasar.
+    for item in payload.items:
+        if int(item.quantity or 0) <= 0:
+            continue
+        await db.products.update_one({'$or': [{'id': item.product_id}, {'sku': item.product_id}]},
+                                     {'$inc': {'stock': -int(item.quantity)}})
+        doc = await db.products.find_one({'$or': [{'id': item.product_id}, {'sku': item.product_id}]},
+                                         {'_id': 0, 'id': 1, 'sku': 1})
+        await _descontar_inventario_vivo(item.product_id, doc, -int(item.quantity))
     if payload.status in loyalty.PAID_STATUSES:
         fresh = await db.orders.find_one({'id': order.id}, {'_id': 0})
         await award_order_points(fresh)
