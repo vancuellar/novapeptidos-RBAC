@@ -1503,3 +1503,21 @@ def test_el_codigo_de_orders_no_suma_el_precio_del_navegador():
         'el subtotal se calcula ANTES de retasar: el precio del navegador manda'
     assert 'raise HTTPException' in cuerpo[:pos_retasa], \
         'un producto que no se resuelve debe RECHAZARSE, no solo anotarse en la bitácora'
+
+
+def test_descontar_y_devolver_inventario_buscan_igual():
+    """El pedido descontaba por `id` y la devolución devolvía por `id` O `sku`.
+
+    El carrito manda el SKU, así que el pedido no bajaba las piezas y la cancelación
+    sí las sumaba: cada ciclo INFLABA el inventario. Se descubrió el 2026-07-27 al
+    borrar tres pedidos de prueba y ver Orexin A en 43 cuando tenía 40."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server.py'),
+               encoding='utf-8').read()
+    ini = src.index("async def create_order(")
+    fin = src.index("async def", ini + 10)
+    descuento = src[ini:fin]
+    assert "'$inc': {'stock': -item.quantity}" in descuento
+    linea = descuento[descuento.index("'$inc': {'stock': -item.quantity}") - 300:
+                      descuento.index("'$inc': {'stock': -item.quantity}")]
+    assert "'sku': item.product_id" in linea, \
+        'el descuento de inventario no busca por SKU y la devolución sí: se infla el stock'

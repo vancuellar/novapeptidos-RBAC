@@ -1270,7 +1270,13 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         await db.users.update_one({'id': user['id']}, {'$inc': {'points_balance': -points_used}})
         await _points_entry(user['id'], order.model_dump(), 'redeem', -points_used)
     for item in payload.items:
-        await db.products.update_one({'id': item.product_id}, {'$inc': {'stock': -item.quantity}})
+        # Por `id` O por `sku`: el carrito manda el SKU. Descontar solo por `id` mientras
+        # `restore_order_stock` devuelve por id O sku dejaba el inventario ASIMÉTRICO —
+        # el pedido no bajaba las piezas y la cancelación sí las sumaba, así que cada
+        # ciclo INFLABA el inventario. Encontrado el 2026-07-27 al limpiar unas pruebas:
+        # tres pedidos borrados dejaron Orexin A en 43 cuando tenía 40.
+        await db.products.update_one({'$or': [{'id': item.product_id}, {'sku': item.product_id}]},
+                                     {'$inc': {'stock': -item.quantity}})
         # Inventario vivo por presentacion (key = product_id del carrito, ya incluye ::presentacion)
         await db.stock.update_one({'key': item.product_id}, {'$inc': {'qty': -item.quantity}})
     # Confirmacion por correo, en segundo plano: la compra no debe quedarse
