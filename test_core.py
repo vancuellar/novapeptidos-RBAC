@@ -1454,3 +1454,52 @@ def test_el_catalogo_publico_filtra_los_ocultos():
         assert e.value.status_code == 404      # oculto se comporta como inexistente
     finally:
         _srv.db = original
+
+
+# ---------- El precio lo pone el SERVIDOR, nunca el navegador ----------
+# Hasta el 2026-07-27 `/orders` sumaba `item.price` tal como venía en la petición: se podía
+# mandar precio 0 y llevarse un vial de $9,359 pagando los $250 del envío. Lo cazó una
+# auditoría externa. Estas pruebas fijan el arreglo para que no vuelva.
+
+def test_el_pedido_se_retasa_con_el_precio_del_catalogo():
+    """Manda precio 0 y el servidor tiene que cobrar el del catálogo."""
+    hecho = {}
+
+    class _Item:
+        def __init__(self):
+            self.product_id = 'OREXINA-10MG'
+            self.name = 'Orexin A 10 mg'
+            self.price = 0.0            # el atacante manda cero
+            self.quantity = 1
+
+    item = _Item()
+    catalogo = {'OREXINA-10MG': {'id': 'x', 'sku': 'OREXINA-10MG', 'price': 9359.0,
+                                 'stock': 40, 'commission_cap': 0.35,
+                                 'distributor_eligible': True, 'category': 'nootropicos'}}
+    # Réplica exacta del retasado que hace el servidor (server.py, create_order).
+    for it in [item]:
+        real = catalogo[it.product_id]['price']
+        it.price = float(real)
+        hecho[it.product_id] = it.price
+    subtotal = sum(i.price * i.quantity for i in [item])
+
+    assert item.price == 9359.0, 'el precio del navegador se coló'
+    assert subtotal == 9359.0
+    assert hecho['OREXINA-10MG'] != 0.0
+
+
+def test_el_codigo_de_orders_no_suma_el_precio_del_navegador():
+    """Candado sobre el código: el subtotal tiene que calcularse DESPUÉS de retasar.
+
+    No es cosmético — el orden de esas dos líneas es justo lo que falló."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server.py'),
+               encoding='utf-8').read()
+    ini = src.index("async def create_order(")
+    fin = src.index("async def", ini + 10)
+    cuerpo = src[ini:fin]
+    pos_retasa = cuerpo.index('it.price = float(real)')
+    pos_subtotal = cuerpo.index('subtotal = sum(item.price * item.quantity')
+    assert pos_retasa < pos_subtotal, \
+        'el subtotal se calcula ANTES de retasar: el precio del navegador manda'
+    assert 'raise HTTPException' in cuerpo[:pos_retasa], \
+        'un producto que no se resuelve debe RECHAZARSE, no solo anotarse en la bitácora'

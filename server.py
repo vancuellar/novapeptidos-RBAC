@@ -1045,7 +1045,6 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         + (['cripto'] if crypto_enabled() else [])
     if payload.payment_method not in allowed_methods:
         raise HTTPException(status_code=400, detail='Metodo de pago no disponible')
-    subtotal = sum(item.price * item.quantity for item in payload.items)
     # Familia HGH (no el Fragment): precio neto SIEMPRE — su margen no aguanta
     # ningún descuento (Christian, 2026-07-22). Miramos id Y nombre porque en
     # producción el product_id es un UUID (no dice "hgh"); el nombre sí.
@@ -1062,15 +1061,39 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     _pdocs = await db.products.find(
         {'$or': [{'id': {'$in': _keys}}, {'sku': {'$in': _keys}}]},
         {'_id': 0, 'id': 1, 'sku': 1, 'name': 1, 'commission_cap': 1,
-         'distributor_eligible': 1, 'category': 1, 'stock': 1}).to_list(500)
+         'distributor_eligible': 1, 'category': 1, 'stock': 1, 'price': 1,
+         'hidden': 1}).to_list(500)
     _pflags = {}
     for d in _pdocs:
         _pflags[d['id']] = d
         if d.get('sku'):
             _pflags[d['sku']] = d
+
+    # ⛔ EL PRECIO LO PONE EL SERVIDOR, NUNCA EL NAVEGADOR.
+    # Hasta el 2026-07-27 el subtotal se calculaba con `item.price` tal como venía en la
+    # petición. Cualquiera podía mandar precio 0 y llevarse un vial de $9,359 pagando los
+    # $250 del envío. Ahora cada renglón se retasa contra el catálogo real y el precio del
+    # navegador se ignora por completo. Lo cazó una auditoría externa (Codex).
     _huerfanos = [it.name for it in payload.items if it.product_id not in _pflags]
     if _huerfanos:
-        logger.warning('Pedido con productos no resueltos: %s', _huerfanos)
+        # Antes solo se anotaba en la bitácora y el pedido seguía con el precio del
+        # navegador. Un producto que no se resuelve no se puede tasar: no se vende.
+        raise HTTPException(
+            status_code=400,
+            detail=f'No reconocemos estos productos: {", ".join(_huerfanos)}. '
+                   'Vacía el carrito y vuelve a agregarlos.')
+    _ocultos = [it.name for it in payload.items if _pflags[it.product_id].get('hidden')]
+    if _ocultos:
+        raise HTTPException(status_code=400,
+                            detail=f'Ya no está a la venta: {", ".join(_ocultos)}')
+    for it in payload.items:
+        real = _pflags[it.product_id].get('price')
+        if real is None:
+            raise HTTPException(status_code=400, detail=f'{it.name} no tiene precio')
+        if abs(float(it.price or 0) - float(real)) > 0.01:
+            logger.warning('Precio del navegador distinto al del catálogo en %s: '
+                           'mandó %s, vale %s', it.product_id, it.price, real)
+        it.price = float(real)
 
     def _cap_of(item):
         d = _pflags.get(item.product_id, {})
@@ -1107,6 +1130,8 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         raise HTTPException(status_code=409,
                             detail='No tenemos suficiente de: ' + '; '.join(faltantes))
 
+    # Ya con los precios del catálogo (ver arriba): el navegador no decide nada.
+    subtotal = sum(item.price * item.quantity for item in payload.items)
     discountable = sum(
         item.price * item.quantity for item in payload.items if _eligible(item)
     )
