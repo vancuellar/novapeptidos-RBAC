@@ -1537,3 +1537,304 @@ def test_el_envio_gratis_nunca_pasa_del_10_por_ciento_de_la_compra():
     for compra in (FREE_SHIPPING_FROM, FREE_SHIPPING_FROM * 2, 50000):
         assert shipping_for(compra) == 0
         assert SHIPPING_FLAT / compra <= TOPE_ENVIO_SOBRE_COMPRA + 1e-9
+
+
+# --------------------------------------------------------------------------
+#  El pedido ya no cobra envío — Christian, 2026-07-28
+# --------------------------------------------------------------------------
+# El envío se cotiza por separado, fuera del checkout. La regla de arriba NO se
+# borró: quedó dormida detrás de un interruptor, con sus pruebas corriendo, para
+# el día que se vuelva a cobrar.
+
+def test_el_pedido_ya_no_cobra_envio():
+    from server import COBRAR_ENVIO
+    assert COBRAR_ENVIO is False, 'el pedido volvió a cobrar envío sin que nadie lo pidiera'
+
+
+def test_el_cobro_del_pedido_respeta_el_interruptor():
+    """El total de la orden tiene que salir del interruptor, no de la regla vieja.
+
+    Se lee el código porque `create_order` no se puede correr sin base: lo que se
+    vigila es que nadie deje `shipping = shipping_for(...)` a secas otra vez."""
+    src = open(os.path.join(os.path.dirname(__file__), 'server.py'), encoding='utf-8').read()
+    assert 'shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0' in src, \
+        'la orden ya no calcula el envío con el interruptor: el sitio y el cobro se separan'
+
+
+def test_el_sitio_se_entera_de_que_no_se_cobra_envio():
+    """El carrito pinta lo que diga /payments/config. Si esa llave no viaja, el sitio
+    enseña un cargo que el servidor ya no cobra — y eso ya costó dinero antes."""
+    src = open(os.path.join(os.path.dirname(__file__), 'server.py'), encoding='utf-8').read()
+    assert "'shipping_charged': COBRAR_ENVIO" in src
+
+
+def test_la_regla_de_envio_sigue_viva_para_el_dia_que_se_reactive():
+    from server import shipping_for, SHIPPING_FLAT, FREE_SHIPPING_FROM
+    assert shipping_for(FREE_SHIPPING_FROM - 1) == SHIPPING_FLAT
+    assert shipping_for(FREE_SHIPPING_FROM) == 0
+
+
+# --------------------------------------------------------------------------
+#  Adopción de pedidos de invitado — Christian, 2026-07-28
+# --------------------------------------------------------------------------
+# Quien compra sin cuenta y se registra después no veía nada de lo que ya había
+# comprado. Ahora se adopta — pero SOLO cuando la cuenta confirma ese correo: por
+# correo a secas, cualquiera se queda con el historial de compras de otro.
+
+class _Resultado:
+    def __init__(self, n):
+        self.modified_count = n
+        self.matched_count = n
+
+
+def _valor_por_ruta(doc, ruta):
+    actual = doc
+    for parte in ruta.split('.'):
+        if not isinstance(actual, dict):
+            return None
+        actual = actual.get(parte)
+    return actual
+
+
+def _coincide(doc, query):
+    import re as _re
+    for clave, cond in query.items():
+        valor = _valor_por_ruta(doc, clave)
+        if isinstance(cond, dict):
+            if '$regex' in cond and not _re.match(cond['$regex'], str(valor or ''), _re.I):
+                return False
+            if '$ne' in cond and valor == cond['$ne']:
+                return False
+        elif valor != cond:
+            return False
+    return True
+
+
+class _Cursorcito:
+    def __init__(self, docs):
+        self._docs = docs
+
+    async def to_list(self, _n):
+        return [dict(d) for d in self._docs]
+
+
+class _Coleccion:
+    """Lo mínimo de Mongo que usa la adopción. Guarda los documentos vivos para
+    poder comprobar QUÉ quedó escrito, no solo qué devolvió la función."""
+
+    def __init__(self, docs=None):
+        self.docs = docs or []
+
+    def find(self, query, _proj=None):
+        return _Cursorcito([d for d in self.docs if _coincide(d, query)])
+
+    async def find_one(self, query, _proj=None):
+        for d in self.docs:
+            if _coincide(d, query):
+                return dict(d)
+        return None
+
+    async def update_one(self, query, update):
+        for d in self.docs:
+            if _coincide(d, query):
+                d.update(update.get('$set', {}))
+                for k, v in (update.get('$inc') or {}).items():
+                    d[k] = (d.get(k) or 0) + v
+                return _Resultado(1)
+        return _Resultado(0)
+
+    async def insert_one(self, doc):
+        self.docs.append(dict(doc))
+        return _Resultado(1)
+
+
+class _BaseFalsa:
+    def __init__(self, usuarios, pedidos):
+        self.users = _Coleccion(usuarios)
+        self.orders = _Coleccion(pedidos)
+        self.points = _Coleccion([])
+
+
+def _pedido_de_invitado(**extra):
+    """Un pedido pagado, hecho SIN cuenta: user_id nulo y cero puntos."""
+    o = {'id': 'ped-1', 'order_number': 'EX-260728-0001', 'user_id': None,
+         'status': 'confirmado', 'total': 10000.0, 'shipping': 0.0,
+         'discount_rate': 0.10, 'points_earned': 0, 'points_awarded': False,
+         'customer': {'email': 'ana@ejemplo.com', 'full_name': 'Ana'}}
+    o.update(extra)
+    return o
+
+
+def _cuenta(verificado=True, email='ana@ejemplo.com'):
+    return {'id': 'u-ana', 'email': email, 'name': 'Ana', 'role': 'user',
+            'email_verified': verificado, 'points_balance': 0}
+
+
+def _adoptar(base):
+    original = _srv.db
+    _srv.db = base
+    try:
+        return asyncio.new_event_loop().run_until_complete(
+            _srv._adoptar_pedidos_de_invitado('u-ana'))
+    finally:
+        _srv.db = original
+
+
+def test_adopta_la_compra_de_invitado_cuando_el_correo_esta_confirmado():
+    base = _BaseFalsa([_cuenta()], [_pedido_de_invitado()])
+    assert _adoptar(base) == 1
+    pedido = base.orders.docs[0]
+    assert pedido['user_id'] == 'u-ana'
+    assert pedido['adopted_from_guest'] is True
+    assert pedido['adopted_at']                       # queda rastro para auditarlo
+    # y los puntos se calculan con las reglas de siempre: 3% de la mercancía pagada
+    assert pedido['points_earned'] == 300
+    assert base.users.docs[0]['points_balance'] == 300
+
+
+def test_no_adopta_nada_si_el_correo_no_esta_confirmado():
+    """El candado. Registrarse con el correo de otro NO da acceso a sus compras."""
+    base = _BaseFalsa([_cuenta(verificado=False)], [_pedido_de_invitado()])
+    assert _adoptar(base) == 0
+    assert base.orders.docs[0]['user_id'] is None
+    assert base.users.docs[0]['points_balance'] == 0
+
+
+def test_no_adopta_nada_si_la_cuenta_vieja_no_trae_el_campo():
+    """Sin `email_verified` no se sabe si el buzón es suyo: aquí la duda no adopta."""
+    cuenta = _cuenta()
+    del cuenta['email_verified']
+    base = _BaseFalsa([cuenta], [_pedido_de_invitado()])
+    assert _adoptar(base) == 0
+
+
+def test_adoptar_dos_veces_no_duplica_pedidos_ni_puntos():
+    base = _BaseFalsa([_cuenta()], [_pedido_de_invitado()])
+    assert _adoptar(base) == 1
+    assert _adoptar(base) == 0                        # la segunda no encuentra huérfanos
+    assert len(base.orders.docs) == 1
+    assert base.users.docs[0]['points_balance'] == 300
+    assert len([e for e in base.points.docs if e['type'] == 'earn']) == 1
+
+
+def test_un_pedido_que_ya_tiene_dueno_no_cambia_de_dueno_jamas():
+    ajeno = _pedido_de_invitado(user_id='u-otro')
+    base = _BaseFalsa([_cuenta()], [ajeno])
+    assert _adoptar(base) == 0
+    assert base.orders.docs[0]['user_id'] == 'u-otro'
+
+
+def test_adopta_el_pedido_sin_pagar_pero_no_le_regala_puntos():
+    """Un SPEI que nunca se pagó se ve en su historial, pero no genera puntos:
+    misma regla que en una compra normal."""
+    base = _BaseFalsa([_cuenta()], [_pedido_de_invitado(status='pendiente')])
+    assert _adoptar(base) == 1
+    assert base.orders.docs[0]['points_earned'] == 0
+    assert base.users.docs[0]['points_balance'] == 0
+
+
+def test_adopta_aunque_el_correo_se_haya_tecleado_con_otras_mayusculas():
+    base = _BaseFalsa([_cuenta(email='ana@ejemplo.com')],
+                      [_pedido_de_invitado(customer={'email': 'Ana@Ejemplo.com'})])
+    assert _adoptar(base) == 1
+
+
+def test_la_adopcion_se_dispara_al_confirmar_el_correo_no_al_registrarse():
+    """Engancharla al registro sería el agujero: el correo aún no está probado."""
+    src = open(os.path.join(os.path.dirname(__file__), 'server.py'), encoding='utf-8').read()
+    cuerpo = src[src.index("@api_router.post('/auth/verify-email')"):]
+    assert '_adoptar_pedidos_de_invitado' in cuerpo[:1200], \
+        'confirmar el correo ya no adopta los pedidos de invitado'
+
+
+# --------------------------------------------------------------------------
+#  Prellenado del checkout para quien ya tiene cuenta — Christian, 2026-07-28
+# --------------------------------------------------------------------------
+
+def test_los_datos_del_checkout_solo_salen_por_sesion():
+    """La ruta no recibe correo, ni id, ni SKU: solo el dueño de la sesión. Una ruta
+    que devuelva la dirección de alguien a partir de un dato tecleable es una lista
+    de clientes servida en bandeja."""
+    import inspect
+    params = inspect.signature(_srv.my_checkout_data).parameters
+    assert list(params) == ['user'], 'la ruta acepta algo más que la sesión'
+    assert params['user'].default.dependency is _srv.get_current_user
+
+
+def test_el_checkout_devuelve_los_datos_guardados_del_dueno():
+    base = _BaseFalsa([{'id': 'u-ana', 'name': 'Ana', 'email': 'ana@ejemplo.com',
+                        'phone': '+52 55 1234 5678',
+                        'shipping_address': {'address': 'Reforma 100', 'address_2': 'Int. 4',
+                                             'city': 'Mérida', 'state': 'Yucatán',
+                                             'postal_code': '97000', 'country': 'MX'}}], [])
+    original = _srv.db
+    _srv.db = base
+    try:
+        datos = asyncio.new_event_loop().run_until_complete(
+            _srv.my_checkout_data(user={'id': 'u-ana'}))
+    finally:
+        _srv.db = original
+    assert datos['prefilled'] is True
+    assert datos['shipping_address']['address_2'] == 'Int. 4'
+    assert datos['full_name'] == 'Ana'
+
+
+def test_sin_direccion_guardada_no_se_anuncia_prellenado():
+    base = _BaseFalsa([{'id': 'u-ana', 'name': 'Ana', 'email': 'ana@ejemplo.com'}], [])
+    original = _srv.db
+    _srv.db = base
+    try:
+        datos = asyncio.new_event_loop().run_until_complete(
+            _srv.my_checkout_data(user={'id': 'u-ana'}))
+    finally:
+        _srv.db = original
+    assert datos['prefilled'] is False
+    assert datos['shipping_address']['country'] == 'MX'   # el default del negocio
+
+
+def test_la_compra_guarda_la_direccion_pero_nunca_renombra_la_cuenta():
+    """Se recuerda dirección y teléfono. El nombre NO: en el checkout se escribe el de
+    quien RECIBE el paquete, y con eso nadie debe poder renombrar su propia cuenta."""
+    from models import CustomerInfo
+    base = _BaseFalsa([{'id': 'u-ana', 'name': 'Ana', 'email': 'ana@ejemplo.com'}], [])
+    cliente = CustomerInfo(full_name='Su vecino Beto', email='ana@ejemplo.com',
+                           phone='+52 9991234567', address='Reforma 100',
+                           address_2='Int. 4', city='Mérida', state='Yucatán',
+                           postal_code='97000', country='MX')
+    original = _srv.db
+    _srv.db = base
+    try:
+        asyncio.new_event_loop().run_until_complete(
+            _srv._recordar_datos_de_compra({'id': 'u-ana'}, cliente))
+    finally:
+        _srv.db = original
+    guardado = base.users.docs[0]
+    assert guardado['name'] == 'Ana'
+    assert guardado['phone'] == '+52 9991234567'
+    assert guardado['shipping_address']['address_2'] == 'Int. 4'
+
+
+def test_una_compra_de_invitado_no_guarda_nada_en_ningun_perfil():
+    from models import CustomerInfo
+    base = _BaseFalsa([{'id': 'u-ana', 'name': 'Ana', 'email': 'ana@ejemplo.com'}], [])
+    cliente = CustomerInfo(full_name='Invitado', email='x@ejemplo.com', phone='+52 9991234567',
+                           address='Otra calle 5')
+    original = _srv.db
+    _srv.db = base
+    try:
+        asyncio.new_event_loop().run_until_complete(
+            _srv._recordar_datos_de_compra(None, cliente))
+    finally:
+        _srv.db = original
+    assert 'shipping_address' not in base.users.docs[0]
+
+
+def test_la_segunda_linea_de_direccion_viaja_en_el_pedido():
+    """Si el modelo no la trae, el interior se pierde entre el navegador y la etiqueta."""
+    from models import CustomerInfo, AddressInput
+    c = CustomerInfo(full_name='Ana', email='ana@ejemplo.com', phone='+52 9991234567',
+                     address='Reforma 100', address_2='Depto 3B')
+    assert c.address_2 == 'Depto 3B'
+    assert CustomerInfo(full_name='Ana', email='a@b.com', phone='1',
+                        address='x').address_2 == ''      # opcional, nunca obligatoria
+    assert AddressInput().address_2 == ''

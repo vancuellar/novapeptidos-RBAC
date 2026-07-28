@@ -297,10 +297,15 @@ async def register(payload: RegisterInput):
             'message': 'Te mandamos un correo para confirmar tu cuenta. Revisa tambien la carpeta de spam.',
         }
     asyncio.create_task(send_welcome_email(user['name'], user['email'], user['language']))
+    # Solo se llega aqui cuando el correo saliente esta APAGADO y la cuenta nace ya
+    # confirmada; con el encendido, este registro devuelve 'pending_verification' y
+    # no adopta nada hasta que abra el enlace.
+    adoptados = await _adoptar_pedidos_de_invitado(user['id'])
     return {
         'pending_verification': False,
         'token': create_token(user['id']),
         'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
+        'adopted_orders': adoptados,
     }
 
 
@@ -414,9 +419,14 @@ async def google_login(payload: GoogleAuthInput):
         await db.users.insert_one(user)
         asyncio.create_task(send_welcome_email(user['name'], user['email'], user['language']))
 
+    # Google ya avalo el correo, asi que la cuenta entra confirmada: es un momento
+    # de confirmacion igual de bueno que abrir el enlace, y sirve para las dos ramas
+    # (la cuenta que ya existia y la que se acaba de crear).
+    adoptados = await _adoptar_pedidos_de_invitado(user['id'])
     return {
         'token': create_token(user['id']),
         'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user.get('role', 'user')},
+        'adopted_orders': adoptados,
     }
 
 
@@ -668,9 +678,13 @@ async def verify_email(payload: TokenInput):
     if not user.get('email_verified'):
         await db.users.update_one({'id': user['id']}, {'$set': {'email_verified': True, 'verified_at': now_iso()}})
         asyncio.create_task(send_welcome_email(user['name'], user['email'], user.get('language')))
+    # ESTE es el momento en que el correo queda probado, y por eso es el unico
+    # momento en que se pueden adoptar las compras que hizo como invitado.
+    adoptados = await _adoptar_pedidos_de_invitado(user['id'])
     return {
         'token': create_token(user['id']),
         'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
+        'adopted_orders': adoptados,
     }
 
 
@@ -706,9 +720,13 @@ async def activate_account(payload: ActivateInput):
         'verified_at': now_iso(),
     }})
     asyncio.create_task(send_welcome_email(user['name'], user['email'], user.get('language')))
+    # Activar la invitacion confirma el correo (solo llega al buzon real), asi que
+    # aqui tambien se recogen las compras que haya hecho antes como invitado.
+    adoptados = await _adoptar_pedidos_de_invitado(user['id'])
     return {
         'token': create_token(user['id']),
         'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user.get('role', 'user')},
+        'adopted_orders': adoptados,
     }
 
 
@@ -910,12 +928,23 @@ TOPE_ENVIO_SOBRE_COMPRA = 0.10
 FREE_SHIPPING_FROM = int(SHIPPING_FLAT / TOPE_ENVIO_SOBRE_COMPRA)   # 250 / 10% = 2,500
 
 
+# ⛔ EL PEDIDO YA NO COBRA ENVIO (Christian, 2026-07-28). El envio se cotiza por
+# separado, fuera del checkout. La regla de arriba NO se borra: sigue viva, probada
+# y lista para el dia que se vuelva a cobrar — basta con poner esto en True. Se deja
+# como interruptor y no como codigo comentado porque un comentario se pudre: la
+# formula que deriva el umbral del costo real del envio seguiria sin vigilancia y
+# volveria a desalinearse en silencio, que es justo lo que paso el 2026-07-27.
+COBRAR_ENVIO = False
+
+
 def shipping_for(merchandise_paid):
-    """Cuanto se le cobra de envio a un pedido.
+    """Cuanto se le cobra de envio a un pedido, CUANDO se cobra.
 
     Se mide sobre lo que el cliente PAGA de mercancia (ya con descuento), no sobre
     el precio de lista: si no, un codigo grande dejaria el envio gratis cobrando
-    mucho menos. Primero el ROI."""
+    mucho menos. Primero el ROI.
+
+    OJO: hoy no la llama nadie para cobrar — ver COBRAR_ENVIO arriba."""
     return 0 if float(merchandise_paid or 0) >= FREE_SHIPPING_FROM else SHIPPING_FLAT
 
 
@@ -960,6 +989,111 @@ async def award_order_points(order):
         return
     await db.users.update_one({'id': order['user_id']}, {'$inc': {'points_balance': int(order['points_earned'])}})
     await _points_entry(order['user_id'], order, 'earn', order['points_earned'])
+
+
+async def _adoptar_pedidos_de_invitado(user_id: str) -> int:
+    """Pasa a esta cuenta los pedidos que la persona hizo COMO INVITADO.
+
+    Sin esto, quien compra sin cuenta y se registra después no ve nada de lo que ya
+    compró: ni en su historial, ni en sus puntos, ni para desbloquear herramientas.
+
+    ⛔ EL CANDADO: solo se adopta si la cuenta YA CONFIRMÓ ese correo. Adoptar por
+    correo a secas sería regalarle el historial de compras de cualquiera —su nombre,
+    su teléfono, su dirección y qué péptidos compró— al primero que se registre
+    tecleando el correo de otro. La confirmación es la única prueba que tenemos de
+    que ese buzón es suyo, así que esta función se llama SIEMPRE en el momento en
+    que el correo queda confirmado, nunca en el de registrarse.
+
+    Un pedido que YA tiene dueño no cambia de dueño jamás: la búsqueda exige
+    `user_id` nulo, y la toma se hace con esa misma condición dentro del update
+    para que dos confirmaciones a la vez no se lo peleen.
+
+    Idempotente por construcción: al adoptarlo el pedido deja de ser huérfano, así
+    que la segunda corrida no encuentra nada. Los puntos los deposita
+    `award_order_points`, que ya tiene su propio candado (`points_awarded`).
+    """
+    user = await db.users.find_one({'id': user_id}, {'_id': 0, 'password_hash': 0})
+    email = ((user or {}).get('email') or '').strip()
+    # `is not True` a propósito: las cuentas viejas sin el campo NO adoptan nada.
+    # Aquí, a diferencia del login, la duda se resuelve del lado seguro.
+    if not email or (user or {}).get('email_verified') is not True:
+        return 0
+    # Sin distinguir mayúsculas: el pedido guarda el correo tal como lo tecleó el
+    # invitado, y "Ana@X.com" es la misma persona que "ana@x.com".
+    huerfanos = await db.orders.find(
+        {'customer.email': {'$regex': f'^{re.escape(email)}$', '$options': 'i'},
+         'user_id': None},
+        {'_id': 0}).to_list(500)
+    adoptados = 0
+    for o in huerfanos:
+        tomado = await db.orders.update_one(
+            {'id': o['id'], 'user_id': None},
+            {'$set': {'user_id': user_id, 'adopted_at': now_iso(),
+                      'adopted_from_guest': True}})
+        if tomado.modified_count == 0:
+            continue                     # se lo llevó otra corrida: no es nuestro
+        adoptados += 1
+        # Los puntos se calculan AHORA, con las reglas de siempre: cuando se creó el
+        # pedido no había cuenta a la que abonar, así que nació en cero. Solo los
+        # pedidos PAGADOS los generan, igual que en una compra normal.
+        if o.get('status') in loyalty.PAID_STATUSES and not o.get('points_awarded'):
+            mercancia = float(o.get('total', 0) or 0) - float(o.get('shipping', 0) or 0)
+            ganados = loyalty.earn(mercancia, loyalty.eligible(user), o.get('discount_rate', 0))
+            if ganados > 0:
+                await db.orders.update_one({'id': o['id']}, {'$set': {'points_earned': ganados}})
+                fresco = await db.orders.find_one({'id': o['id']}, {'_id': 0})
+                await award_order_points(fresco)
+    return adoptados
+
+
+async def _recordar_datos_de_compra(user, customer):
+    """Guarda en el perfil los datos con los que este cliente acaba de comprar, para
+    no volver a pedírselos la próxima vez (Christian, 2026-07-28).
+
+    Solo dirección y teléfono. El NOMBRE de la cuenta NO se toca: en el checkout se
+    escribe el de quien RECIBE el paquete —un regalo, la oficina, un familiar— y con
+    eso no se le puede cambiar el nombre a la cuenta de nadie.
+    """
+    if not user:
+        return                      # invitado: no hay dónde guardarlo, y así se queda
+    update = {'shipping_address': {
+        'address': customer.address, 'address_2': customer.address_2,
+        'city': customer.city, 'state': customer.state,
+        'postal_code': customer.postal_code, 'country': customer.country,
+    }}
+    if (customer.phone or '').strip():
+        update['phone'] = customer.phone.strip()
+    await db.users.update_one({'id': user['id']}, {'$set': update})
+
+
+@api_router.get('/me/checkout')
+async def my_checkout_data(user=Depends(get_current_user)):
+    """Los datos con los que el checkout se pinta ya lleno para quien tiene sesión.
+
+    Va por sesión y SOLO por sesión: no recibe correo, ni id, ni SKU. Una ruta que
+    devuelva la dirección de alguien a partir de un dato que se puede teclear es una
+    lista de clientes servida en bandeja.
+    """
+    fresh = await db.users.find_one(
+        {'id': user['id']},
+        {'_id': 0, 'name': 1, 'email': 1, 'phone': 1, 'shipping_address': 1}) or {}
+    envio = fresh.get('shipping_address') or {}
+    return {
+        'full_name': fresh.get('name') or '',
+        'email': fresh.get('email') or '',
+        'phone': fresh.get('phone') or '',
+        'shipping_address': {
+            'address': envio.get('address') or '',
+            'address_2': envio.get('address_2') or '',
+            'city': envio.get('city') or '',
+            'state': envio.get('state') or '',
+            'postal_code': envio.get('postal_code') or '',
+            'country': envio.get('country') or 'MX',
+        },
+        # Para que el sitio sepa si debe avisar "usamos los datos de tu última
+        # compra": sin dirección guardada no hay nada que avisar.
+        'prefilled': bool(envio.get('address')),
+    }
 
 
 async def _descontar_inventario_vivo(product_id, doc, delta):
@@ -1238,8 +1372,9 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         balance = int((fresh or {}).get('points_balance', 0) or 0)
         points_used = loyalty.clamp_redeem(payload.points_to_use, balance, after_discount)
     paid_merchandise = after_discount - points_used
-    # El envio lo decide el SERVIDOR, no lo que mande el navegador.
-    shipping = shipping_for(paid_merchandise)
+    # El envio lo decide el SERVIDOR, no lo que mande el navegador. Y hoy decide
+    # que no se cobra: el envio se cotiza aparte (ver COBRAR_ENVIO).
+    shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0
     total = paid_merchandise + shipping
     # `discount_rate` es el descuento CONCEDIDO: con el máximo (40%) el pedido no
     # genera puntos. Ver la regla en loyalty.py.
@@ -1306,10 +1441,15 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         points_earned=points_earned,
         attribution=(payload.attribution.model_dump() if payload.attribution else {}),
         first_order=await _es_primera_compra(payload.customer.email),
+        # Se guarda lo que dice el navegador y NO se inventa una fecha cuando viene
+        # vacía: una constancia fabricada por el servidor no prueba nada.
+        terms_accepted_at=(payload.terms_accepted_at or '').strip()[:40],
     )
     await db.orders.insert_one(order.model_dump())
     # Ese carrito SI se cerro: su intento deja de estar pendiente y la IA ya no le escribe.
     asyncio.create_task(_cerrar_intentos(payload.customer.email))
+    # Con sesion iniciada, estos datos quedan como los suyos para la proxima compra.
+    await _recordar_datos_de_compra(user, payload.customer)
     if coupon and coupon.get('single_use', True):
         await db.discount_codes.update_one({'id': coupon['id']},
                                            {'$set': {'used': True, 'active': False, 'used_order': order.order_number}})
@@ -1413,11 +1553,16 @@ async def _confirm_paid_order(order_number: str):
 
 @api_router.get('/payments/config')
 async def payments_config():
-    """El checkout pregunta qué métodos están encendidos hoy, y desde cuánto va
-    gratis el envío (para que el carrito enseñe el mismo número que se cobra)."""
+    """El checkout pregunta qué métodos están encendidos hoy, y si el pedido cobra
+    envío (para que el carrito enseñe el mismo número que se cobra).
+
+    `shipping_charged` es la llave que manda: con ella apagada el sitio no pinta
+    ningún cargo de envío. Los otros dos números siguen viajando porque describen
+    la regla dormida, no lo que se cobra hoy."""
     return {'crypto_enabled': crypto_enabled(),
             'card_enabled': mercadopago.enabled(),
             'oxxo_enabled': mercadopago.enabled(),   # viaja por la misma pasarela
+            'shipping_charged': COBRAR_ENVIO,
             'shipping_flat': SHIPPING_FLAT,
             'free_shipping_from': FREE_SHIPPING_FROM}
 

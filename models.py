@@ -35,6 +35,10 @@ class ForgotPasswordInput(BaseModel):
 
 class AddressInput(BaseModel):
     address: str = ''
+    # Segunda línea: interior, departamento, entre calles, referencia. Va aparte
+    # porque metida en `address` la paquetería la imprime pegada al número y el
+    # repartidor no la lee. Opcional siempre.
+    address_2: str = ''
     city: str = ''
     state: str = ''
     postal_code: str = ''
@@ -184,6 +188,7 @@ class CustomerInfo(BaseModel):
     email: EmailStr
     phone: str
     address: str
+    address_2: str = ''   # interior / depto / referencia — opcional
     city: str = ''
     state: str = ''
     postal_code: str = ''
@@ -226,6 +231,11 @@ class OrderCreate(BaseModel):
     distributor_code: Optional[str] = None   # referido por un distribuidor (atribuye la venta)
     points_to_use: int = 0                   # puntos de lealtad a canjear; el servidor valida saldo
     attribution: Optional[Attribution] = None
+    # Cuándo aceptó el comprador el aviso 18+/RUO en la puerta del sitio (ISO).
+    # Antes se le volvía a pedir lo MISMO con una casilla en el checkout, y sin
+    # marcarla el botón de pagar parecía muerto; la casilla se quitó y quedó esto,
+    # que es lo único que aportaba: la constancia. Christian, 2026-07-28.
+    terms_accepted_at: str = ''
 
 
 class Order(BaseModel):
@@ -274,6 +284,9 @@ class Order(BaseModel):
     # el anuncio haya conseguido, y contarla abarata el costo artificialmente.
     attribution: dict = Field(default_factory=dict)
     first_order: bool = False
+    # Constancia de la aceptación 18+/RUO (ver OrderCreate). Los pedidos anteriores
+    # a esto no la traen y se leen igual de bien: por eso tiene default.
+    terms_accepted_at: str = ''
     created_at: str = Field(default_factory=now_iso)
 
 
