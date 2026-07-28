@@ -1679,6 +1679,44 @@ async def admin_stats(admin=Depends(get_current_admin)):
     }
 
 
+# ----------------- Admin: Motor de Precios -----------------
+# La foto resumida del motor, para verla en el Panel sin abrir una terminal.
+#
+# ⛔ ESTO NUNCA PUEDE SER PÚBLICO. Lleva el COSTO de cada producto, el nombre de cada
+# proveedor, el ROI y el margen. Nació como un archivo en `public/` del sitio y así
+# habría quedado servido en abierto en exygenlabs.com — cualquiera con el enlace veía
+# a cuánto compramos y a quién. Por eso vive aquí, detrás de sesión de admin, y por eso
+# el sitio ya NO lo lleva como archivo suelto.
+#
+# La foto la calcula la Mac de Christian (`pricing-system/publicar_dashboard_precios.py`)
+# porque la base del motor vive ahí, no en el servidor. El backend sólo la guarda y la
+# entrega; no la interpreta ni la recalcula.
+@api_router.get('/admin/motor-precios')
+async def admin_motor_precios(admin=Depends(get_current_admin)):
+    doc = await db.app_data.find_one({'clave': 'motor_precios'}, {'_id': 0})
+    if not doc:
+        raise HTTPException(
+            status_code=404,
+            detail='Todavía no se ha subido ninguna foto del motor de precios.')
+    return doc.get('valor') or {}
+
+
+@api_router.put('/admin/motor-precios')
+async def admin_motor_precios_guardar(payload: dict, admin=Depends(get_current_admin)):
+    """Recibe la foto tal cual y la guarda. No la valida a fondo a propósito: quien la
+    genera es el motor, y ponerle aquí una segunda opinión sobre su forma crea dos
+    verdades sobre el mismo dato — el error que la base del motor vino a matar."""
+    if not isinstance(payload, dict) or not payload.get('generado'):
+        raise HTTPException(status_code=400,
+                            detail='La foto viene sin fecha de generación.')
+    await db.app_data.update_one(
+        {'clave': 'motor_precios'},
+        {'$set': {'clave': 'motor_precios', 'valor': payload,
+                  'subido': datetime.now(timezone.utc).isoformat()}},
+        upsert=True)
+    return {'ok': True, 'generado': payload.get('generado')}
+
+
 # ----------------- Admin: Customers -----------------
 @api_router.get('/admin/customers')
 async def admin_customers(admin=Depends(get_current_admin)):
