@@ -1250,7 +1250,17 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # pesos al crear la orden; los reportes suman lo guardado.
     commissions = []
     commission = 0
-    if referrer:
+    # ⛔ SI LOS PUNTOS PAGARON TODA LA MERCANCÍA, NO HAY COMISIÓN NI PUNTOS NUEVOS.
+    # Regla de Christian (2026-07-28). El canje al 100% sí se permite —los puntos ya se
+    # ganaron y son suyos—, pero de un pedido donde no entró un peso por la mercancía no
+    # se puede pagar además una comisión sobre el precio completo: eso convierte cada
+    # canje en dinero que SALE. El barrido adversarial lo puso en números: 80 viales,
+    # $0 de ingreso, $187,180 de comisión y $74,896 de costo — $262,076 de pérdida en un
+    # solo pedido. Y tampoco se depositan puntos nuevos: si no pagaste, no acumulas.
+    pagado_todo_con_puntos = points_used > 0 and paid_merchandise <= 0
+    if pagado_todo_con_puntos:
+        points_earned = 0
+    if referrer and not pagado_todo_con_puntos:
         upline = await _upline_chain(referrer)
         # El reparto se calcula POR TOPE de producto: descuento + comisiones
         # nunca rebasan el tope (así la casa conserva su 5x).

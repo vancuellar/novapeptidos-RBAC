@@ -144,3 +144,23 @@ def test_el_descuento_de_inventario_avisa_cuando_no_encuentra_el_renglon():
     # y las dos direcciones —cobrar y cancelar— tienen que usar el MISMO resolvedor,
     # o cada ciclo de pedido+cancelación desbalancea el inventario.
     assert src.count('_descontar_inventario_vivo(') >= 3
+
+
+# ---------- Canje total de puntos ----------
+
+def test_si_los_puntos_pagan_todo_no_hay_comision_ni_puntos_nuevos():
+    """Regla de Christian (2026-07-28): el canje al 100% se permite, pero ese pedido no
+    paga comisión ni deposita puntos.
+
+    Los puntos ya se ganaron y son del cliente, así que puede gastarlos completos. Lo que
+    no puede pasar es que ADEMÁS salga una comisión calculada sobre el precio íntegro: en
+    un pedido donde no entró un peso por la mercancía, eso es dinero que sale. El barrido
+    adversarial lo puso en números: 80 viales, $0 de ingreso, $187,180 de comisión y
+    $74,896 de costo — $262,076 de pérdida en un solo pedido."""
+    src = _fuente()
+    assert 'pagado_todo_con_puntos' in src, 'no existe la regla del canje total'
+    m = re.search(r"pagado_todo_con_puntos = .*?\n(.*?)\n    if referrer", src, re.S)
+    assert m, 'no encontré dónde se aplica'
+    assert 'points_earned = 0' in m.group(0), 'sigue depositando puntos'
+    assert 'if referrer and not pagado_todo_con_puntos:' in src, (
+        'la comisión se sigue pagando aunque los puntos hayan cubierto todo')
