@@ -962,6 +962,30 @@ async def award_order_points(order):
     await _points_entry(order['user_id'], order, 'earn', order['points_earned'])
 
 
+async def _descontar_inventario_vivo(product_id, doc, delta):
+    """Mueve el inventario VIVO (`db.stock`) de UNA presentación. Devuelve si acertó.
+
+    La llave de `db.stock` es `<slug>::<presentación>` (así la escribe el Panel), pero el
+    carrito manda a veces el id, a veces un UUID y a veces el SKU. Cuando no coincidía,
+    `update_one` no encontraba el documento y devolvía "0 modificados" sin quejarse: el
+    pedido salía, el inventario vivo se quedaba igual, y el siguiente cliente compraba
+    algo que ya no existe. Se prueban las llaves conocidas y, si ninguna existe, se avisa
+    — porque el silencio aquí se ve exactamente igual que el éxito."""
+    candidatas = [product_id]
+    if doc:
+        for k in ('sku', 'id'):
+            if doc.get(k) and doc[k] not in candidatas:
+                candidatas.append(doc[k])
+    for llave in candidatas:
+        r = await db.stock.update_one({'key': llave}, {'$inc': {'qty': delta}})
+        if r.matched_count:
+            return True
+    logger.warning('INVENTARIO VIVO SIN DESCONTAR: no hay renglón en db.stock para %s '
+                   '(probé %s). El pedido salió y las piezas no bajaron.',
+                   product_id, candidatas)
+    return False
+
+
 async def restore_order_stock(order):
     """Devuelve al inventario lo que la orden se habia llevado. Se llama al
     CANCELAR y al BORRAR: antes el stock se descontaba y nunca regresaba, asi que
@@ -974,7 +998,12 @@ async def restore_order_stock(order):
             continue
         await db.products.update_one({'$or': [{'id': pid}, {'sku': pid}]},
                                      {'$inc': {'stock': qty}})
-        await db.stock.update_one({'key': pid}, {'$inc': {'qty': qty}})
+        # La devolución usa el MISMO resolvedor de llaves que el descuento. Si cada lado
+        # busca de una forma distinta, el inventario se desbalancea con cada cancelación
+        # — ya pasó una vez y dejó Orexin A en 43 cuando tenía 40.
+        doc = await db.products.find_one({'$or': [{'id': pid}, {'sku': pid}]},
+                                         {'_id': 0, 'id': 1, 'sku': 1})
+        await _descontar_inventario_vivo(pid, doc, qty)
     await db.orders.update_one({'id': order['id']}, {'$set': {'stock_restored': True}})
 
 
@@ -1121,16 +1150,28 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # NO se vende lo que no hay. El servidor descontaba el stock sin revisarlo, asi
     # que un pedido de 99,999 piezas pasaba y dejaba el inventario en negativo
     # (encontrado en la auditoria del 2026-07-25). Se valida contra el catalogo real.
+    #
+    # ⚠️ SE SUMAN LOS RENGLONES DEL MISMO PRODUCTO ANTES DE COMPARAR. Revisar renglón
+    # por renglón no sirve de nada: el carrito puede mandar el MISMO producto dos veces,
+    # cada renglón pasa por su cuenta (40 ≤ 40, y otra vez 40 ≤ 40) y salen 80 piezas de
+    # las 40 que hay. Repitiendo renglones no hay tope: el pedido crece sin límite y el
+    # inventario queda en negativo. Lo encontró el barrido adversarial del 28-jul, y es
+    # el mismo agujero que se creyó cerrado el 25-jul — entonces se tapó el "pediste
+    # 99,999", no el "pediste 40 dos veces".
     faltantes = []
+    pedido_por_producto = {}
     for it in payload.items:
         if it.quantity is None or it.quantity < 1:
             raise HTTPException(status_code=400, detail=f'Cantidad invalida en {it.name}')
-        d = _pflags.get(it.product_id)
+        pedido_por_producto.setdefault(it.product_id, {'total': 0, 'nombre': it.name})
+        pedido_por_producto[it.product_id]['total'] += int(it.quantity)
+    for pid, acum in pedido_por_producto.items():
+        d = _pflags.get(pid)
         if not d:
             continue          # producto que no resolvimos: no inventamos un limite
         hay = int(d.get('stock') or 0)
-        if it.quantity > hay:
-            faltantes.append(f'{it.name}: pediste {it.quantity} y hay {hay}')
+        if acum['total'] > hay:
+            faltantes.append(f"{acum['nombre']}: pediste {acum['total']} y hay {hay}")
     if faltantes:
         raise HTTPException(status_code=409,
                             detail='No tenemos suficiente de: ' + '; '.join(faltantes))
@@ -1282,8 +1323,14 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         # tres pedidos borrados dejaron Orexin A en 43 cuando tenía 40.
         await db.products.update_one({'$or': [{'id': item.product_id}, {'sku': item.product_id}]},
                                      {'$inc': {'stock': -item.quantity}})
-        # Inventario vivo por presentacion (key = product_id del carrito, ya incluye ::presentacion)
-        await db.stock.update_one({'key': item.product_id}, {'$inc': {'qty': -item.quantity}})
+        # Inventario vivo por presentacion. La llave NO siempre es el product_id: en el
+        # catálogo de respaldo sí (`fallback-orexin-a::10 mg`), pero cuando el producto
+        # viene del backend el carrito manda un UUID o el SKU y entonces esta línea NO
+        # ENCONTRABA NADA — descontaba cero, en silencio, y el inventario vivo nunca
+        # bajaba. Ahora se prueban las tres llaves y, si ninguna existe, se GRITA en el
+        # log: un descuento que no ocurre y no avisa es cómo se vende lo que ya no hay.
+        await _descontar_inventario_vivo(item.product_id, _pflags.get(item.product_id),
+                                         -item.quantity)
     # Confirmacion por correo, en segundo plano: la compra no debe quedarse
     # esperando al proveedor de correo ni fallar si esta caido.
     email_order = order.model_dump()

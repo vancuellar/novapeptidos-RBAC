@@ -106,3 +106,41 @@ def test_solo_acepta_tres_decisiones():
     cuerpo = re.search(r"async def admin_motor_decidir\(.*?\n(?=@|\Z)", _fuente(), re.S).group(0)
     assert "('aprobado', 'descartado', 'pendiente')" in cuerpo
     assert 'status_code=400' in cuerpo
+
+
+# ---------- El pedido: renglones repetidos del mismo producto ----------
+
+def test_el_inventario_se_valida_SUMANDO_los_renglones_del_mismo_producto():
+    """Pedir 40 dos veces son 80, no 40 y 40.
+
+    El carrito puede mandar el MISMO producto en varios renglones. Revisando renglón por
+    renglón cada uno pasa por su cuenta y el pedido se lleva el doble —o el triple— de lo
+    que hay: el inventario queda en negativo y la pérdida no tiene tope, porque siempre se
+    puede añadir otro renglón. Lo encontró el barrido adversarial del 28-jul, y es el
+    MISMO hueco que se creyó cerrado el 25-jul: entonces se tapó el "pediste 99,999", no
+    el "pediste 40 dos veces"."""
+    src = _fuente()
+    m = re.search(r"faltantes = \[\].*?status_code=409", src, re.S)
+    assert m, 'no encontré la validación de inventario del checkout'
+    cuerpo = m.group(0)
+    assert 'pedido_por_producto' in cuerpo, (
+        'el checkout sigue validando renglón por renglón: dos renglones del mismo '
+        'producto se llevan el doble del inventario')
+    assert "+= int(it.quantity)" in cuerpo, 'no está sumando las cantidades'
+
+
+def test_el_descuento_de_inventario_avisa_cuando_no_encuentra_el_renglon():
+    """Un descuento que no ocurre y no avisa se ve igual que uno que sí ocurrió.
+
+    La llave de `db.stock` es `<slug>::<presentación>`, pero el carrito manda a veces un
+    UUID y a veces el SKU. Cuando no coincidía, `update_one` devolvía cero modificados sin
+    quejarse: el pedido salía y las piezas nunca bajaban."""
+    src = _fuente()
+    assert 'async def _descontar_inventario_vivo(' in src
+    m = re.search(r"async def _descontar_inventario_vivo\(.*?\n(?=async def|\Z)", src, re.S)
+    cuerpo = m.group(0)
+    assert 'matched_count' in cuerpo, 'no comprueba si de verdad encontró el renglón'
+    assert 'logger.warning' in cuerpo, 'falla en silencio'
+    # y las dos direcciones —cobrar y cancelar— tienen que usar el MISMO resolvedor,
+    # o cada ciclo de pedido+cancelación desbalancea el inventario.
+    assert src.count('_descontar_inventario_vivo(') >= 3
