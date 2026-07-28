@@ -1717,6 +1717,59 @@ async def admin_motor_precios_guardar(payload: dict, admin=Depends(get_current_a
     return {'ok': True, 'generado': payload.get('generado')}
 
 
+# Lo que Christian decide sobre los productos que le ofrecen y no vende.
+#
+# El botón NO publica nada. Guarda la decisión, y la Mac la aplica después pasando el
+# producto por el motor de precios como cualquier otro. Es a propósito: el precio lo pone
+# la fórmula (costo, competencia, piso de 5×), y un alta desde una pantalla se saltaría
+# todo eso — que es exactamente como se acaba vendiendo algo por debajo del costo.
+@api_router.get('/admin/motor-precios/decisiones')
+async def admin_motor_decisiones(admin=Depends(get_current_admin)):
+    doc = await db.app_data.find_one({'clave': 'motor_decisiones'}, {'_id': 0})
+    return (doc or {}).get('valor') or {}
+
+
+@api_router.put('/admin/motor-precios/decisiones/{llave}')
+async def admin_motor_decidir(llave: str, payload: dict,
+                              admin=Depends(get_current_admin)):
+    """Aprueba o descarta UN producto de la lista de oportunidades.
+
+    El veto se comprueba AQUÍ además de en la pantalla. La lista que ve el Panel ya viene
+    filtrada, pero un botón no es una compuerta: cualquiera con sesión de admin puede
+    llamar a esta ruta a mano, y lo que está en juego es dar de alta un esteroide
+    anabólico o un medicamento regulado. Un control que sólo vive en el navegador no es
+    un control."""
+    decision = str((payload or {}).get('decision') or '').strip().lower()
+    if decision not in ('aprobado', 'descartado', 'pendiente'):
+        raise HTTPException(status_code=400,
+                            detail='La decisión sólo puede ser aprobado, descartado o pendiente.')
+    if decision == 'aprobado':
+        foto = await db.app_data.find_one({'clave': 'motor_precios'}, {'_id': 0})
+        vetados = {str(x).lower() for x in
+                   (((foto or {}).get('valor') or {}).get('oportunidades') or {}).get('vetados', [])}
+        if llave.lower() in vetados:
+            raise HTTPException(
+                status_code=409,
+                detail='Ese producto está vetado (sustancia controlada o insumo): '
+                       'no se puede dar de alta desde aquí.')
+    doc = await db.app_data.find_one({'clave': 'motor_decisiones'}, {'_id': 0})
+    valor = (doc or {}).get('valor') or {}
+    if decision == 'pendiente':
+        valor.pop(llave, None)
+    else:
+        valor[llave] = {
+            'decision': decision,
+            'nota': str((payload or {}).get('nota') or '')[:400],
+            'quien': admin.get('email') or admin.get('id'),
+            'cuando': datetime.now(timezone.utc).isoformat(),
+            'aplicado': False,
+        }
+    await db.app_data.update_one({'clave': 'motor_decisiones'},
+                                 {'$set': {'clave': 'motor_decisiones', 'valor': valor}},
+                                 upsert=True)
+    return {'ok': True, 'llave': llave, 'decision': decision}
+
+
 # ----------------- Admin: Customers -----------------
 @api_router.get('/admin/customers')
 async def admin_customers(admin=Depends(get_current_admin)):

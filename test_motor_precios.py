@@ -70,3 +70,39 @@ def test_no_guarda_una_foto_sin_fecha():
     assert m, 'no encontré el guardado'
     assert "payload.get('generado')" in m.group(0)
     assert 'status_code=400' in m.group(0)
+
+
+# ---------- Aprobar un producto desde el Panel ----------
+
+def test_aprobar_y_leer_decisiones_exigen_admin():
+    """Aprobar un producto es dar de alta mercancía. No basta con estar logueado."""
+    src = _fuente()
+    for patron in (r"@api_router\.get\('/admin/motor-precios/decisiones'\)",
+                   r"@api_router\.put\('/admin/motor-precios/decisiones/\{llave\}'\)"):
+        m = re.search(patron + r"\s*\nasync def \w+\([^)]*\)", _fuente(), re.S)
+        assert m, f'no encontré la ruta {patron}'
+        assert 'get_current_admin' in m.group(0), m.group(0)
+    assert 'motor_decisiones' in src
+
+
+def test_un_producto_vetado_no_se_puede_aprobar():
+    """El veto se comprueba EN EL SERVIDOR, no sólo en la pantalla.
+
+    La lista del Panel ya viene filtrada, pero un botón no es una compuerta: cualquiera
+    con sesión de admin puede llamar a la ruta a mano. Y lo que está en juego no es un
+    renglón feo — la lista de Lumi trae testosterona, winstrol y trembolona."""
+    m = re.search(r"async def admin_motor_decidir\(.*?\n(?=@|\Z)", _fuente(), re.S)
+    assert m, 'no encontré el guardado de decisiones'
+    cuerpo = m.group(0)
+    assert "'vetados'" in cuerpo or '"vetados"' in cuerpo, (
+        'no consulta la lista de vetados de la foto')
+    assert 'status_code=409' in cuerpo, 'no rechaza un producto vetado'
+    assert "decision == 'aprobado'" in cuerpo
+
+
+def test_solo_acepta_tres_decisiones():
+    """aprobado / descartado / pendiente. Cualquier otra cosa se rechaza: un valor libre
+    aquí acaba siendo un estado que ningún script sabe interpretar."""
+    cuerpo = re.search(r"async def admin_motor_decidir\(.*?\n(?=@|\Z)", _fuente(), re.S).group(0)
+    assert "('aprobado', 'descartado', 'pendiente')" in cuerpo
+    assert 'status_code=400' in cuerpo
