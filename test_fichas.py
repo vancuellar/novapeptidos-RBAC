@@ -4,9 +4,13 @@ Lo que importa aquí no es que la descarga funcione, sino que NO funcione cuando
 no debe: el slug viene del navegador y el token lo puede manipular cualquiera.
 """
 import importlib
+import os
 import time
 
 import pytest
+
+os.environ.setdefault('MONGO_URL', 'mongodb://localhost:27017')
+os.environ.setdefault('DB_NAME', 'exygen_test')
 
 
 @pytest.fixture()
@@ -110,3 +114,32 @@ def test_otro_secreto_invalida_el_token(store, monkeypatch, tmp_path):
     import ficha_store
     otro = importlib.reload(ficha_store)
     assert otro.validar_enlace(t) is None
+
+
+# ------------------------------------------- quién ve el catálogo completo
+# Christian, 2026-07-29: el distribuidor vende todo el catálogo y necesita la
+# ficha ANTES de que exista el pedido. Lo que no puede pasar es que esa puerta
+# se le abra a un cliente normal.
+
+def test_el_distribuidor_ve_todas_las_fichas():
+    from server import _ve_el_catalogo_completo
+    assert _ve_el_catalogo_completo({'role': 'distributor'})
+
+
+def test_el_admin_tambien():
+    from server import _ve_el_catalogo_completo
+    assert _ve_el_catalogo_completo({'role': 'admin'})
+
+
+@pytest.mark.parametrize('quien', [
+    {'role': 'user'},
+    {'role': 'client'},
+    {'role': ''},
+    {'role': None},
+    {},
+    {'role': 'Distributor'},   # el rol se compara exacto, no sin mayúsculas
+    {'role': 'distribuidor'},  # el rol real está en inglés
+])
+def test_un_cliente_solo_ve_lo_que_compro(quien):
+    from server import _ve_el_catalogo_completo
+    assert not _ve_el_catalogo_completo(quien)
