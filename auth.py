@@ -106,3 +106,16 @@ async def get_current_distributor(user=Depends(get_current_user)):
     if user.get('role') not in ('distributor', 'admin'):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail='Acceso solo para distribuidores')
     return user
+
+
+async def get_current_marketing(user=Depends(get_current_user)):
+    """Rol 'marketing' (quien lleva los anuncios, p. ej. María): SOLO difusión.
+
+    Las únicas rutas que cuelgan de aquí son embudo, marketing y Meta. Todo lo
+    demás (pedidos, clientes, stock, cobros, precios, distribuidores) sigue
+    exigiendo `get_current_admin`, así que este rol recibe 403 aunque le pegue
+    a la API directo. El admin pasa por aquí también: él entra a todo."""
+    if user.get('role') not in ('marketing', 'admin'):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail='Acceso solo para administradores o marketing')
+    return user

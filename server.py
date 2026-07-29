@@ -27,6 +27,7 @@ from models import (
 from auth import (
     hash_password, verify_password, create_token, create_view_as_token, deny_view_as,
     get_current_user, get_optional_user, get_current_admin, get_current_distributor,
+    get_current_marketing,
 )
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
 import coa_store
@@ -2305,10 +2306,116 @@ async def download_spei_receipt(order_id: str, admin=Depends(get_current_admin))
 
 # ----------------- Admin: Orders -----------------
 @api_router.get('/admin/orders')
-async def admin_orders(admin=Depends(get_current_admin)):
-    orders = await db.orders.find({}, {'_id': 0}).to_list(500)
+async def admin_orders(archivados: bool = False, admin=Depends(get_current_admin)):
+    """Los pedidos. Por omisión SIN los archivados; con `?archivados=true`, sólo esos.
+
+    Archivar no borra: sólo los quita de la vista de todos los días. Los pedidos viejos
+    y las pruebas ensucian la lista, pero borrarlos es irreversible y a veces hay que
+    volver a mirarlos."""
+    filtro = {'archived': True} if archivados else {'archived': {'$ne': True}}
+    orders = await db.orders.find(filtro, {'_id': 0}).to_list(500)
     orders.sort(key=lambda o: o.get('created_at', ''), reverse=True)
     return orders
+
+
+# Estados en los que el cliente YA PAGÓ. Un pedido así no se borra en masa por
+# accidente: es una venta real, con dinero que entró y contabilidad detrás.
+ESTADOS_PAGADOS = ('confirmado', 'enviado', 'entregado')
+
+
+def esta_pagado(order):
+    """¿Entró el dinero de este pedido?
+
+    ⛔ PAGADO Y ENTREGADO SON COSAS DISTINTAS (Christián, 2026-07-29). El `status`
+    cuenta el viaje de la mercancía; el dinero lo cuenta `paid`. Se separaron porque
+    Christián entrega en persona y a veces cobra después: la venta de Alanís salió
+    ENTREGADA y SIN PAGAR, y el tablero la sumaba como ingreso.
+
+    Los pedidos viejos no tienen el campo, así que para ellos se sigue infiriendo del
+    estado — así ningún reporte histórico cambia de golpe y no hace falta una
+    migración que toque la base de producción. Sólo cuando alguien marca el pago a
+    mano (o lo confirma una pasarela) el campo manda sobre el estado.
+    """
+    if order.get('status') == 'cancelado':
+        return False
+    if 'paid' in order:
+        return bool(order['paid'])
+    return order.get('status') in ESTADOS_PAGADOS
+
+
+class MarcaDePago(BaseModel):
+    pagado: bool
+
+
+@api_router.put('/admin/orders/{order_id}/pago')
+async def admin_marcar_pago(order_id: str, payload: MarcaDePago,
+                            admin=Depends(get_current_admin)):
+    """Marca un pedido como PAGADO o como no pagado, sin tocar el estado de entrega."""
+    order = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    cambio = {'paid': payload.pagado,
+              'paid_at': datetime.now(timezone.utc).isoformat() if payload.pagado else None}
+    await db.orders.update_one({'id': order_id}, {'$set': cambio})
+    logger.info('Admin %s marcó el pedido %s como %s', admin.get('email'),
+                order.get('order_number'), 'PAGADO' if payload.pagado else 'NO pagado')
+    return {'order_number': order.get('order_number'), **cambio}
+
+
+class LoteDePedidos(BaseModel):
+    ids: list[str]
+    accion: str                      # 'borrar' | 'archivar' | 'desarchivar'
+    forzar: bool = False             # sólo para borrar algo ya pagado
+
+
+@api_router.post('/admin/orders/lote')
+async def admin_orders_lote(payload: LoteDePedidos, admin=Depends(get_current_admin)):
+    """Archiva, desarchiva o BORRA varios pedidos de un golpe.
+
+    ⛔ EL CANDADO QUE IMPORTA: `borrar` se NIEGA a tocar un pedido ya pagado
+    (confirmado/enviado/entregado) a menos que venga `forzar`. La lista del Panel tiene
+    'seleccionar todo', y entre doce pedidos de prueba vive UNA venta real —
+    la de Paz Cambray. Un clic distraído en 'seleccionar todo' + 'borrar' se la llevaba
+    junto con la basura, sin deshacer. (Christián, 2026-07-29)
+
+    Borrar usa exactamente el mismo camino que el borrado de uno solo: devuelve los
+    puntos que la orden depositó o canjeó, regresa las piezas al inventario y limpia su
+    bitácora de puntos. No es un `delete_many` a secas — eso dejaría puntos regalados y
+    el inventario corto.
+    """
+    if payload.accion not in ('borrar', 'archivar', 'desarchivar'):
+        raise HTTPException(status_code=400, detail='Acción desconocida')
+    if not payload.ids:
+        raise HTTPException(status_code=400, detail='No mandaste ningún pedido')
+
+    hechos, protegidos, faltantes = [], [], []
+    for oid in payload.ids:
+        order = await db.orders.find_one({'id': oid}, {'_id': 0})
+        if not order:
+            faltantes.append(oid)
+            continue
+        if payload.accion == 'borrar':
+            if order.get('status') in ESTADOS_PAGADOS and not payload.forzar:
+                protegidos.append({'order_number': order.get('order_number'),
+                                   'status': order.get('status'),
+                                   'cliente': (order.get('customer') or {}).get('full_name', ''),
+                                   'total': order.get('total', 0)})
+                continue
+            if order.get('status') != 'cancelado':
+                await revoke_order_points(order)
+            await restore_order_stock(order)
+            await db.orders.delete_one({'id': oid})
+            await db.points.delete_many({'order_id': oid})
+            logger.warning('Admin %s BORRÓ EN LOTE el pedido %s (%s, $%s)',
+                           admin.get('email'), order.get('order_number'),
+                           (order.get('customer') or {}).get('full_name'), order.get('total'))
+        else:
+            await db.orders.update_one(
+                {'id': oid}, {'$set': {'archived': payload.accion == 'archivar'}})
+        hechos.append(order.get('order_number'))
+
+    return {'accion': payload.accion, 'hechos': len(hechos), 'numeros': hechos,
+            'protegidos': protegidos, 'no_encontrados': faltantes}
 
 
 @api_router.put('/admin/orders/{order_id}/status')
@@ -2416,14 +2523,20 @@ async def admin_stats(admin=Depends(get_current_admin)):
     total_products = await db.products.count_documents({})
     total_orders = await db.orders.count_documents({})
     total_users = await db.users.count_documents({'role': 'user'})
-    orders = await db.orders.find({}, {'_id': 0, 'total': 1, 'status': 1}).to_list(1000)
-    revenue = sum(o.get('total', 0) for o in orders if o.get('status') != 'cancelado')
+    orders = await db.orders.find({}, {'_id': 0, 'total': 1, 'status': 1, 'paid': 1}).to_list(1000)
+    # El ingreso son los pedidos COBRADOS, no los entregados: ver `esta_pagado`.
+    revenue = sum(o.get('total', 0) for o in orders if esta_pagado(o))
+    por_cobrar = sum(o.get('total', 0) for o in orders
+                     if o.get('status') != 'cancelado' and not esta_pagado(o))
     pending = sum(1 for o in orders if o.get('status') == 'pendiente')
     return {
         'total_products': total_products,
         'total_orders': total_orders,
         'total_users': total_users,
         'revenue': revenue,
+        # Entregado o en camino pero SIN cobrar. Sin este número, un pedido fiado
+        # desaparece del tablero: ni suma en ingresos ni aparece en ningún lado.
+        'por_cobrar': por_cobrar,
         'pending_orders': pending,
     }
 
@@ -4093,10 +4206,18 @@ TUTORIAL_DIST_ONLY = {
     'tutorial-4-pedidos-y-ventas.mp4',
     'tutorial-5-novedades.mp4',
 }
+# El video de métricas de difusión enseña ventas, gastos de anuncios e ingresos
+# internos: SOLO admin, ni clientes ni distribuidores.
+TUTORIAL_ADMIN_ONLY = {
+    'tutorial-12-metricas-difusion.mp4',
+}
 
 
 def tutorial_allowed(filename: str, role: str) -> bool:
-    """Un cliente solo ve videos de cliente; distribuidor/admin ven todo."""
+    """Un cliente solo ve videos de cliente; distribuidor/admin ven todo.
+    Los videos internos del negocio son únicamente para admin."""
+    if filename in TUTORIAL_ADMIN_ONLY:
+        return role == 'admin'
     if filename in TUTORIAL_DIST_ONLY:
         return role in ('distributor', 'admin')
     return True
@@ -4441,7 +4562,7 @@ class MetaCsv(BaseModel):
 
 
 @api_router.post('/admin/meta/import')
-async def admin_meta_import(payload: MetaCsv, admin=Depends(get_current_admin)):
+async def admin_meta_import(payload: MetaCsv, admin=Depends(get_current_marketing)):
     """Sube el CSV del Administrador de Anuncios. Reemplaza la foto anterior:
     el CSV de Meta ya trae el acumulado, no hay que ir sumando."""
     rows = meta_ads.parse_csv(payload.csv or '')
@@ -4514,7 +4635,7 @@ def _iso_de(ts):
 
 
 @api_router.get('/admin/meta/dashboard')
-async def admin_meta_dashboard(days: int = 30, admin=Depends(get_current_admin)):
+async def admin_meta_dashboard(days: int = 30, admin=Depends(get_current_marketing)):
     """Lo que Meta gastó, cruzado con lo que el sitio de verdad vendió.
 
     Fuente EN VIVO si hay token de Meta; si no, el último CSV subido. La salida es
@@ -4630,7 +4751,7 @@ async def _ventas_por_cupon(desde: str):
 
 
 @api_router.get('/admin/marketing/resumen')
-async def admin_marketing_resumen(days: int = 30, admin=Depends(get_current_admin)):
+async def admin_marketing_resumen(days: int = 30, admin=Depends(get_current_marketing)):
     """Costo por cliente CON COMPRA HECHA, campaña por campaña.
 
     Es lo que Christian pidió: no "cuánto costó un clic" sino cuánto costó cada
@@ -4659,7 +4780,7 @@ async def admin_marketing_resumen(days: int = 30, admin=Depends(get_current_admi
 
 @api_router.get('/admin/marketing/campana/{campaign_id}')
 async def admin_marketing_campana(campaign_id: str, days: int = 30,
-                                  admin=Depends(get_current_admin)):
+                                  admin=Depends(get_current_marketing)):
     """La radiografía de UNA campaña: día a día, anuncio por anuncio, y a quién
     se le mostró. Todo del mismo token; no hace falta ningún permiso nuevo."""
     filas, estado = await _meta_filas(days)
@@ -4717,7 +4838,7 @@ class DirectorPedido(BaseModel):
 
 
 @api_router.post('/admin/marketing/director')
-async def admin_marketing_director(payload: DirectorPedido, admin=Depends(get_current_admin)):
+async def admin_marketing_director(payload: DirectorPedido, admin=Depends(get_current_marketing)):
     """Modo "director de marketing": arma una campaña nueva desde cero.
 
     La IA NO inventa los datos: `director.briefing()` arma los hechos desde la
@@ -4861,7 +4982,7 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
 
 
 @api_router.get('/admin/funnel')
-async def admin_funnel(days: int = 30, admin=Depends(get_current_admin)):
+async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
     """Embudo + origen del trafico. Responde: llega gente? compra? de donde viene?"""
     desde = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat()
     evs = await db.events.find({'created_at': {'$gte': desde}}, {'_id': 0}).to_list(50000)
@@ -4945,7 +5066,12 @@ async def admin_create_order(payload: ManualOrderCreate, admin=Depends(get_curre
         raise HTTPException(status_code=404, detail='Cliente no encontrado')
     if payload.status not in ('pendiente', 'confirmado', 'enviado', 'entregado'):
         raise HTTPException(status_code=400, detail='Estado no válido')
-    rate = max(0.0, min(0.60, payload.discount_rate))
+    # ⛔ EL TECHO ES 40%, NO 60%. Este `min` estaba en 0.60 y dejaba que una venta
+    # directa regalara hasta 60% cuando el máximo de la casa es 40%
+    # (`loyalty.MAX_DISCOUNT`), que es el que sí respeta el checkout público. En un
+    # pedido de $374,360 la diferencia son **$74,872** que salen de más.
+    # Lo cazó el auditor de Codex el 2026-07-29.
+    rate = max(0.0, min(loyalty.MAX_DISCOUNT, payload.discount_rate))
     # ⛔ EL PRECIO LO PONE EL SERVIDOR, TAMBIÉN AQUÍ.
     # El checkout público ya se blindó el 2026-07-27 (`create_order` retasa cada renglón
     # contra el catálogo), pero la VENTA DIRECTA se quedó fuera: sumaba `i.price` tal cual
@@ -4957,7 +5083,8 @@ async def admin_create_order(payload: ManualOrderCreate, admin=Depends(get_curre
     _claves = [i.product_id for i in payload.items]
     _docs = await db.products.find(
         {'$or': [{'id': {'$in': _claves}}, {'sku': {'$in': _claves}}]},
-        {'_id': 0, 'id': 1, 'sku': 1, 'price': 1, 'slug': 1, 'presentation': 1}
+        {'_id': 0, 'id': 1, 'sku': 1, 'price': 1, 'slug': 1, 'presentation': 1,
+         'commission_cap': 1, 'category': 1}
     ).to_list(500)
     _catalogo = {}
     for d in _docs:
@@ -4981,7 +5108,19 @@ async def admin_create_order(payload: ManualOrderCreate, admin=Depends(get_curre
                            'mandaron %s, vale %s', i.product_id, i.price, real)
         i.price = float(real)
     subtotal = sum(i.price * i.quantity for i in payload.items)
-    discount = round(subtotal * rate)
+    # ⛔ Y EL TOPE POR PRODUCTO TAMBIÉN APLICA AQUÍ. El descuento se calculaba sobre el
+    # subtotal completo, plano, ignorando que cada producto tiene su propio techo
+    # (`commission_cap`) — el que protege el 5× de la casa. El checkout público sí lo
+    # respeta renglón por renglón (`_disc_of`); la venta directa no, así que por aquí se
+    # podía regalar más de lo que el ROI aguanta en los productos de margen apretado.
+    # Los insumos (agua bacteriostática, jeringas) nunca llevan descuento.
+    discount = 0
+    for i in payload.items:
+        d = _catalogo.get(i.product_id) or {}
+        if (d.get('category') or '') in NO_DISCOUNT_CATEGORIES:
+            continue
+        tope = max(0.0, min(0.50, float(d.get('commission_cap', 0.50) or 0.50)))
+        discount += round(i.price * i.quantity * min(rate, tope))
     total = subtotal - discount
     # La venta directa es justo donde se da el 40%: con ese descuento no hay puntos.
     points_earned = loyalty.earn(total, loyalty.eligible(u), rate)

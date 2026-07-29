@@ -888,6 +888,15 @@ def test_tutorial_videos_role_gating():
         assert tutorial_allowed(client_video, role)        # lo de cliente lo ven todos
 
 
+def test_tutorial_video_admin_only():
+    # El video de metricas de difusion trae ventas y gastos internos:
+    # unicamente el admin puede pedirlo, ni el distribuidor adivinando la URL.
+    admin_video = 'tutorial-12-metricas-difusion.mp4'
+    assert not tutorial_allowed(admin_video, 'client')
+    assert not tutorial_allowed(admin_video, 'distributor')
+    assert tutorial_allowed(admin_video, 'admin')
+
+
 def test_parse_range_header_variants():
     assert parse_range_header('bytes=0-99', 1000) == (0, 99)
     assert parse_range_header('bytes=200-', 1000) == (200, 999)     # abierto al final

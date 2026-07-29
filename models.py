@@ -265,6 +265,14 @@ class Order(BaseModel):
     shipping: float
     total: float
     status: str = 'pendiente'   # pendiente | confirmado | enviado | entregado | cancelado
+    # ⛔ PAGADO ES OTRA COSA QUE ENTREGADO (Christián, 2026-07-29).
+    # El estado de arriba cuenta el viaje de la MERCANCÍA; éste cuenta si entró el
+    # DINERO. Se separaron porque Christián entrega en persona y a veces cobra
+    # después: la venta de Alanís salió entregada y sin pagar, y el tablero la
+    # contaba como ingreso. Un reporte que dice que cobraste lo que no cobraste es
+    # peor que no tener reporte.
+    paid: bool = False
+    paid_at: Optional[str] = None
     referred_by: Optional[str] = None   # id del distribuidor cuyo código se usó (si aplica)
     commission: float = 0               # tajada del VENDEDOR en esta orden (MXN) — compat
     # Pirámide: reparto completo bloqueado al crear la orden. Cada fila es

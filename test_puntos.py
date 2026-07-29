@@ -61,6 +61,18 @@ class FakeCol:
                 return dict(d)
         return None
 
+    async def delete_one(self, filtro):
+        for i, d in enumerate(self.docs):
+            if _match(d, filtro):
+                self.docs.pop(i)
+                return _Res(1)
+        return _Res(0)
+
+    async def delete_many(self, filtro):
+        antes = len(self.docs)
+        self.docs = [d for d in self.docs if not _match(d, filtro)]
+        return _Res(antes - len(self.docs))
+
     async def update_one(self, filtro, cambio, upsert=False):
         for d in self.docs:
             if _match(d, filtro):
@@ -236,3 +248,108 @@ def test_el_checkout_prorratea_cuando_hay_puntos():
     cuerpo = src.split('pagado_todo_con_puntos = ')[1].split('order = Order(')[0]
     assert 'prorratear_por_dinero(' in cuerpo
     assert cuerpo.index('prorratear_por_dinero(') < cuerpo.index('seller_amount(')
+
+
+# ---------- Borrado y archivado EN LOTE (Christián, 2026-07-29) ----------
+# Christián quería limpiar los 12 pedidos de prueba de un golpe. El riesgo real no es
+# borrar de más: es que entre esos 12 vive UNA venta de verdad (Paz Cambray, entregada)
+# y la lista tiene "seleccionar todo".
+
+def test_el_lote_no_borra_una_venta_pagada_sin_forzar():
+    src = open(server.__file__, encoding='utf-8').read()
+    cuerpo = src.split('async def admin_orders_lote(')[1].split('\n@api_router')[0]
+    assert 'ESTADOS_PAGADOS' in cuerpo, 'se fue el candado de los pedidos pagados'
+    assert 'payload.forzar' in cuerpo, 'se puede borrar un pedido pagado sin forzar'
+    assert 'protegidos.append' in cuerpo, 'no avisa cuáles se protegieron'
+
+
+def test_los_estados_pagados_son_los_tres():
+    assert server.ESTADOS_PAGADOS == ('confirmado', 'enviado', 'entregado')
+
+
+def test_borrar_en_lote_devuelve_puntos_e_inventario():
+    """Un `delete_many` a secas dejaría los puntos regalados y el inventario corto.
+    El lote tiene que usar el MISMO camino que el borrado de uno."""
+    src = open(server.__file__, encoding='utf-8').read()
+    cuerpo = src.split('async def admin_orders_lote(')[1].split('\n@api_router')[0]
+    assert 'revoke_order_points(order)' in cuerpo
+    assert 'restore_order_stock(order)' in cuerpo
+    assert 'db.points.delete_many' in cuerpo
+    assert 'delete_many({' not in cuerpo.split('db.points')[0], 'borra órdenes en bloque'
+
+
+def test_archivar_no_borra():
+    src = open(server.__file__, encoding='utf-8').read()
+    cuerpo = src.split('async def admin_orders_lote(')[1].split('\n@api_router')[0]
+    rama = cuerpo.split("else:")[-1]
+    assert 'update_one' in rama and 'archived' in rama
+    assert 'delete_one' not in rama, 'archivar está borrando'
+
+
+def test_la_lista_esconde_los_archivados_por_omision():
+    src = open(server.__file__, encoding='utf-8').read()
+    cuerpo = src.split("async def admin_orders(")[1].split('\n@api_router')[0]
+    assert "{'archived': {'$ne': True}}" in cuerpo
+    assert 'archivados' in cuerpo, 'no se pueden ver los archivados'
+
+
+# ---------- Venta directa: el techo es 40%, no 60% (auditor de Codex, 2026-07-29) ----------
+
+def test_la_venta_directa_no_puede_pasar_del_maximo_de_la_casa():
+    """El `min` estaba en 0.60 y el máximo de la casa es 0.40. En un pedido de
+    $374,360 la diferencia son $74,872 que salen de más."""
+    src = open(server.__file__, encoding='utf-8').read()
+    cuerpo = src.split('async def admin_create_order(')[1].split('\n@api_router')[0]
+    assert 'min(0.60' not in cuerpo, 'volvió el techo del 60%'
+    assert 'min(loyalty.MAX_DISCOUNT' in cuerpo
+    import loyalty
+    assert loyalty.MAX_DISCOUNT == 0.40
+
+
+def test_la_venta_directa_respeta_el_tope_por_producto():
+    """El descuento se calculaba plano sobre el subtotal, ignorando el techo de cada
+    producto — el que protege el 5× de la casa. El checkout público sí lo respeta."""
+    src = open(server.__file__, encoding='utf-8').read()
+    cuerpo = src.split('async def admin_create_order(')[1].split('\n@api_router')[0]
+    assert 'commission_cap' in cuerpo, 'no lee el tope del producto'
+    assert 'NO_DISCOUNT_CATEGORIES' in cuerpo, 'los insumos vuelven a llevar descuento'
+    assert 'round(subtotal * rate)' not in cuerpo, 'volvió el descuento plano'
+
+
+# ---------- Pagado ≠ entregado (Christián, 2026-07-29) ----------
+# La venta de Alanís salió ENTREGADA y SIN PAGAR, y el tablero la contaba como
+# ingreso. Un reporte que dice que cobraste lo que no cobraste es peor que no tenerlo.
+
+def test_un_pedido_entregado_pero_no_pagado_no_cuenta_como_ingreso():
+    assert server.esta_pagado({'status': 'entregado', 'paid': False}) is False
+    assert server.esta_pagado({'status': 'entregado', 'paid': True}) is True
+
+
+def test_los_pedidos_viejos_sin_el_campo_siguen_infiriendo_del_estado():
+    """No hay migración sobre la base de producción: los pedidos de antes no traen
+    `paid` y deben seguir contando igual que siempre."""
+    for est in ('confirmado', 'enviado', 'entregado'):
+        assert server.esta_pagado({'status': est}) is True, est
+    for est in ('pendiente', 'cancelado'):
+        assert server.esta_pagado({'status': est}) is False, est
+
+
+def test_un_cancelado_nunca_cuenta_aunque_diga_pagado():
+    """Una devolución deja el pedido cancelado; el dinero ya salió de vuelta."""
+    assert server.esta_pagado({'status': 'cancelado', 'paid': True}) is False
+
+
+def test_el_tablero_separa_cobrado_de_por_cobrar():
+    src = open(server.__file__, encoding='utf-8').read()
+    cuerpo = src.split("async def admin_stats(")[1].split('\n@api_router')[0]
+    assert 'esta_pagado(o)' in cuerpo, 'el ingreso ya no distingue lo cobrado'
+    assert "'por_cobrar'" in cuerpo, 'un pedido fiado desaparecería del tablero'
+    assert "'paid': 1" in cuerpo, 'la consulta no trae el campo y el ingreso saldría mal'
+
+
+def test_marcar_el_pago_no_toca_el_estado_de_entrega():
+    src = open(server.__file__, encoding='utf-8').read()
+    cuerpo = src.split('async def admin_marcar_pago(')[1].split('\n@api_router')[0]
+    assert "'paid'" in cuerpo and "'paid_at'" in cuerpo
+    assert "'status'" not in cuerpo.split('cambio =')[1].split('}')[0], \
+        'marcar el pago está moviendo el estado de entrega'
