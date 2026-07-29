@@ -942,13 +942,20 @@ TOPE_ENVIO_SOBRE_COMPRA = envios.TOPE_ENVIO_SOBRE_COMPRA
 FREE_SHIPPING_FROM = int(SHIPPING_FLAT / TOPE_ENVIO_SOBRE_COMPRA)   # 250 / 10% = 2,500
 
 
-# ⛔ EL PEDIDO YA NO COBRA ENVIO (Christian, 2026-07-28). El envio se cotiza por
-# separado, fuera del checkout. La regla de arriba NO se borra: sigue viva, probada
-# y lista para el dia que se vuelva a cobrar — basta con poner esto en True. Se deja
-# como interruptor y no como codigo comentado porque un comentario se pudre: la
-# formula que deriva el umbral del costo real del envio seguiria sin vigilancia y
-# volveria a desalinearse en silencio, que es justo lo que paso el 2026-07-27.
-COBRAR_ENVIO = False
+# ✅ SE COBRA ENVIO OTRA VEZ: $250 PAREJO (Christian, 2026-07-28, en sus palabras:
+# "vamos a dejarlo con $250 parejo y pagamos un poco mas por envio express").
+#
+# El numero sale de la cotizacion REAL de Skydropx desde Playa del Carmen, que es de
+# donde salen los paquetes. Las opciones de $51 tardan 7 u 8 dias y rompen la promesa
+# de "2-5 dias" del sitio; las que si la cumplen andan en $139-$165. Cobrando $250
+# alcanza para pagar la express y todavia queda margen.
+#
+# Y arriba de $2,500 va gratis, con el tope del 10% que ya esta en envios.py: la casa
+# absorbe hasta el 10% de la compra y el cliente paga la diferencia.
+#
+# Contra la competencia: Certified cobra $250 SIEMPRE, sin excepcion. Nosotros
+# empatamos abajo de $2,500 y le ganamos arriba.
+COBRAR_ENVIO = True
 
 
 def shipping_for(merchandise_paid, costo_real=None):

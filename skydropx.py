@@ -55,6 +55,13 @@ PAQUETERIAS_PERMITIDAS = ('estafeta', 'paquetexpress', 'fedex')
 # arriba y rompería la promesa por ahorrarse cien pesos. Las tarifas que se pasan
 # de este número no se le enseñan al cliente. Cambiarlo es cambiar esta línea.
 DIAS_MAXIMOS_ENTREGA = 5
+# Se PAGA por llegar antes (Christian, 2026-07-28: "pagamos un poco mas por envio
+# express"). Como al cliente se le cobran $250 parejo, lo barato deja de ser el
+# criterio: entre dos opciones que cumplen el plazo, gana la que llega ANTES, y solo
+# se desempata por precio. Medido desde Playa del Carmen, lo de $51 tarda 7-8 dias y
+# rompe la promesa de "2-5 dias" del sitio; lo que la cumple anda en $139-$165, que
+# cabe de sobra en los $250.
+PREFERIR_MAS_RAPIDO = True
 
 # La cotización es asíncrona y el checkout NO se puede colgar esperándola. Si a
 # los 12 segundos la paquetería no terminó, se devuelve sin opciones y el checkout
@@ -283,9 +290,19 @@ def solo_permitidas(opciones: list) -> list:
 
     Dos cedazos, no uno: la paquetería tiene que estar permitida Y cumplir el plazo.
     """
-    return [o for o in (opciones or [])
-            if permitida(o.get('paqueteria_id') or o.get('paqueteria', ''))
-            and dentro_del_plazo(o.get('dias'))]
+    buenas = [o for o in (opciones or [])
+              if permitida(o.get('paqueteria_id') or o.get('paqueteria', ''))
+              and dentro_del_plazo(o.get('dias'))]
+    if not PREFERIR_MAS_RAPIDO:
+        return buenas
+    # Primero los DIAS, luego el precio. Un 0 en dias significa "no dijo", no "hoy":
+    # se manda al final para que no le gane a una opcion que si promete una fecha.
+    def orden(o):
+        d = o.get('dias') or 0
+        try: d = int(d)
+        except (TypeError, ValueError): d = 0
+        return (d if d > 0 else 99, float(o.get('precio') or o.get('costo') or 0))
+    return sorted(buenas, key=orden)
 
 
 def _opcion(cruda: dict) -> dict | None:
