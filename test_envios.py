@@ -1,14 +1,17 @@
-"""Pruebas del envío con Skydropx: cotizar, cobrar y comprar la guía.
+"""Pruebas del envío con Skydropx PRO (API v2): cotizar, cobrar y comprar la guía.
 
 Lo que cuidan, en orden de cuánto duele si se rompe:
 
   1. QUE EL PRECIO LO PONGA EL SERVIDOR. Un envío que el navegador manda no se
      cobra jamás, ni aunque venga en la petición. Es la regla más cara de esta
      casa: creerle un precio al navegador ya costó dinero (2026-07-27).
-  2. Que solo se le enseñe ESTAFETA al cliente, aunque la API devuelva de todo.
+  2. Que solo se le enseñen las paqueterías permitidas (Estafeta y Paquetexpress)
+     y solo las que cumplen el plazo, aunque la API devuelva veintitantas.
   3. La regla del 10% y su tope.
   4. Que la guía se compre sola con los CUATRO métodos de pago.
-  5. Que sin llave y sin remitente nada reviente — y que sin remitente NO se compre.
+  5. Que sin credenciales y sin remitente nada reviente — y que sin remitente NO
+     se compre.
+  6. Que la cotización en diferido de la API PRO no cuelgue el checkout.
 
 ⛔ Nunca se llama a Skydropx de verdad: todas las respuestas son dobles de prueba.
 """
@@ -109,10 +112,26 @@ def db(monkeypatch):
     return fake
 
 
+@pytest.fixture(autouse=True)
+def _sin_token_viejo():
+    """El token vive en memoria del módulo: se tira antes y después de cada prueba.
+
+    Si no, una prueba le dejaría el token a la siguiente y las que cuentan llamadas
+    al OAuth medirían cualquier cosa.
+    """
+    skydropx.olvidar_token()
+    yield
+    skydropx.olvidar_token()
+
+
 @pytest.fixture()
 def con_llave(monkeypatch):
-    """Skydropx encendido y el checkout cotizando."""
-    monkeypatch.setenv('SKYDROPX_API_KEY', 'llave-de-prueba')
+    """Skydropx encendido y el checkout cotizando.
+
+    Son DOS credenciales porque la API PRO usa OAuth2: con una sola no se enciende.
+    """
+    monkeypatch.setenv('SKYDROPX_CLIENT_ID', 'id-de-prueba')
+    monkeypatch.setenv('SKYDROPX_CLIENT_SECRET', 'secreto-de-prueba')
     monkeypatch.setattr(envios, 'COTIZAR_EN_CHECKOUT', True)
     return True
 
@@ -120,22 +139,54 @@ def con_llave(monkeypatch):
 @pytest.fixture()
 def con_remitente(monkeypatch):
     for k, v in {'NAME': 'Trabajador de Prueba', 'ADDRESS1': 'Calle 1 #2',
-                 'CITY': 'Monterrey', 'PROVINCE': 'Nuevo León', 'ZIP': '64000'}.items():
+                 'CITY': 'Monterrey', 'PROVINCE': 'Nuevo León', 'ZIP': '64000',
+                 'COLONIA': 'Centro', 'PHONE': '8112345678',
+                 'EMAIL': 'envios@exygenlabs.com'}.items():
         monkeypatch.setenv(f'SKYDROPX_FROM_{k}', v)
     return True
 
 
-# Lo que devolvería Skydropx: varias paqueterías, a propósito.
-TARIFAS_CRUDAS = [
-    {'id': 'r-dhl', 'provider': 'DHL', 'service_level_name': 'Express',
-     'service_level_code': 'dhl_exp', 'days': 1, 'total_pricing': '410.00', 'currency_local': 'MXN'},
-    {'id': 'r-est-eco', 'provider': 'Estafeta', 'service_level_name': 'Terrestre',
-     'service_level_code': 'est_ter', 'days': 4, 'total_pricing': '180.00', 'currency_local': 'MXN'},
-    {'id': 'r-fedex', 'provider': 'FedEx', 'service_level_name': 'Día siguiente',
-     'service_level_code': 'fx_next', 'days': 1, 'total_pricing': '520.00', 'currency_local': 'MXN'},
-    {'id': 'r-est-dia', 'provider': 'ESTAFETA', 'service_level_name': 'Día Siguiente',
-     'service_level_code': 'est_dia', 'days': 1, 'total_pricing': '320.00', 'currency_local': 'MXN'},
+# ==========================================================================
+#  Doble de Skydropx PRO
+#
+#  Copiado de una respuesta REAL del 2026-07-28 (Mérida 97000 → CDMX 06000, 1 kg):
+#  precios y plazos son los que devolvió el servicio. Se conservan las tarifas sin
+#  precio (`success: false`) porque en la corrida real salieron 15 de 27 así, y el
+#  cliente jamás debe verlas.
+# ==========================================================================
+def _tarifa(rid, proveedor, mostrar, servicio, codigo, dias, total, ok=True):
+    return {'success': ok, 'id': rid, 'provider_name': proveedor,
+            'provider_display_name': mostrar, 'provider_service_name': servicio,
+            'provider_service_code': codigo, 'days': dias,
+            'status': 'price_found_internal' if ok else 'no_coverage',
+            'currency_code': 'MXN' if ok else None,
+            'amount': total if ok else None, 'total': total if ok else None,
+            'error_messages': None, 'requires_origin_verification': False}
+
+
+TARIFAS_V2 = [
+    _tarifa('r-dhl', 'dhl', 'DHL', 'Express', 'express', 1, '222.64'),
+    _tarifa('r-est-ter', 'estafeta', 'Estafeta', 'Terrestre', 'estafeta_standard', 5, '168.33'),
+    _tarifa('r-fedex-sav', 'fedex', 'FedEx', 'Express Saver', 'fedex_express_saver', 4, '52.45'),
+    _tarifa('r-fedex-ovn', 'fedex', 'FedEx', 'Standard Overnight', 'standard_overnight', 2, '179.20'),
+    _tarifa('r-est-exp', 'estafeta', 'Estafeta', 'Servicio Express', 'estafeta_next_day', 3, '186.90'),
+    _tarifa('r-pqx-2d', 'paquetexpress', 'Paquetexpress', 'Express Second Day',
+            'express_second_day', 2, '165.27'),
+    # ⚠️ La trampa real: la más barata de todas, pero 7 días. Rompe la promesa del
+    # sitio y por eso NO se le enseña al cliente.
+    _tarifa('r-pqx-nac', 'paquetexpress', 'Paquetexpress', 'Nacional', 'nacional', 7, '51.25'),
+    _tarifa('r-afimex', 'afimex', 'Afimex', 'Standard', 'standard', 0, None, ok=False),
 ]
+
+PAQUETES_V2 = [{'package_number': 1, 'weight': '1.0', 'length': '30.0',
+                'width': '20.0', 'height': '15.0'}]
+
+# Lo que devuelve POST /shipments. ⚠️ NO VERIFICADO CONTRA UNA COMPRA REAL: comprar
+# una guía cuesta dinero. La forma sale del JSON:API que devuelve GET /shipments.
+GUIA_OK = {'data': {'id': 'ship-1', 'type': 'shipments', 'attributes': {'status': 'processing'}},
+           'included': [{'id': 'lbl-1', 'type': 'labels', 'attributes': {
+               'tracking_number': '7712345678', 'label_url': 'https://skydropx.test/guia.pdf',
+               'tracking_url_provider': 'https://estafeta.test/7712345678'}}]}
 
 
 class FakeResp:
@@ -146,20 +197,97 @@ class FakeResp:
         return self._p
 
 
-def _falsear_skydropx(monkeypatch, por_ruta):
-    """Sustituye requests.post: NUNCA se toca el servicio real."""
-    llamadas = []
+class ApiFalsa:
+    """Un Skydropx PRO de mentira: OAuth, cotización EN DIFERIDO y /shipments.
 
-    def fake_post(url, headers=None, json=None, timeout=None):
-        ruta = '/' + url.rstrip('/').rsplit('/', 1)[-1]
-        llamadas.append({'ruta': ruta, 'cuerpo': json, 'headers': headers})
-        salida = por_ruta.get(ruta)
+    ⛔ Reproduce lo que de verdad hace la API: `POST /quotations` contesta al
+    instante con las tarifas sin precio, y hay que volver a preguntar hasta que
+    `is_completed` sea true. Si la prueba no pasa por ahí, no prueba nada.
+    """
+
+    def __init__(self, tarifas=None, consultas_para_completar=1, fallos=None,
+                 shipment=None, nunca_completa=False, un_401_en=''):
+        self.tarifas = TARIFAS_V2 if tarifas is None else tarifas
+        self.faltan = consultas_para_completar
+        self.fallos = fallos or {}
+        self.shipment = shipment if shipment is not None else GUIA_OK
+        self.nunca_completa = nunca_completa
+        self.un_401_en = un_401_en
+        self.llamadas = []
+        self.tokens = 0
+
+    # -- utilidades
+    def _ruta(self, url):
+        return url.split('/api/v1', 1)[-1] if '/api/v1' in url else url
+
+    def _pendientes(self):
+        return [dict(t, success=False, status='pending', amount=None, total=None)
+                for t in self.tarifas]
+
+    def _cotizacion(self, completa):
+        return {'id': 'q-1', 'is_completed': completa, 'packages': PAQUETES_V2,
+                'requires_origin_verification': True,
+                'rates': self.tarifas if completa else self._pendientes()}
+
+    def _quizas_falla(self, ruta):
+        salida = self.fallos.get(ruta)
         if isinstance(salida, Exception):
             raise salida
-        return FakeResp(salida)
+        if isinstance(salida, int):
+            return FakeResp({'message': 'no'}, salida)
+        return None
 
-    monkeypatch.setattr(skydropx.requests, 'post', fake_post)
-    return llamadas
+    # -- los dos verbos
+    def post(self, url, headers=None, json=None, timeout=None):
+        ruta = self._ruta(url)
+        self.llamadas.append({'ruta': ruta, 'metodo': 'POST', 'cuerpo': json,
+                              'headers': headers})
+        if ruta == '/oauth/token':
+            self.tokens += 1
+            return FakeResp({'access_token': f'token-{self.tokens}', 'expires_in': 7200,
+                             'token_type': 'Bearer'})
+        if self.un_401_en == ruta:
+            self.un_401_en = ''
+            return FakeResp({'message': 'no autorizado'}, 401)
+        fallo = self._quizas_falla(ruta)
+        if fallo is not None:
+            return fallo
+        if ruta == '/quotations':
+            return FakeResp(self._cotizacion(self.faltan <= 0 and not self.nunca_completa))
+        if ruta == '/shipments':
+            return FakeResp(self.shipment)
+        return FakeResp({}, 404)
+
+    def get(self, url, headers=None, timeout=None):
+        ruta = self._ruta(url)
+        self.llamadas.append({'ruta': ruta, 'metodo': 'GET', 'headers': headers})
+        if self.un_401_en == ruta:
+            self.un_401_en = ''
+            return FakeResp({'message': 'no autorizado'}, 401)
+        fallo = self._quizas_falla(ruta)
+        if fallo is not None:
+            return fallo
+        if ruta.startswith('/quotations/'):
+            self.faltan -= 1
+            return FakeResp(self._cotizacion(self.faltan <= 0 and not self.nunca_completa))
+        if ruta.startswith('/shipments/'):
+            return FakeResp(self.shipment)
+        return FakeResp({}, 404)
+
+
+def _falsear_skydropx(monkeypatch, **kw):
+    """Sustituye requests.post y requests.get: NUNCA se toca el servicio real."""
+    api = ApiFalsa(**kw)
+    monkeypatch.setattr(skydropx.requests, 'post', api.post)
+    monkeypatch.setattr(skydropx.requests, 'get', api.get)
+    monkeypatch.setattr(skydropx, 'ESPERA_ENTRE_CONSULTAS_S', 0.01)
+    return api
+
+
+def _peticiones(api, ruta=None):
+    """Lo que se le pidió a la paquetería, sin contar el trámite del token."""
+    return [l for l in api.llamadas
+            if l['ruta'] != '/oauth/token' and (ruta is None or l['ruta'] == ruta)]
 
 
 # ==========================================================================
@@ -191,36 +319,108 @@ def test_peso_de_un_carrito_vacio_es_cero_y_no_revienta():
 
 
 # ==========================================================================
-#  2. Solo Estafeta
+#  2. Solo las paqueterías permitidas, y solo las que llegan a tiempo
 # ==========================================================================
-def test_solo_se_le_enseña_estafeta_al_cliente(monkeypatch):
-    _falsear_skydropx(monkeypatch, {'/quotations': TARIFAS_CRUDAS})
-    monkeypatch.setenv('SKYDROPX_API_KEY', 'k')
-    opciones = skydropx.cotizar('64000', {'peso_kg': 1, 'alto_cm': 15, 'ancho_cm': 20, 'largo_cm': 30})
-    assert [o['paqueteria'] for o in opciones] == ['Estafeta', 'ESTAFETA']   # DHL y FedEx fuera
-    assert [o['precio'] for o in opciones] == [180.0, 320.0]                 # y de barato a caro
+BULTO = {'peso_kg': 1, 'alto_cm': 15, 'ancho_cm': 20, 'largo_cm': 30}
+
+
+def test_solo_se_le_enseñan_las_paqueterias_permitidas(monkeypatch, con_llave):
+    """DHL y Afimex salen en la respuesta real de la API. El cliente no las ve."""
+    _falsear_skydropx(monkeypatch)
+    opciones = skydropx.cotizar('64000', BULTO)
+    assert {o['paqueteria'] for o in opciones} == {'Estafeta', 'Paquetexpress', 'FedEx'}
+    # de barato a caro, y ninguna de las que se pasan del plazo
+    assert [o['precio'] for o in opciones] == [52.45, 165.27, 168.33, 179.2, 186.9]
+
+
+def test_la_mas_barata_de_7_dias_NO_se_le_ofrece_al_cliente(monkeypatch, con_llave):
+    """Paquetexpress Nacional cuesta $51.25 —la más barata de todas— pero tarda 7
+    días y el sitio promete 2-5. Ordenar solo por precio la pondría hasta arriba.
+
+    La que gana es FedEx Express Saver: $52.45 en 4 días, un peso más cara y tres
+    días antes."""
+    _falsear_skydropx(monkeypatch)
+    opciones = skydropx.cotizar('64000', BULTO)
+    assert 'nacional' not in [o['servicio_codigo'] for o in opciones]
+    assert opciones[0]['servicio_codigo'] == 'fedex_express_saver'
+    assert all(o['dias'] <= skydropx.DIAS_MAXIMOS_ENTREGA for o in opciones)
+    assert skydropx.DIAS_MAXIMOS_ENTREGA == 5
+
+
+def test_el_plazo_maximo_se_cambia_en_un_solo_renglon(monkeypatch, con_llave):
+    _falsear_skydropx(monkeypatch)
+    monkeypatch.setattr(skydropx, 'DIAS_MAXIMOS_ENTREGA', 7)
+    opciones = skydropx.cotizar('64000', BULTO)
+    assert opciones[0]['servicio_codigo'] == 'nacional'      # ahora sí, y es la barata
+    assert opciones[0]['precio'] == 51.25
+
+
+def test_un_plazo_desconocido_no_se_castiga():
+    """0 días quiere decir «no lo dijeron», no «llega hoy»: no se tira por eso."""
+    assert skydropx.dentro_del_plazo(0) is True
+    assert skydropx.dentro_del_plazo(None) is True
+    assert skydropx.dentro_del_plazo('basura') is True
+    assert skydropx.dentro_del_plazo(99) is False
 
 
 def test_la_lista_de_permitidas_se_amplia_con_un_renglon(monkeypatch):
+    """Y viene EN MINÚSCULAS, que es como manda `provider_name` la API PRO."""
+    assert skydropx.PAQUETERIAS_PERMITIDAS == ('estafeta', 'paquetexpress', 'fedex')
+    assert skydropx.permitida('paquetexpress') is True
+    assert skydropx.permitida('Estafeta') is True            # el nombre bonito también
+    assert skydropx.permitida('dhl') is False
     monkeypatch.setattr(skydropx, 'PAQUETERIAS_PERMITIDAS', ('estafeta', 'dhl'))
     assert skydropx.permitida('DHL') is True
-    assert skydropx.permitida('FedEx') is False
+    assert skydropx.permitida('paquetexpress') is False
 
 
-def test_se_le_pide_a_la_api_solo_lo_permitido_y_ademas_se_filtra_al_recibir(monkeypatch):
-    """Doble candado: se lo pedimos, y si nos manda de más igual lo tiramos.
-    La lista de permitidas es NUESTRA regla, no un favor de la paquetería."""
-    llamadas = _falsear_skydropx(monkeypatch, {'/quotations': TARIFAS_CRUDAS})
-    monkeypatch.setenv('SKYDROPX_API_KEY', 'k')
-    skydropx.cotizar('64000', {'peso_kg': 1, 'alto_cm': 15, 'ancho_cm': 20, 'largo_cm': 30})
-    assert llamadas[0]['cuerpo']['carriers'] == [{'name': 'estafeta'}]
+def test_el_filtro_se_aplica_a_lo_que_devuelve_la_api(monkeypatch, con_llave):
+    """La API PRO ignora el `carriers` que se le mande (comprobado en vivo: devolvió
+    las 27 igual). Así que el único candado que sirve es el nuestro, al recibir."""
+    api = _falsear_skydropx(monkeypatch)
+    opciones = skydropx.cotizar('64000', BULTO)
+    pedido = _peticiones(api, '/quotations')[0]['cuerpo']['quotation']
+    assert pedido['address_to']['postal_code'] == '64000'
+    fuera = {'dhl', 'afimex'}
+    assert fuera & {t['provider_name'] for t in TARIFAS_V2}       # sí venían
+    assert not fuera & {o['paqueteria_id'] for o in opciones}     # y no salieron
 
 
-def test_una_tarifa_sin_precio_no_es_una_opcion(monkeypatch):
-    _falsear_skydropx(monkeypatch, {'/quotations': [
-        {'id': 'x', 'provider': 'Estafeta', 'total_pricing': '0'}]})
-    monkeypatch.setenv('SKYDROPX_API_KEY', 'k')
+def test_una_tarifa_sin_precio_no_es_una_opcion(monkeypatch, con_llave):
+    """En la corrida real 15 de 27 volvieron con `success: false` y `total: null`."""
+    _falsear_skydropx(monkeypatch, tarifas=[
+        _tarifa('x', 'estafeta', 'Estafeta', 'Terrestre', 'estafeta_standard', 3, None, ok=False),
+        _tarifa('y', 'estafeta', 'Estafeta', 'Express', 'estafeta_next_day', 3, '0')])
     assert skydropx.cotizar('64000', {'peso_kg': 1}) == []
+
+
+# ==========================================================================
+#  2b. La cotización es EN DIFERIDO — y no puede colgar el checkout
+# ==========================================================================
+def test_la_cotizacion_se_espera_hasta_que_este_completa(monkeypatch, con_llave):
+    """La API contesta al instante con las tarifas vacías. Si no se vuelve a
+    preguntar, el checkout enseñaría una lista sin precios."""
+    api = _falsear_skydropx(monkeypatch, consultas_para_completar=3)
+    opciones = skydropx.cotizar('64000', BULTO)
+    assert len(opciones) == 5
+    assert len(_peticiones(api, '/quotations/q-1')) == 3       # preguntó tres veces
+
+
+def test_si_la_paqueteria_tarda_demasiado_el_checkout_sigue_sin_envio(monkeypatch, con_llave):
+    """⛔ Un carrito congelado cuesta más que un envío. Pasado el tope se devuelve
+    vacío y el checkout se comporta como hoy."""
+    _falsear_skydropx(monkeypatch, nunca_completa=True)
+    monkeypatch.setattr(skydropx, 'ESPERA_MAX_COTIZACION_S', 0.05)
+    assert skydropx.cotizar('64000', BULTO) == []
+
+
+def test_media_cotizacion_no_se_le_enseña_al_cliente(monkeypatch, con_llave):
+    """Sin `is_completed` las tarifas que ya llegaron son las que alcanzaron, no las
+    mejores: enseñarlas sería cobrar por la que ganó la carrera."""
+    _falsear_skydropx(monkeypatch, nunca_completa=True)
+    monkeypatch.setattr(skydropx, 'ESPERA_MAX_COTIZACION_S', 0.05)
+    cot = skydropx.cotizacion({'zip': '64000'}, BULTO)
+    assert cot['completa'] is False and cot['opciones'] == []
 
 
 # ==========================================================================
@@ -297,40 +497,40 @@ PFLAGS = {'a': {'id': 'a', 'name': 'BPC-157'}}
 
 
 def test_el_envio_que_manda_el_navegador_se_ignora(db, con_llave, monkeypatch):
-    """El pedido dice que el envío cuesta $1. El servidor cobra los $180 que él
+    """El pedido dice que el envío cuesta $1. El servidor cobra los $52.45 que él
     mismo cotizó y guardó. Es la regla que ya costó dinero cuando no existía."""
-    _falsear_skydropx(monkeypatch, {'/quotations': TARIFAS_CRUDAS})
+    _falsear_skydropx(monkeypatch)
     payload = _pedido(shipping_mentiroso=1)
     cobrado, guardado = asyncio.run(server._envio_del_pedido(payload, 1000, PFLAGS))
-    assert cobrado == 180                      # el precio real, no el del navegador
-    assert guardado['cost'] == 180.0
-    assert guardado['carrier'] == 'Estafeta'
+    assert cobrado == 52                       # el precio real, no el del navegador
+    assert guardado['cost'] == 52.45
+    assert guardado['carrier'] == 'FedEx'
 
 
 def test_un_id_de_cotizacion_inventado_no_regala_el_envio(db, con_llave, monkeypatch):
-    _falsear_skydropx(monkeypatch, {'/quotations': TARIFAS_CRUDAS})
+    _falsear_skydropx(monkeypatch)
     payload = _pedido(quote_id='me-lo-invente', shipping_mentiroso=0)
     cobrado, _ = asyncio.run(server._envio_del_pedido(payload, 1000, PFLAGS))
-    assert cobrado == 180                      # recotiza; no cobra cero por creerle
+    assert cobrado == 52                       # recotiza; no cobra cero por creerle
 
 
 def test_la_cotizacion_guardada_manda_sobre_la_recotizacion(db, con_llave, monkeypatch):
-    """El cliente eligió el servicio de día siguiente ($320). Se le cobra ESO,
-    no la más barata: eligió y el servidor respeta lo que él mismo le enseñó."""
-    _falsear_skydropx(monkeypatch, {'/quotations': TARIFAS_CRUDAS})
+    """El cliente eligió el Express de Estafeta ($186.90). Se le cobra ESO, no la
+    más barata: eligió y el servidor respeta lo que él mismo le enseñó."""
+    _falsear_skydropx(monkeypatch)
     quote = asyncio.run(server._guardar_cotizacion(
         '64000', envios.paquete_del_pedido(_pedido().items, PFLAGS),
         skydropx.cotizar('64000', {'peso_kg': 1})))
-    dia_siguiente = next(o for o in quote['opciones'] if o['precio'] == 320.0)
-    payload = _pedido(quote_id=dia_siguiente['opcion_id'])
+    express = next(o for o in quote['opciones'] if o['precio'] == 186.9)
+    payload = _pedido(quote_id=express['opcion_id'])
     cobrado, guardado = asyncio.run(server._envio_del_pedido(payload, 1000, PFLAGS))
-    assert cobrado == 320
-    assert guardado['service_code'] == 'est_dia'
+    assert cobrado == 187
+    assert guardado['service_code'] == 'estafeta_next_day'
 
 
 def test_una_cotizacion_de_OTRO_codigo_postal_no_sirve(db, con_llave, monkeypatch):
     """Cotizar a la esquina y mandar a Tijuana. Se tira y se recotiza."""
-    _falsear_skydropx(monkeypatch, {'/quotations': TARIFAS_CRUDAS})
+    _falsear_skydropx(monkeypatch)
     quote = asyncio.run(server._guardar_cotizacion(
         '01000', {'peso_kg': 1.0}, [{'paqueteria': 'Estafeta', 'servicio': 'x',
                                      'servicio_codigo': 'x', 'dias': 3, 'precio': 1.0}]))
@@ -359,16 +559,16 @@ def test_una_cotizacion_vencida_no_sirve(db, con_llave):
 
 
 def test_una_cotizacion_de_paqueteria_no_permitida_no_se_cobra(db, con_llave):
-    """Aunque alguien la meta a mano en la base, FedEx no se cobra ni se compra."""
+    """Aunque alguien la meta a mano en la base, DHL no se cobra ni se compra."""
     quote = asyncio.run(server._guardar_cotizacion(
-        '64000', {'peso_kg': 1.0}, [{'paqueteria': 'FedEx', 'servicio': 'x',
+        '64000', {'peso_kg': 1.0}, [{'paqueteria': 'DHL', 'servicio': 'x',
                                      'servicio_codigo': 'x', 'dias': 1, 'precio': 900.0}]))
     assert asyncio.run(server._cotizacion_valida(
         quote['opciones'][0]['opcion_id'], '64000', 1.0)) is None
 
 
 def test_si_la_paqueteria_no_contesta_no_se_inventa_un_cargo(db, con_llave, monkeypatch):
-    _falsear_skydropx(monkeypatch, {'/quotations': RuntimeError('caida')})
+    _falsear_skydropx(monkeypatch, fallos={'/quotations': RuntimeError('caida')})
     cobrado, guardado = asyncio.run(server._envio_del_pedido(_pedido(), 1000, PFLAGS))
     assert cobrado == 0 and guardado == {}
 
@@ -382,27 +582,37 @@ def test_apagado_el_envio_se_comporta_EXACTAMENTE_como_hoy(db):
     assert cobrado == 0 and guardado == {}
 
 
-def test_sin_llave_no_se_cotiza_aunque_este_prendido(monkeypatch):
-    monkeypatch.delenv('SKYDROPX_API_KEY', raising=False)
+def test_sin_credenciales_no_se_cotiza_aunque_este_prendido(monkeypatch):
+    for k in ('SKYDROPX_CLIENT_ID', 'SKYDROPX_CLIENT_SECRET'):
+        monkeypatch.delenv(k, raising=False)
     monkeypatch.setattr(envios, 'COTIZAR_EN_CHECKOUT', True)
     assert skydropx.enabled() is False
     assert server.envio_se_cotiza() is False
 
 
+def test_con_UNA_sola_credencial_tampoco_se_enciende(monkeypatch):
+    """El OAuth2 pide las dos. Media credencial es no tener credencial."""
+    monkeypatch.setenv('SKYDROPX_CLIENT_ID', 'solo-el-id')
+    monkeypatch.delenv('SKYDROPX_CLIENT_SECRET', raising=False)
+    assert skydropx.enabled() is False
+
+
 def test_la_ruta_de_cotizacion_no_rompe_el_checkout_sin_llave(db, monkeypatch):
-    monkeypatch.delenv('SKYDROPX_API_KEY', raising=False)
+    for k in ('SKYDROPX_CLIENT_ID', 'SKYDROPX_CLIENT_SECRET'):
+        monkeypatch.delenv(k, raising=False)
     from models import ShippingQuoteRequest
     r = asyncio.run(server.shipping_quote(ShippingQuoteRequest(postal_code='64000')))
     assert r == {'enabled': False, 'options': []}
 
 
 def test_la_ruta_de_cotizacion_no_devuelve_precios_de_otras_paqueterias(db, con_llave, monkeypatch):
-    _falsear_skydropx(monkeypatch, {'/quotations': TARIFAS_CRUDAS})
+    _falsear_skydropx(monkeypatch)
     from models import ShippingQuoteRequest
     r = asyncio.run(server.shipping_quote(ShippingQuoteRequest(
         postal_code='64000', items=[OrderItem(product_id='a', name='BPC-157', price=1, quantity=1)])))
     assert r['enabled'] is True
-    assert {o['carrier'].lower() for o in r['options']} == {'estafeta'}
+    assert {o['carrier'].lower() for o in r['options']} == {'estafeta', 'paquetexpress', 'fedex'}
+    assert all(o['days'] <= skydropx.DIAS_MAXIMOS_ENTREGA for o in r['options'])
     # y el precio NO viaja de vuelta como algo cobrable: cada opción es un ID opaco
     assert all(o['id'] and len(o['id']) > 20 for o in r['options'])
 
@@ -410,17 +620,6 @@ def test_la_ruta_de_cotizacion_no_devuelve_precios_de_otras_paqueterias(db, con_
 # ==========================================================================
 #  5. La guía se compra sola — con los CUATRO métodos de pago
 # ==========================================================================
-GUIA_OK = {'data': {'id': 'ship-1', 'type': 'shipments',
-                    'relationships': {'rates': {'data': [
-                        {'id': '9001', 'type': 'rates', 'attributes': {
-                            'provider': 'Estafeta', 'service_level_name': 'Terrestre',
-                            'service_level_code': 'est_ter', 'days': 4,
-                            'total_pricing': '180.00', 'currency_local': 'MXN'}}]}}}}
-ETIQUETA_OK = {'data': {'id': 'lbl-1', 'type': 'labels', 'attributes': {
-    'tracking_number': '7712345678', 'label_url': 'https://skydropx.test/guia.pdf',
-    'tracking_url_provider': 'https://estafeta.test/7712345678'}}}
-
-
 def _orden(metodo, **extra):
     base = {
         'id': 'o1', 'order_number': 'EX-20260728-0001', 'status': 'pendiente',
@@ -429,7 +628,8 @@ def _orden(metodo, **extra):
         'customer': {'full_name': 'Ana', 'email': 'ana@x.com', 'phone': '+528111111111',
                      'address': 'Calle 1', 'city': 'Monterrey', 'state': 'Nuevo León',
                      'postal_code': '64000', 'country': 'MX'},
-        'shipping_quote': {'carrier': 'Estafeta', 'service_code': 'est_ter', 'cost': 180,
+        'shipping_quote': {'carrier': 'Estafeta', 'service_code': 'estafeta_standard',
+                           'cost': 168.33,
                            'paquete': {'peso_kg': 1.0, 'largo_cm': 30, 'ancho_cm': 20, 'alto_cm': 15}},
     }
     base.update(extra)
@@ -440,7 +640,7 @@ def _orden(metodo, **extra):
 def test_la_guia_se_compra_sola_en_los_cuatro_metodos_de_pago(
         metodo, db, con_llave, con_remitente, monkeypatch):
     monkeypatch.setattr(envios, 'COMPRAR_GUIA_AL_PAGAR', True)
-    _falsear_skydropx(monkeypatch, {'/shipments': GUIA_OK, '/labels': ETIQUETA_OK})
+    _falsear_skydropx(monkeypatch)
     orden = _orden(metodo)
     asyncio.run(db.orders.insert_one(orden))
 
@@ -454,6 +654,33 @@ def test_la_guia_se_compra_sola_en_los_cuatro_metodos_de_pago(
     guardado = db.orders.docs[0]
     assert guardado['tracking_number'] == '7712345678'      # y quedó EN el pedido
     assert guardado['label_provider'] == 'skydropx'
+
+
+def test_comprar_la_guia_manda_el_cuerpo_QUE_LA_API_PRO_ACEPTA(
+        db, con_llave, con_remitente, monkeypatch):
+    """La forma se comprobó contra la API REAL el 2026-07-28 sin comprar nada: se le
+    mandó todo esto con un `package_number` mal a propósito y lo único que reclamó
+    fue ese número. O sea: el resto del cuerpo lo dio por bueno.
+
+    ⛔ Se cotiza primero y se compra contra el `rate_id` de ESA cotización, con su
+    mismo `package_number`. Si no coinciden, la API rechaza la compra."""
+    monkeypatch.setattr(envios, 'COMPRAR_GUIA_AL_PAGAR', True)
+    api = _falsear_skydropx(monkeypatch)
+    orden = _orden('tarjeta')
+    asyncio.run(db.orders.insert_one(orden))
+    asyncio.run(server.comprar_guia_del_pedido(orden))
+
+    envio = _peticiones(api, '/shipments')[0]['cuerpo']['shipment']
+    assert envio['rate_id'] == 'r-est-ter'                 # el servicio que se eligió
+    assert envio['packages'][0]['package_number'] == 1     # el de la cotización
+    assert envio['packages'][0]['package_type'] == '4G'
+    assert envio['packages'][0]['consignment_note'] == '31181701'
+    # Los datos de la persona: la API los exige y los imprime en la guía.
+    for lado in ('address_from', 'address_to'):
+        for campo in ('name', 'street1', 'phone', 'email', 'reference'):
+            assert envio[lado][campo], f'{lado}.{campo} vacío: la API lo rechaza'
+    assert envio['address_to']['name'] == 'Ana'
+    assert envio['address_from']['email'] == 'envios@exygenlabs.com'
 
 
 def test_los_tres_metodos_de_pasarela_pasan_por_la_confirmacion(db, monkeypatch):
@@ -494,20 +721,20 @@ def test_no_se_compra_dos_veces_la_misma_guia(db, con_llave, con_remitente, monk
     """El webhook de una pasarela puede llegar repetido. Una guía repetida es un
     paquete pagado dos veces."""
     monkeypatch.setattr(envios, 'COMPRAR_GUIA_AL_PAGAR', True)
-    llamadas = _falsear_skydropx(monkeypatch, {'/shipments': GUIA_OK, '/labels': ETIQUETA_OK})
+    api = _falsear_skydropx(monkeypatch)
     orden = _orden('tarjeta')
     asyncio.run(db.orders.insert_one(orden))
     asyncio.run(server.comprar_guia_del_pedido(orden))
-    n = len(llamadas)
+    n = len(api.llamadas)
     ya_con_guia = db.orders.docs[0]
     assert asyncio.run(server.comprar_guia_del_pedido(ya_con_guia)) is None
-    assert len(llamadas) == n              # no volvió a hablarle a Skydropx
+    assert len(api.llamadas) == n          # no volvió a hablarle a Skydropx
 
 
 def test_apagado_el_interruptor_no_se_compra_ninguna_guia(db, con_llave, con_remitente, monkeypatch):
-    llamadas = _falsear_skydropx(monkeypatch, {'/shipments': GUIA_OK, '/labels': ETIQUETA_OK})
+    api = _falsear_skydropx(monkeypatch)
     assert asyncio.run(server.comprar_guia_del_pedido(_orden('tarjeta'))) is None
-    assert llamadas == []
+    assert api.llamadas == []
 
 
 # ==========================================================================
@@ -517,25 +744,32 @@ def test_sin_remitente_configurado_el_sistema_se_NIEGA_a_comprar(db, con_llave, 
     """⚠️ PENDIENTE DE CHRISTIAN: la dirección va a ser la de un trabajador y
     todavía no la tenemos. Comprar con una inventada es pagar una recolección en
     una dirección que no existe."""
-    for k in ('NAME', 'ADDRESS1', 'CITY', 'PROVINCE', 'ZIP'):
+    for k in ('NAME', 'ADDRESS1', 'CITY', 'PROVINCE', 'ZIP', 'PHONE', 'EMAIL'):
         monkeypatch.delenv(f'SKYDROPX_FROM_{k}', raising=False)
     monkeypatch.setattr(envios, 'COMPRAR_GUIA_AL_PAGAR', True)
-    llamadas = _falsear_skydropx(monkeypatch, {'/shipments': GUIA_OK, '/labels': ETIQUETA_OK})
+    api = _falsear_skydropx(monkeypatch)
     orden = _orden('tarjeta')
     asyncio.run(db.orders.insert_one(orden))
 
     assert skydropx.remitente_configurado() is False
     assert asyncio.run(server.comprar_guia_del_pedido(orden)) is None
-    assert llamadas == []                                   # ni le habló a Skydropx
+    assert api.llamadas == []                               # ni le habló a Skydropx
     assert 'remitente' in db.orders.docs[0]['label_error'].lower()
 
 
 def test_el_remitente_de_ejemplo_grita_que_esta_pendiente(monkeypatch):
-    for k in ('NAME', 'ADDRESS1', 'CITY', 'PROVINCE', 'ZIP'):
+    for k in ('NAME', 'ADDRESS1', 'CITY', 'PROVINCE', 'ZIP', 'PHONE', 'EMAIL'):
         monkeypatch.delenv(f'SKYDROPX_FROM_{k}', raising=False)
     r = skydropx.remitente()
     assert skydropx.REMITENTE_PENDIENTE in r['address1']
     assert skydropx.REMITENTE_PENDIENTE in r['name']
+
+
+def test_sin_telefono_ni_correo_del_remitente_TAMPOCO_se_compra(monkeypatch, con_remitente):
+    """La API PRO los exige en /shipments: sin ellos la compra muere en un 422,
+    después de que el cliente ya pagó. Mejor negarse antes."""
+    monkeypatch.delenv('SKYDROPX_FROM_PHONE', raising=False)
+    assert skydropx.remitente_configurado() is False
 
 
 def test_con_remitente_configurado_si_compra(con_remitente):
@@ -544,7 +778,7 @@ def test_con_remitente_configurado_si_compra(con_remitente):
 
 def test_una_falla_de_skydropx_no_tumba_un_pedido_ya_pagado(db, con_llave, con_remitente, monkeypatch):
     monkeypatch.setattr(envios, 'COMPRAR_GUIA_AL_PAGAR', True)
-    _falsear_skydropx(monkeypatch, {'/shipments': RuntimeError('502 de Skydropx')})
+    _falsear_skydropx(monkeypatch, fallos={'/shipments': RuntimeError('502 de Skydropx')})
     orden = _orden('cripto')
     asyncio.run(db.orders.insert_one(orden))
     assert asyncio.run(server.comprar_guia_del_pedido(orden)) is None   # no revienta
@@ -553,34 +787,85 @@ def test_una_falla_de_skydropx_no_tumba_un_pedido_ya_pagado(db, con_llave, con_r
 
 def test_la_guia_respeta_el_servicio_que_eligio_el_cliente(db, con_llave, con_remitente, monkeypatch):
     monkeypatch.setattr(envios, 'COMPRAR_GUIA_AL_PAGAR', True)
-    dos = {'data': {'id': 's1', 'relationships': {'rates': {'data': [
-        {'id': '1', 'attributes': {'provider': 'Estafeta', 'service_level_code': 'est_ter',
-                                   'service_level_name': 'Terrestre', 'days': 4, 'total_pricing': '180'}},
-        {'id': '2', 'attributes': {'provider': 'Estafeta', 'service_level_code': 'est_dia',
-                                   'service_level_name': 'Día Siguiente', 'days': 1, 'total_pricing': '320'}},
-    ]}}}}
-    llamadas = _falsear_skydropx(monkeypatch, {'/shipments': dos, '/labels': ETIQUETA_OK})
+    api = _falsear_skydropx(monkeypatch)
     orden = _orden('tarjeta')
-    orden['shipping_quote']['service_code'] = 'est_dia'      # eligió el caro
+    orden['shipping_quote']['service_code'] = 'estafeta_next_day'   # eligió el caro
     asyncio.run(db.orders.insert_one(orden))
     asyncio.run(server.comprar_guia_del_pedido(orden))
-    etiqueta = next(l for l in llamadas if l['ruta'] == '/labels')
-    assert etiqueta['cuerpo']['rate_id'] == '2'              # el que eligió, no el barato
+    envio = _peticiones(api, '/shipments')[0]['cuerpo']['shipment']
+    assert envio['rate_id'] == 'r-est-exp'          # el que eligió, no el barato
+
+
+def test_si_el_servicio_elegido_ya_no_existe_cae_en_el_mas_barato_PERMITIDO(
+        db, con_llave, con_remitente, monkeypatch):
+    """Nunca en una paquetería que el cliente no pidió ni en un plazo que no se le
+    prometió: la de 7 días sigue descartada aunque sea la más barata."""
+    monkeypatch.setattr(envios, 'COMPRAR_GUIA_AL_PAGAR', True)
+    api = _falsear_skydropx(monkeypatch)
+    orden = _orden('tarjeta')
+    orden['shipping_quote']['service_code'] = 'ya-no-existe'
+    asyncio.run(db.orders.insert_one(orden))
+    asyncio.run(server.comprar_guia_del_pedido(orden))
+    envio = _peticiones(api, '/shipments')[0]['cuerpo']['shipment']
+    assert envio['rate_id'] == 'r-fedex-sav'        # $52.45 en 4 días, no la de 7
 
 
 # ==========================================================================
-#  7. La llave: entorno, panel y lista blanca
+#  7. Las credenciales: OAuth2, entorno, panel y lista blanca
 # ==========================================================================
-def test_la_llave_de_skydropx_se_puede_pegar_desde_el_admin():
+def test_las_credenciales_de_skydropx_se_pueden_pegar_desde_el_admin():
     import secretos
-    assert 'SKYDROPX_API_KEY' in secretos.PERMITIDAS
+    assert 'SKYDROPX_CLIENT_ID' in secretos.PERMITIDAS
+    assert 'SKYDROPX_CLIENT_SECRET' in secretos.PERMITIDAS
+    # La de la API vieja ya no sirve para nada: no se guarda.
+    assert 'SKYDROPX_API_KEY' not in secretos.PERMITIDAS
 
 
-def test_la_llave_viaja_en_el_encabezado_que_pide_skydropx(monkeypatch):
-    llamadas = _falsear_skydropx(monkeypatch, {'/quotations': []})
-    monkeypatch.setenv('SKYDROPX_API_KEY', 'abc123')
-    skydropx.cotizar('64000', {'peso_kg': 1})
-    assert llamadas[0]['headers']['Authorization'] == 'Token token=abc123'
+def test_el_token_viaja_como_Bearer_y_no_como_la_llave_vieja(monkeypatch, con_llave):
+    api = _falsear_skydropx(monkeypatch)
+    skydropx.cotizar('64000', BULTO)
+    oauth = next(l for l in api.llamadas if l['ruta'] == '/oauth/token')
+    assert oauth['cuerpo']['grant_type'] == 'client_credentials'
+    assert oauth['cuerpo']['client_id'] == 'id-de-prueba'
+    for l in _peticiones(api):
+        assert l['headers']['Authorization'] == 'Bearer token-1'
+
+
+def test_el_token_se_guarda_y_no_se_pide_en_cada_cotizacion(monkeypatch, con_llave):
+    """Pedir token en cada llamada duplicaría el tráfico. Dura 2 horas."""
+    api = _falsear_skydropx(monkeypatch)
+    skydropx.cotizar('64000', BULTO)
+    skydropx.cotizar('64000', BULTO)
+    assert api.tokens == 1
+
+
+def test_un_token_vencido_se_renueva_solo(monkeypatch, con_llave):
+    api = _falsear_skydropx(monkeypatch)
+    skydropx.cotizar('64000', BULTO)
+    skydropx._TOKEN['vence'] = 0            # como si hubieran pasado las 2 horas
+    skydropx.cotizar('64000', BULTO)
+    assert api.tokens == 2
+
+
+def test_un_401_pide_token_nuevo_y_reintenta_UNA_vez(monkeypatch, con_llave):
+    """Un token puede morir antes de tiempo (lo revocan desde el panel). Que eso
+    tumbe una cotización sería tirar una venta por un trámite."""
+    api = _falsear_skydropx(monkeypatch, un_401_en='/quotations')
+    opciones = skydropx.cotizar('64000', BULTO)
+    assert opciones and api.tokens == 2
+    assert len(_peticiones(api, '/quotations')) == 2
+
+
+def test_un_401_que_no_cede_no_se_reintenta_en_bucle(monkeypatch, con_llave):
+    api = _falsear_skydropx(monkeypatch, fallos={'/quotations': 401})
+    with pytest.raises(RuntimeError):
+        skydropx.cotizar('64000', BULTO)
+    assert len(_peticiones(api, '/quotations')) == 2      # dos, y ya
+
+
+def test_la_url_por_omision_es_la_de_skydropx_PRO():
+    """La vieja (api.skydropx.com/v1) no entiende OAuth2 ni cotiza en diferido."""
+    assert skydropx.API == 'https://pro.skydropx.com/api/v1'
 
 
 # ==========================================================================

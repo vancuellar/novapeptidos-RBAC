@@ -1057,8 +1057,9 @@ async def shipping_quote(payload: ShippingQuoteRequest):
     """
     if not envio_se_cotiza():
         if envios.COTIZAR_EN_CHECKOUT and not skydropx.enabled():
-            logger.info('Envio: no se cotiza porque falta SKYDROPX_API_KEY '
-                        '(se pega en Admin → Cobros o en el entorno).')
+            logger.info('Envio: no se cotiza porque faltan SKYDROPX_CLIENT_ID / '
+                        'SKYDROPX_CLIENT_SECRET (se pegan en Admin → Cobros o en '
+                        'el entorno).')
         return {'enabled': False, 'options': []}
     cp = (payload.postal_code or '').strip()
     if len(cp) < 5:
@@ -1070,7 +1071,11 @@ async def shipping_quote(payload: ShippingQuoteRequest):
     if not paquete['peso_kg']:
         return {'enabled': True, 'options': [], 'detail': 'El carrito está vacío'}
     try:
-        opciones = skydropx.cotizar(cp, paquete)
+        # El estado y la ciudad viajan solo para llenar los campos de zona que la
+        # API PRO exige. El precio lo decide el CP (comprobado en vivo), así que si
+        # el checkout no los manda no cambia nada.
+        opciones = skydropx.cotizar(cp, paquete, destino={
+            'province': payload.state, 'city': payload.city, 'country': payload.country})
     except Exception:
         logger.exception('Skydropx: no se pudo cotizar a %s', cp)
         return {'enabled': False, 'options': [], 'detail': 'La paquetería no respondió'}
@@ -1114,7 +1119,10 @@ async def _envio_del_pedido(payload, paid_merchandise, pflags):
         # Cotización vencida, ausente, de otro CP o de otro peso: se cotiza de nuevo
         # AQUÍ, con el carrito de verdad. Se toma la más barata de las permitidas.
         try:
-            frescas = skydropx.cotizar(cp, paquete)
+            frescas = skydropx.cotizar(cp, paquete, destino={
+                'province': getattr(payload.customer, 'state', '') or '',
+                'city': getattr(payload.customer, 'city', '') or '',
+                'country': getattr(payload.customer, 'country', 'MX') or 'MX'})
         except Exception:
             logger.exception('Skydropx: no se pudo recotizar el pedido a %s', cp)
             frescas = []
@@ -1155,7 +1163,8 @@ async def comprar_guia_del_pedido(order: dict) -> dict | None:
     if not order or order.get('tracking_number'):
         return None                     # ya tiene guía: no se compra dos veces
     if not skydropx.enabled():
-        logger.info('Envio: no se compra guia de %s porque falta SKYDROPX_API_KEY',
+        logger.info('Envio: no se compra guia de %s porque faltan las credenciales '
+                    'de Skydropx PRO (SKYDROPX_CLIENT_ID / SKYDROPX_CLIENT_SECRET)',
                     order.get('order_number'))
         return None
     if not skydropx.remitente_configurado():
