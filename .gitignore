@@ -86,3 +86,9 @@ android-sdk/
 credentials.json
 *.key
 .credentials
+
+# iCloud vaciaba los archivos del entorno de Python y pytest se colgaba para
+# siempre. La carpeta real es .venv.nosync (el sufijo le dice a iCloud que no la
+# sincronice) y .venv es un enlace hacia ella. Ninguna de las dos se sube.
+.venv.nosync/
+.venv
