@@ -1,4 +1,4 @@
-# SES production-access request (ready to submit once DKIM verifies)
+# SES production-access request (DKIM de exygenlabs.com: VERIFICADO 2026-07-29)
 
 Submit with:
 
@@ -6,16 +6,16 @@ Submit with:
 aws sesv2 put-account-details \
   --production-access-enabled \
   --mail-type TRANSACTIONAL \
-  --website-url https://novapeptidos.mx \
+  --website-url https://exygenlabs.com \
   --use-case-description "$(cat <<'EOF'
-Nova Peptides (novapeptidos.mx) is an e-commerce store serving customers in Mexico.
+Exygen Labs (exygenlabs.com) is an e-commerce store serving customers in Mexico.
 We send TRANSACTIONAL email only, triggered by explicit customer actions:
 (1) account-creation confirmations and (2) order status notifications.
 
 - Recipients: only customers who created an account or placed an order on our site
   (double opt-in by nature of the action). No marketing, no bulk mail, no purchased lists.
 - Volume: very low - under 50 emails/day initially, well under 200/day at scale.
-- From address: hola@novapeptidos.mx on our DKIM-verified domain.
+- From address: hola@exygenlabs.com on our DKIM-verified domain.
 - Bounce/complaint handling: SES account-level suppression list is enabled for both
   BOUNCE and COMPLAINT. Hard-bounced and complaining addresses are never mailed again.
 - Unsubscribe/contact: every email footer includes our contact address and a note to
