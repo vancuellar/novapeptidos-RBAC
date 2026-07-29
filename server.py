@@ -3458,17 +3458,36 @@ async def download_coa(lot: str, user=Depends(get_current_user)):
 # agencias. Ver ficha_store.py.
 
 
+def _ve_el_catalogo_completo(user) -> bool:
+    """¿Esta persona ve TODAS las fichas, no solo las de lo que compró?
+
+    Un distribuidor vende el catálogo entero: necesita la ficha de cualquier
+    compuesto para contestarle a su cliente antes de que exista el pedido.
+    Atarlo a lo que él compró lo dejaba sin material de venta. Decisión de
+    Christian, 2026-07-29. Los COA siguen igual: esos acreditan un lote que se
+    entregó, y solo los ve quien lo recibió.
+    """
+    return user.get('role') in ('distributor', 'admin')
+
+
 @api_router.get('/me/fichas')
 async def mis_fichas(user=Depends(get_current_user)):
-    """Fichas técnicas de los productos que el usuario compró."""
+    """Fichas técnicas: el catálogo completo si es distribuidor, y si no, las
+    de los productos que el usuario compró."""
+    if _ve_el_catalogo_completo(user):
+        return ficha_store.para_slugs(ficha_store.slugs_disponibles())
     slugs = await _user_product_slugs(user['id'])
     return ficha_store.para_slugs(slugs)
 
 
 @api_router.get('/me/ficha/{slug}')
 async def descargar_mi_ficha(slug: str, user=Depends(get_current_user)):
-    """Descarga la ficha de un producto que el usuario compró."""
-    slugs = await _user_product_slugs(user['id'])
+    """Descarga la ficha de un producto que el usuario compró (o cualquiera,
+    si es distribuidor)."""
+    if _ve_el_catalogo_completo(user):
+        slugs = set(ficha_store.slugs_disponibles())
+    else:
+        slugs = await _user_product_slugs(user['id'])
     if slug not in slugs or not ficha_store.existe(slug):
         # 404 y no 403: a quien no compró no se le confirma qué fichas hay.
         raise HTTPException(status_code=404, detail='Ficha no encontrada')
