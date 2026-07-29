@@ -1915,6 +1915,11 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
                 else:
                     merged[k] = dict(r)
         commissions = list(merged.values())
+        # ⛔ La misma regla del canje al 100% pero sin el escalón: de mercancía
+        # cobrada en puntos no se paga comisión (ver pyramid.prorratear_por_dinero).
+        if points_used > 0:
+            commissions = pyramid.prorratear_por_dinero(
+                commissions, paid_merchandise, after_discount)
         commission = pyramid.seller_amount(commissions)
     order = Order(
         order_number=gen_order_number(),

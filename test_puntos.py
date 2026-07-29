@@ -188,3 +188,51 @@ def test_la_reactivacion_se_cobra_antes_de_depositar_puntos_nuevos():
     cuerpo = src.split('async def update_order_status(')[1].split('\n@api_router')[0]
     assert 'recobrar_puntos_canjeados(order)' in cuerpo
     assert cuerpo.index('recobrar_puntos_canjeados(') < cuerpo.index('award_order_points(')
+
+
+# ---------- comisión sobre mercancía pagada en puntos (el agujero del canje parcial) ----------
+# La regla del 100% ya existía; estas pruebas cuidan el hueco de en medio: puntos
+# pagando el 99% y $1 en efectivo NO puede pagar la comisión completa.
+
+import pyramid
+
+
+def _reparto():
+    return [{'distributor_id': 'd1', 'role': 'seller', 'amount': 1000},
+            {'distributor_id': 'd2', 'role': 'upline', 'amount': 200}]
+
+
+def test_sin_puntos_la_comision_no_se_toca():
+    rows = pyramid.prorratear_por_dinero(_reparto(), 10000, 10000)
+    assert [r['amount'] for r in rows] == [1000, 200]
+
+
+def test_mitad_en_puntos_mitad_de_comision():
+    rows = pyramid.prorratear_por_dinero(_reparto(), 5000, 10000)
+    assert [r['amount'] for r in rows] == [500, 100]
+
+
+def test_un_peso_en_dinero_casi_no_paga_comision():
+    # 9,999 de 10,000 en puntos: la comisión del vendedor cae a la milésima parte.
+    rows = pyramid.prorratear_por_dinero(_reparto(), 1, 10000)
+    assert sum(r['amount'] for r in rows) <= 1
+
+
+def test_todo_en_puntos_deja_cero_renglones():
+    rows = pyramid.prorratear_por_dinero(_reparto(), 0, 10000)
+    assert rows == []
+
+
+def test_los_renglones_en_cero_se_quitan():
+    rows = pyramid.prorratear_por_dinero(_reparto(), 100, 10000)  # 1%
+    # el upline de $200 queda en $2; el vendedor de $1000 en $10 — ninguno en 0
+    assert all(r['amount'] > 0 for r in rows)
+
+
+def test_el_checkout_prorratea_cuando_hay_puntos():
+    # El endpoint es demasiado grande para armarlo aquí; se comprueba que el
+    # prorrateo esté DENTRO del camino del checkout y ANTES de fijar la comisión.
+    src = open(server.__file__, encoding='utf-8').read()
+    cuerpo = src.split('pagado_todo_con_puntos = ')[1].split('order = Order(')[0]
+    assert 'prorratear_por_dinero(' in cuerpo
+    assert cuerpo.index('prorratear_por_dinero(') < cuerpo.index('seller_amount(')

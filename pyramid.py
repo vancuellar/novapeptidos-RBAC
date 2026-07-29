@@ -238,3 +238,26 @@ def cap_breakdown(rows, merchandise, cap_rate):
         r['capped'] = True
         out.append(r)
     return out
+
+
+def prorratear_por_dinero(rows, paid_merchandise, after_discount):
+    """Escala el reparto a la fracción de la mercancía que se pagó EN DINERO.
+
+    La misma regla del canje al 100% (Christian, 2026-07-28) pero sin el escalón:
+    de mercancía cobrada en puntos no se paga comisión. Con puntos pagando el 99%
+    y $1 en efectivo, la comisión salía completa sobre dinero que nunca entró —
+    el mismo agujero del canje total, repartido en dos pedidos. La comisión se
+    prorratea por lo que sí entró; sin puntos la fracción es 1 y no cambia nada.
+    Los renglones que quedan en $0 se quitan: una comisión de cero no se reporta."""
+    if not rows or after_discount <= 0:
+        return rows
+    fraccion = max(0.0, min(1.0, float(paid_merchandise) / float(after_discount)))
+    if fraccion >= 1.0:
+        return rows
+    out = []
+    for r in rows:
+        r = dict(r)
+        r['amount'] = round(r['amount'] * fraccion)
+        if r['amount'] > 0:
+            out.append(r)
+    return out
