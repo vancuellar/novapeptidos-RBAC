@@ -3490,10 +3490,13 @@ async def descargar_mi_ficha(slug: str, user=Depends(get_current_user)):
     """Descarga la ficha de un producto que el usuario compró (o cualquiera,
     si es distribuidor)."""
     if _ve_el_catalogo_completo(user):
-        slugs = set(ficha_store.slugs_disponibles())
+        permitidas = set(ficha_store.slugs_disponibles())
     else:
-        slugs = await _user_product_slugs(user['id'])
-    if slug not in slugs or not ficha_store.existe(slug):
+        # Lo que compró son PRESENTACIONES ("retatrutida-40-mg"); `para_slugs`
+        # las traduce al compuesto, que es como se llama la ficha.
+        comprados = await _user_product_slugs(user['id'])
+        permitidas = {f['product_slug'] for f in ficha_store.para_slugs(comprados)}
+    if slug not in permitidas or not ficha_store.existe(slug):
         # 404 y no 403: a quien no compró no se le confirma qué fichas hay.
         raise HTTPException(status_code=404, detail='Ficha no encontrada')
     path = ficha_store.ruta_de(slug)

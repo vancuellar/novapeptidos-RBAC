@@ -41,6 +41,61 @@ def test_para_slugs_filtra_lo_que_no_tiene_ficha(store):
     assert [x['product_slug'] for x in r] == ['bpc-157']
 
 
+# ------------------------------------- presentación del catálogo → compuesto
+# En la base cada presentación es su propio producto ("retatrutida-40-mg") y la
+# ficha es del compuesto ("retatrutida"). Sin recortar el sufijo no emparejaba
+# ni uno de los 193 productos del catálogo. Encontrado en vivo el 2026-07-29.
+
+@pytest.fixture()
+def store2(tmp_path, monkeypatch):
+    """Fichas con nombres que sí llevan número propio, que es donde duele."""
+    for n in ('BPC-157', 'THYMOSIN-ALPHA-1', 'SNAP-8', 'NAD-PLUS'):
+        (tmp_path / f'FICHA-TECNICA-{n}.pdf').write_bytes(b'%PDF-1.4')
+    monkeypatch.setenv('FICHA_DIR', str(tmp_path))
+    import ficha_store
+    return importlib.reload(ficha_store)
+
+
+@pytest.mark.parametrize('comprado,ficha', [
+    ('bpc-157-10-mg', 'bpc-157'),
+    ('bpc-157', 'bpc-157'),              # ya viene limpio
+    ('nad-plus-500-mg', 'nad-plus'),
+    ('nad-plus-1-5-mg', 'nad-plus'),     # decimal: 1.5 mg
+    ('bpc-157-60mg', 'bpc-157'),         # unidad pegada
+    # El número es parte del NOMBRE: no se puede recortar de más.
+    ('thymosin-alpha-1-5-mg', 'thymosin-alpha-1'),
+    ('thymosin-alpha-1-10-mg', 'thymosin-alpha-1'),
+    ('snap-8-10-mg', 'snap-8'),
+    ('snap-8-100-mg', 'snap-8'),
+])
+def test_la_presentacion_encuentra_su_compuesto(store2, comprado, ficha):
+    assert store2.compuesto_de(comprado) == ficha
+    assert [x['product_slug'] for x in store2.para_slugs([comprado])] == [ficha]
+
+
+@pytest.mark.parametrize('comprado', [
+    'pinealon-5-mg',        # compuesto sin ficha: no debe inventar
+    'cardiogen-20-mg',
+    'bpc',                  # un pedazo del nombre no vale
+    'bpc-157-x-mg',
+    '', None, 123,
+])
+def test_no_inventa_una_ficha_que_no_existe(store2, comprado):
+    assert store2.compuesto_de(comprado) is None
+
+
+def test_el_recorte_no_entrega_la_ficha_de_otro(store2):
+    """Recortar de más no puede acabar en el compuesto del vecino: se exige
+    que el resultado exista en disco."""
+    assert store2.compuesto_de('snap-8-10-mg') == 'snap-8'
+    assert store2.compuesto_de('snap-10-mg') is None
+
+
+def test_varias_presentaciones_dan_una_sola_ficha(store2):
+    r = store2.para_slugs(['bpc-157-5-mg', 'bpc-157-10-mg', 'bpc-157-20-mg'])
+    assert [x['product_slug'] for x in r] == ['bpc-157']
+
+
 # ------------------------------------------------------- no salirse de la carpeta
 
 @pytest.mark.parametrize('malo', [
