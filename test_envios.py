@@ -574,3 +574,66 @@ def test_la_llave_viaja_en_el_encabezado_que_pide_skydropx(monkeypatch):
     monkeypatch.setenv('SKYDROPX_API_KEY', 'abc123')
     skydropx.cotizar('64000', {'peso_kg': 1})
     assert llamadas[0]['headers']['Authorization'] == 'Token token=abc123'
+
+
+# ==========================================================================
+#  8. EL TOPE DEL 10% TAMBIÉN EN LA TARIFA PLANA (Christian, 2026-07-28)
+#
+#  «Envío gratis arriba de $2,500 PERO con tope del 10%: si una compra por 2,500
+#  genera un costo de envío de $500 ni en pedo lo pago.»
+#
+#  El camino de la tarifa plana (`shipping_for`, el que se usará el día que
+#  `COBRAR_ENVIO` se ponga en True) tenía su PROPIA cuenta —"gratis arriba de
+#  $2,500"— que nunca miraba lo que la guía costaba de verdad. La regla del 10%
+#  existía sólo en el camino de Skydropx. Ahora hay UNA sola regla.
+# ==========================================================================
+def test_la_tarifa_plana_usa_LA_MISMA_regla_del_10_por_ciento():
+    """`shipping_for` no decide nada por su cuenta: delega en la regla de envios.py."""
+    for compra in (0, 179, 879, 2499, 2500, 3000, 50000):
+        assert server.shipping_for(compra) == envios.cobro_de_envio_al_cliente(
+            server.SHIPPING_FLAT, compra, server.FREE_SHIPPING_FROM)
+
+
+def test_un_pedido_de_179_NUNCA_lleva_envio_gratis():
+    """$250 de guía sobre $179 de mercancía es el 140% del pedido."""
+    assert server.shipping_for(179) == server.SHIPPING_FLAT
+    assert envios.cobro_de_envio_al_cliente(250, 179, server.FREE_SHIPPING_FROM) == 250
+    assert envios.tope_que_absorbe_la_casa(179) == 17.9
+
+
+def test_una_guia_cara_ya_no_se_regala_por_pasar_el_umbral():
+    """$2,600 de compra con una guía REAL de $500: el 19%. No va gratis.
+    Antes `shipping_for` devolvía 0 para cualquier compra arriba de $2,500,
+    costara lo que costara la guía."""
+    assert server.shipping_for(2600, costo_real=500) == 500
+    assert server.shipping_for(2600, costo_real=250) == 0      # el 9.6%: sí cabe
+
+
+def test_lo_que_la_casa_absorbe_y_cuanto_se_pasa_del_tope():
+    # Pedido de $179, guía de $250, cobro apagado: la casa se come los $250 enteros.
+    assert envios.envio_que_absorbe_la_casa(250, 0) == 250
+    assert envios.absorcion_fuera_de_tope(250, 179, 0) == 232.1     # 250 − 17.90
+    # Pedido de $3,000 con guía de $250: cabe en el 10%, no se pasa de nada.
+    assert envios.absorcion_fuera_de_tope(250, 3000, 0) == 0
+    # Y si el cliente la pagó, la casa no absorbe nada.
+    assert envios.envio_que_absorbe_la_casa(250, 250) == 0
+    assert envios.absorcion_fuera_de_tope(250, 179, 250) == 0
+
+
+def test_las_funciones_del_tope_no_revientan_con_basura():
+    assert envios.tope_que_absorbe_la_casa(None) == 0
+    assert envios.tope_que_absorbe_la_casa('x') == 0
+    assert envios.envio_que_absorbe_la_casa(None, None) == 0
+    assert envios.envio_que_absorbe_la_casa('a', 'b') == 0
+    assert envios.absorcion_fuera_de_tope(None, None, None) == 0
+
+
+def test_el_pedido_guarda_lo_que_la_casa_absorbe_aunque_no_cobre_envio():
+    """Con el cobro apagado el pedido guardaba costo $0 y absorbido $0: los $250
+    que la casa se come no existían en ningún reporte."""
+    assert server.COBRAR_ENVIO is False              # ⛔ política del dueño, no se toca
+    cobrado = server.shipping_for(179) if server.COBRAR_ENVIO else 0
+    costo_guia = server.SHIPPING_FLAT                 # sin cotización, la tarifa plana
+    assert cobrado == 0
+    assert envios.envio_que_absorbe_la_casa(costo_guia, cobrado) == 250
+    assert envios.absorcion_fuera_de_tope(costo_guia, 179, cobrado) > 0

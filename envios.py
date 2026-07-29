@@ -182,6 +182,52 @@ def cobro_de_envio_al_cliente(costo_envio: float, mercancia_pagada: float,
     return round(costo - tope)
 
 
+def tope_que_absorbe_la_casa(mercancia_pagada: float) -> float:
+    """El MÁXIMO de envío que la casa está dispuesta a comerse en un pedido.
+
+    Es el 10% de lo que el cliente pagó de mercancía, y ni un peso más. Palabras de
+    Christian: «si una compra por 2,500 genera un costo de envío de $500 ni en pedo
+    lo pago». Un pedido de $179 tiene un tope de $17.90 — por eso nunca puede llevar
+    envío gratis.
+    """
+    try:
+        mercancia = max(0.0, float(mercancia_pagada or 0))
+    except (TypeError, ValueError):
+        mercancia = 0.0
+    return round(mercancia * TOPE_ENVIO_SOBRE_COMPRA, 2)
+
+
+def envio_que_absorbe_la_casa(costo_envio: float, cobrado_al_cliente: float) -> float:
+    """Lo que la guía le cuesta a la casa DESPUÉS de lo que pagó el cliente.
+
+    El espejo de `cobro_de_envio_al_cliente`. Existe porque el número que duele no
+    es el que se cobra sino el que NO se cobra: hoy el checkout no cobra envío
+    (`COBRAR_ENVIO = False` en server.py, decisión de Christian), así que la casa
+    absorbe el 100% de cada guía y en el pedido eso se guardaba como $0 — un pedido
+    de $179 se llevaba $250 de envío, el 140%, y no aparecía en ningún reporte.
+    """
+    try:
+        costo = max(0.0, float(costo_envio or 0))
+    except (TypeError, ValueError):
+        costo = 0.0
+    try:
+        cobrado = max(0.0, float(cobrado_al_cliente or 0))
+    except (TypeError, ValueError):
+        cobrado = 0.0
+    return round(max(0.0, costo - cobrado), 2)
+
+
+def absorcion_fuera_de_tope(costo_envio: float, mercancia_pagada: float,
+                            cobrado_al_cliente: float) -> float:
+    """Cuánto se pasó la casa del tope del 10% en ESTE pedido. 0 si respetó la regla.
+
+    No decide nada: mide. Sirve para que un envío que se traga el pedido se vea en
+    la orden y en la bitácora en vez de desaparecer, mientras el cobro siga apagado.
+    """
+    absorbido = envio_que_absorbe_la_casa(costo_envio, cobrado_al_cliente)
+    return round(max(0.0, absorbido - tope_que_absorbe_la_casa(mercancia_pagada)), 2)
+
+
 # ------------------------------------------------- vigencia de una cotización
 # Una cotización guardada solo vale unos minutos. No es burocracia: es lo que
 # impide que alguien cotice hoy a $150, guarde el id y lo use dentro de un mes

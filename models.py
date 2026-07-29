@@ -293,6 +293,10 @@ class Order(BaseModel):
     shipping_quote: dict = Field(default_factory=dict)
     shipping_cost: float = 0            # lo que cuesta la guía de verdad
     shipping_absorbed: float = 0        # lo que la casa absorbió del envío
+    # Cuánto se pasó esa absorción del tope del 10% de la compra (regla de Christian).
+    # Cero cuando se respeta. Sin este número, un envío que se traga el pedido no
+    # existe en ningún reporte: un pedido de $179 con guía de $250 se veía en $0.
+    shipping_over_cap: float = 0
     label_url: str = ''                 # PDF de la guía
     label_provider: str = ''            # 'skydropx'
     label_error: str = ''               # por qué no se pudo comprar sola (si pasó)

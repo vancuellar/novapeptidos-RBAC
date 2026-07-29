@@ -951,15 +951,25 @@ FREE_SHIPPING_FROM = int(SHIPPING_FLAT / TOPE_ENVIO_SOBRE_COMPRA)   # 250 / 10% 
 COBRAR_ENVIO = False
 
 
-def shipping_for(merchandise_paid):
+def shipping_for(merchandise_paid, costo_real=None):
     """Cuanto se le cobra de envio a un pedido, CUANDO se cobra.
 
     Se mide sobre lo que el cliente PAGA de mercancia (ya con descuento), no sobre
     el precio de lista: si no, un codigo grande dejaria el envio gratis cobrando
     mucho menos. Primero el ROI.
 
+    ⛔ LA REGLA DEL 10% VIVE EN UN SOLO SITIO: `envios.cobro_de_envio_al_cliente`.
+    Esta funcion solo le pone el costo por omision (la tarifa plana) y el umbral. Antes
+    tenia su propia cuenta —"gratis arriba de $2,500"— que NUNCA miraba lo que la guia
+    costaba de verdad: con un envio real de $500, un pedido de $2,600 salia gratis y la
+    casa absorbia el 19%. Palabras de Christian: «si una compra por 2,500 genera un
+    costo de envio de $500 ni en pedo lo pago».
+
+    `costo_real` es lo que cuesta ESA guia. Si no se pasa, se asume la tarifa plana.
+
     OJO: hoy no la llama nadie para cobrar — ver COBRAR_ENVIO arriba."""
-    return 0 if float(merchandise_paid or 0) >= FREE_SHIPPING_FROM else SHIPPING_FLAT
+    costo = SHIPPING_FLAT if costo_real is None else costo_real
+    return envios.cobro_de_envio_al_cliente(costo, merchandise_paid, FREE_SHIPPING_FROM)
 
 
 # ==========================================================================
@@ -1511,6 +1521,36 @@ async def _devolver_reserva(reservado):
                                      {'$inc': {'stock': n}})
 
 
+async def _apartar_puntos(user_id, puntos) -> bool:
+    """Aparta puntos del saldo COMPARANDO Y RESTANDO EN EL MISMO PASO.
+
+    ⛔ ES EL MISMO CANDADO QUE `_reservar_inventario`, y por la misma razón. El saldo se
+    leía en una consulta (`find_one` → `clamp_redeem`) y se restaba MUCHO después, ya
+    grabado el pedido. Entre las dos cosas cabía otro checkout del mismo cliente: los
+    dos leían 1,000 puntos, los dos los canjeaban enteros y el saldo terminaba en −1,000.
+    El cliente pagaba dos pedidos con los mismos puntos. Es dinero que sale, no un
+    desajuste cosmético: 1 punto = 1 peso de mercancía.
+
+    Aquí la condición viaja DENTRO del update (`points_balance >= lo que pides`): si el
+    otro pedido ya se los llevó, Mongo no encuentra el documento, no resta nada y se
+    devuelve False. Nunca deja el saldo en negativo.
+    """
+    puntos = int(puntos or 0)
+    if puntos <= 0:
+        return True
+    r = await db.users.update_one(
+        {'id': user_id, 'points_balance': {'$gte': puntos}},
+        {'$inc': {'points_balance': -puntos}})
+    return bool(r.matched_count)
+
+
+async def _devolver_puntos(user_id, puntos):
+    """Regresa los puntos apartados por un pedido que no llegó a existir."""
+    puntos = int(puntos or 0)
+    if puntos > 0:
+        await db.users.update_one({'id': user_id}, {'$inc': {'points_balance': puntos}})
+
+
 async def restore_order_stock(order):
     """Devuelve al inventario lo que la orden se habia llevado. Se llama al
     CANCELAR y al BORRAR: antes el stock se descontaba y nunca regresaba, asi que
@@ -1553,6 +1593,36 @@ async def revoke_order_points(order):
         if res.modified_count:
             await db.users.update_one({'id': order['user_id']}, {'$inc': {'points_balance': int(order['points_used'])}})
             await _points_entry(order['user_id'], order, 'refund', order['points_used'])
+
+
+async def recobrar_puntos_canjeados(order):
+    """Un pedido que sale de 'cancelado' vuelve a pagar sus puntos. Idempotente.
+
+    ⛔ EL OTRO DOBLE GASTO. Cancelar devolvía los puntos canjeados y ponía la marca
+    `points_refunded`; reactivar el pedido no hacía nada con ella. Así el cliente se
+    quedaba con el pedido Y con los puntos: los mismos puntos pagaron dos veces, esta
+    vez sin necesidad de dos pedidos simultáneos — bastaba cancelar y volver a
+    confirmar. Se descuentan comparando y restando en el mismo paso, y si el saldo ya
+    no alcanza (se los gastó mientras el pedido estaba cancelado) NO se deja el saldo
+    en negativo: se avisa en la bitácora para que un humano lo resuelva.
+    """
+    if not order.get('user_id') or not order.get('points_refunded'):
+        return
+    usados = int(order.get('points_used', 0) or 0)
+    if usados <= 0:
+        return
+    res = await db.orders.update_one({'id': order['id'], 'points_refunded': True},
+                                     {'$set': {'points_refunded': False}})
+    if not res.modified_count:
+        return
+    if await _apartar_puntos(order['user_id'], usados):
+        await _points_entry(order['user_id'], order, 'redeem', -usados)
+    else:
+        await db.orders.update_one({'id': order['id']},
+                                   {'$set': {'points_refunded': True}})
+        logger.warning('PUNTOS SIN RECOBRAR: el pedido %s se reactivó pero el cliente %s '
+                       'ya no tiene los %s puntos que había canjeado.',
+                       order.get('order_number'), order['user_id'], usados)
 
 
 @api_router.get('/me/points')
@@ -1768,6 +1838,22 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # apagado, del camino de siempre.
     shipping, shipping_quote = await _envio_del_pedido(payload, paid_merchandise, _pflags)
     total = paid_merchandise + shipping
+    # Lo que la guia cuesta DE VERDAD. Sin cotizacion de Skydropx no es cero: es la
+    # tarifa plana, que es lo que la paqueteria cobra igual. Se calculaba con
+    # `shipping_quote.get('cost') or 0` y con el cobro apagado la cotizacion viene
+    # vacia, asi que TODO pedido guardaba costo $0 y absorbido $0 — un pedido de $179
+    # se llevaba $250 de envio (el 140%) y no aparecia en ningun reporte. (2026-07-28)
+    costo_guia = float(shipping_quote.get('cost') or SHIPPING_FLAT)
+    envio_absorbido = envios.envio_que_absorbe_la_casa(costo_guia, shipping)
+    fuera_de_tope = envios.absorcion_fuera_de_tope(costo_guia, paid_merchandise, shipping)
+    if fuera_de_tope > 0:
+        # No bloquea la venta —el dueño decidió no cobrar envío— pero deja constancia:
+        # la regla de la casa es absorber como máximo el 10% de la compra.
+        logger.warning(
+            'ENVIO FUERA DE TOPE: la casa absorbe $%.0f de guia en una compra de $%.0f '
+            '(tope 10%% = $%.0f, se pasa por $%.0f).',
+            envio_absorbido, paid_merchandise,
+            envios.tope_que_absorbe_la_casa(paid_merchandise), fuera_de_tope)
     # `discount_rate` es el descuento CONCEDIDO: con el máximo (40%) el pedido no
     # genera puntos. Ver la regla en loyalty.py.
     points_earned = loyalty.earn(paid_merchandise, user is not None and loyalty.eligible(user),
@@ -1826,10 +1912,12 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         discount_capped=discount_capped,
         shipping=shipping,
         shipping_quote=shipping_quote,
-        shipping_cost=float(shipping_quote.get('cost') or 0),
+        shipping_cost=costo_guia,
         # Lo que la casa se comió del envío. Sin este número nadie sabe cuánto
         # cuesta de verdad la promesa de "envío gratis".
-        shipping_absorbed=max(0.0, float(shipping_quote.get('cost') or 0) - float(shipping or 0)),
+        shipping_absorbed=envio_absorbido,
+        # Lo que se pasó del tope del 10% en ESTE pedido. Cero cuando se respeta.
+        shipping_over_cap=fuera_de_tope,
         total=total,
         referred_by=referrer['id'] if referrer else None,
         commission=commission,
@@ -1852,10 +1940,19 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         # honesta: mejor un "ya no hay" que cobrar algo que no se puede mandar.
         raise HTTPException(status_code=409,
                             detail='Se agotó mientras comprabas: ' + '; '.join(agotados))
+    # ⛔ Y LOS PUNTOS SE APARTAN AQUÍ MISMO, igual que las piezas y por lo mismo: el saldo
+    # se leyó arriba y se restaba hasta después de grabar, así que dos pedidos a la vez
+    # gastaban los MISMOS puntos (ver `_apartar_puntos`).
+    if points_used and not await _apartar_puntos(user['id'], points_used):
+        await _devolver_reserva(reservado)
+        raise HTTPException(
+            status_code=409,
+            detail='Tus puntos cambiaron mientras comprabas. Vuelve a intentarlo.')
     try:
         await db.orders.insert_one(order.model_dump())
     except Exception:
         await _devolver_reserva(reservado)      # sin pedido no hay nada que apartar
+        await _devolver_puntos(user['id'] if user else None, points_used)
         raise
     # Ese carrito SI se cerro: su intento deja de estar pendiente y la IA ya no le escribe.
     asyncio.create_task(_cerrar_intentos(payload.customer.email))
@@ -1872,9 +1969,10 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
                          f"Ganaste ${row['amount']:,.0f} por {role} (pedido {order.order_number}).",
                          link='/distribuidor')
     if points_used:
-        # El canje se descuenta de inmediato: si no, dos pedidos seguidos
-        # podrian gastar el mismo saldo.
-        await db.users.update_one({'id': user['id']}, {'$inc': {'points_balance': -points_used}})
+        # El saldo YA se restó arriba, apartado en un solo paso condicionado
+        # (`_apartar_puntos`). Aquí solo queda el asiento en la bitácora. Se restaba
+        # también aquí, con un `$inc` a secas y sin condición: ése era el canje que dos
+        # pedidos simultáneos podían hacer dos veces con los mismos puntos.
         await _points_entry(user['id'], order.model_dump(), 'redeem', -points_used)
     for item in payload.items:
         # El inventario del catálogo YA se apartó arriba, agrupado por producto y en un
@@ -2206,6 +2304,9 @@ async def update_order_status(order_id: str, payload: OrderStatusUpdate, admin=D
     order = await db.orders.find_one({'id': order_id}, {'_id': 0})
     # Lealtad: pago verificado deposita puntos; cancelacion los revierte.
     if payload.status in loyalty.PAID_STATUSES:
+        # Si venía de 'cancelado', lo canjeado se vuelve a cobrar ANTES de depositar
+        # nada nuevo: si no, cancelar y reconfirmar regala los puntos canjeados.
+        await recobrar_puntos_canjeados(order)
         await award_order_points(order)
     elif payload.status == 'cancelado':
         await revoke_order_points(order)
@@ -2318,6 +2419,36 @@ async def admin_stats(admin=Depends(get_current_admin)):
 # La foto la calcula la Mac de Christian (`pricing-system/publicar_dashboard_precios.py`)
 # porque la base del motor vive ahí, no en el servidor. El backend sólo la guarda y la
 # entrega; no la interpreta ni la recalcula.
+# Cuántas horas vale una foto del motor antes de considerarse vieja. Es un día
+# hábil: los precios se mueven a diario (la competencia se refresca a diario y la
+# maestra con ella), así que una foto de anteayer describe un catálogo que ya no
+# existe. No borra nada — solo deja de presentarse como si fuera de hoy.
+MOTOR_PRECIOS_VIGENCIA_HORAS = 24
+
+
+def _frescura_de_la_foto(subido: str) -> dict:
+    """Qué tan vieja es la foto del motor, calculado por el SERVIDOR.
+
+    ⛔ La antigüedad NO se cree de `generado`: ese campo lo escribe la Mac de
+    Christian con su reloj local y sin zona horaria, así que un reloj atrasado (o un
+    script que se corre sin volver a construir la base) hace pasar por nueva una foto
+    vieja. Lo único que el servidor sabe de verdad es CUÁNDO LA RECIBIÓ, y de ahí
+    sale esto. El Panel enseñaba datos que ya no correspondían a la base y nada lo
+    decía (2026-07-28: la foto era de las 16:46 y la base de las 18:24).
+    """
+    try:
+        cuando = datetime.fromisoformat(subido)
+    except (TypeError, ValueError):
+        return {'horas': None, 'vencida': True, 'subido': subido or ''}
+    if cuando.tzinfo is None:
+        cuando = cuando.replace(tzinfo=timezone.utc)
+    horas = (datetime.now(timezone.utc) - cuando).total_seconds() / 3600
+    return {'horas': round(max(0.0, horas), 1),
+            'vencida': horas > MOTOR_PRECIOS_VIGENCIA_HORAS,
+            'vigencia_horas': MOTOR_PRECIOS_VIGENCIA_HORAS,
+            'subido': subido}
+
+
 @api_router.get('/admin/motor-precios')
 async def admin_motor_precios(admin=Depends(get_current_admin)):
     doc = await db.app_data.find_one({'clave': 'motor_precios'}, {'_id': 0})
@@ -2325,7 +2456,11 @@ async def admin_motor_precios(admin=Depends(get_current_admin)):
         raise HTTPException(
             status_code=404,
             detail='Todavía no se ha subido ninguna foto del motor de precios.')
-    return doc.get('valor') or {}
+    foto = dict(doc.get('valor') or {})
+    # La frescura viaja SIEMPRE con la foto: un tablero que parece vivo y está viejo
+    # es peor que no tener tablero.
+    foto['frescura'] = _frescura_de_la_foto(doc.get('subido') or '')
+    return foto
 
 
 @api_router.put('/admin/motor-precios')

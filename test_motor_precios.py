@@ -12,6 +12,12 @@ import re
 
 import pytest
 
+# database.py exige MONGO_URL al importar y este archivo también importa `server`.
+# Corriendo la suite completa alguien más ya la había declarado, así que el archivo
+# sólo pasaba acompañado: solo, reventaba con KeyError.
+os.environ.setdefault('MONGO_URL', 'mongodb://localhost:27017')
+os.environ.setdefault('DB_NAME', 'exygen_test')
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 SITIO = os.path.join(BASE, '..', 'novapeptidos-UI')
 
@@ -512,3 +518,39 @@ def test_el_envio_no_se_cobra_a_proposito_y_nunca_se_resta():
     assert envios.COTIZAR_EN_CHECKOUT is False, 'cambió la política de envío sin decirlo'
     assert '- 250' not in src and '-250' not in src.replace('-2500', ''), \
         'apareció una resta de 250: el envío no es un descuento'
+
+
+# ---------- La foto no puede pasar por nueva cuando está vieja ----------
+
+def test_la_frescura_la_calcula_el_servidor_no_la_mac():
+    """El Panel enseñaba la foto y nada decía qué tan vieja era.
+
+    `generado` lo escribe la Mac de Christian con su reloj local y sin zona horaria:
+    si esa Mac corre el script sin reconstruir la base, o tiene el reloj atrasado, una
+    foto vieja se ve nueva. El 2026-07-28 la foto era de las 16:46 y la base de las
+    18:24 — el Panel estaba enseñando un catálogo que ya no existía. Lo único que el
+    servidor sabe de verdad es cuándo la recibió.
+    """
+    from datetime import datetime, timedelta, timezone
+    import server
+
+    ahora = datetime.now(timezone.utc)
+    fresca = server._frescura_de_la_foto((ahora - timedelta(hours=2)).isoformat())
+    assert fresca['vencida'] is False and 1.5 < fresca['horas'] < 2.5
+
+    vieja = server._frescura_de_la_foto((ahora - timedelta(hours=30)).isoformat())
+    assert vieja['vencida'] is True and vieja['horas'] > 24
+
+    # Sin fecha o con basura: se asume vencida. Nunca "fresca por no saber".
+    for basura in ('', None, 'ayer'):
+        assert server._frescura_de_la_foto(basura)['vencida'] is True
+
+
+def test_la_foto_sale_siempre_con_su_frescura():
+    """La ruta no puede devolver la foto pelona: el dato de antigüedad va pegado."""
+    src = _fuente()
+    ini = src.index("async def admin_motor_precios(")
+    cuerpo = src[ini:src.index('@api_router', ini)]
+    assert "foto['frescura'] = _frescura_de_la_foto(" in cuerpo
+    assert "return doc.get('valor') or {}" not in cuerpo, \
+        'volvió a devolverse la foto sin decir de cuándo es'
