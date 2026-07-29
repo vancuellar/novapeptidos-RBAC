@@ -130,19 +130,16 @@ def paquete_del_pedido(items, pflags: dict | None = None) -> dict:
 # ------------------------------------------------- quién paga el envío
 TOPE_ENVIO_SOBRE_COMPRA = 0.10
 
-# ⚠️⚠️ FALTA UNA DEFINICIÓN DE CHRISTIAN — Y ES DE UNA SOLA LÍNEA.
+# ✅ DECIDIDO POR CHRISTIAN el 2026-07-28, en sus palabras:
+# "En un pedido de más de 2.5k pesos donde el envío pasa del 10%, el cliente paga
+#  la diferencia y la casa absorbe hasta el 10% del costo del envío máximo."
 #
-# La regla acordada: arriba de $2,500 el envío va por cuenta de la casa, PERO solo
-# mientras no pase del 10% de la compra. Lo que NO está definido es qué pasa cuando
-# sí lo pasa: un pedido de $3,000 con un envío de $600 (el 20%).
-#
-#   True  → el cliente paga los $600 completos. Es lo que está puesto hoy, por ser
-#           lo que más protege el ROI, que es como se decide todo en esta casa.
-#   False → la casa absorbe su 10% ($300) y el cliente paga solo el excedente
-#           ($300). Es más amable con el cliente y cuesta la mitad.
+# O sea: en un pedido de $3,000 con envío de $600, la casa pone $300 (su 10%) y el
+# cliente paga los otros $300. La casa NUNCA absorbe más del 10% de la compra, y el
+# cliente nunca paga el envío completo si ya pasó de $2,500.
 #
 # Para cambiarlo: esta línea, nada más. No hay otro lugar donde se decida.
-CLIENTE_PAGA_EL_ENVIO_COMPLETO_AL_PASAR_EL_TOPE = True
+CLIENTE_PAGA_EL_ENVIO_COMPLETO_AL_PASAR_EL_TOPE = False
 
 
 def cobro_de_envio_al_cliente(costo_envio: float, mercancia_pagada: float,

@@ -241,18 +241,25 @@ def test_el_tope_del_10_por_ciento_es_exacto():
     assert envios.cobro_de_envio_al_cliente(301, 3000, 2500) > 0       # un peso más, ya no
 
 
-def test_arriba_del_tope_hoy_paga_el_envio_completo():
-    """⚠️ PENDIENTE DE CHRISTIAN. Hoy: el cliente paga los $600 enteros.
-    Si algún día decide que solo pague el excedente, se cambia UNA línea en
-    envios.py y esta prueba es la que lo dice."""
-    assert envios.CLIENTE_PAGA_EL_ENVIO_COMPLETO_AL_PASAR_EL_TOPE is True
-    assert envios.cobro_de_envio_al_cliente(600, 3000, 2500) == 600
+def test_arriba_del_tope_el_cliente_paga_SOLO_la_diferencia():
+    """DECIDIDO por Christian el 2026-07-28: "el cliente paga la diferencia y la
+    casa absorbe hasta el 10% del costo del envío máximo". Pedido de $3,000 con
+    envío de $600: la casa pone $300 (su 10%) y el cliente paga los otros $300."""
+    assert envios.CLIENTE_PAGA_EL_ENVIO_COMPLETO_AL_PASAR_EL_TOPE is False
+    assert envios.cobro_de_envio_al_cliente(600, 3000, 2500) == 300
+
+
+def test_la_casa_nunca_absorbe_mas_del_10_por_ciento():
+    """Es el otro lado de la misma regla: por cara que salga la guía, la casa se
+    queda topada en el 10% de la compra."""
+    assert envios.cobro_de_envio_al_cliente(2000, 3000, 2500) == 1700   # casa: 300
+    assert envios.cobro_de_envio_al_cliente(310, 3000, 2500) == 10      # casa: 300
 
 
 def test_la_otra_definicion_se_prende_cambiando_una_sola_linea(monkeypatch):
-    monkeypatch.setattr(envios, 'CLIENTE_PAGA_EL_ENVIO_COMPLETO_AL_PASAR_EL_TOPE', False)
-    # $3,000 con envío de $600: la casa absorbe su 10% ($300), el cliente paga $300.
-    assert envios.cobro_de_envio_al_cliente(600, 3000, 2500) == 300
+    monkeypatch.setattr(envios, 'CLIENTE_PAGA_EL_ENVIO_COMPLETO_AL_PASAR_EL_TOPE', True)
+    # Con la regla contraria, ese mismo pedido pagaría los $600 completos.
+    assert envios.cobro_de_envio_al_cliente(600, 3000, 2500) == 600
 
 
 def test_el_envio_se_mide_sobre_lo_que_el_cliente_PAGA():
@@ -605,7 +612,8 @@ def test_una_guia_cara_ya_no_se_regala_por_pasar_el_umbral():
     """$2,600 de compra con una guía REAL de $500: el 19%. No va gratis.
     Antes `shipping_for` devolvía 0 para cualquier compra arriba de $2,500,
     costara lo que costara la guía."""
-    assert server.shipping_for(2600, costo_real=500) == 500
+    # La casa absorbe su 10% ($260) y el cliente paga los otros $240.
+    assert server.shipping_for(2600, costo_real=500) == 240
     assert server.shipping_for(2600, costo_real=250) == 0      # el 9.6%: sí cabe
 
 
