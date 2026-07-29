@@ -114,8 +114,13 @@ async def get_current_marketing(user=Depends(get_current_user)):
     Las únicas rutas que cuelgan de aquí son embudo, marketing y Meta. Todo lo
     demás (pedidos, clientes, stock, cobros, precios, distribuidores) sigue
     exigiendo `get_current_admin`, así que este rol recibe 403 aunque le pegue
-    a la API directo. El admin pasa por aquí también: él entra a todo."""
-    if user.get('role') not in ('marketing', 'admin'):
+    a la API directo. El admin pasa por aquí también: él entra a todo.
+
+    `extra_roles` SUMA papeles en vez de sustituirlos: María sigue siendo
+    distribuidora (role='distributor') y además lleva la difusión
+    (extra_roles=['marketing']) sin perder su panel (Christián, 2026-07-29)."""
+    if user.get('role') not in ('marketing', 'admin') \
+            and 'marketing' not in (user.get('extra_roles') or []):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                             detail='Acceso solo para administradores o marketing')
     return user

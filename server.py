@@ -257,6 +257,21 @@ async def root():
 
 
 # ----------------- Auth -----------------
+
+def _session_user(user):
+    """Lo que el frontend guarda de la sesión al entrar.
+
+    `extra_roles` SUMA papeles (María: distribuidora + difusión) y las
+    preferencias hacen que su cuenta abra en su idioma y tema, sin importar
+    el navegador. Cambia aquí y cambian TODAS las formas de iniciar sesión."""
+    return {
+        'id': user['id'], 'name': user['name'], 'email': user['email'],
+        'role': user.get('role', 'user'),
+        'extra_roles': user.get('extra_roles') or [],
+        'preferred_language': user.get('preferred_language'),
+        'preferred_theme': user.get('preferred_theme'),
+    }
+
 @api_router.post('/auth/register')
 async def register(payload: RegisterInput):
     existing = await db.users.find_one({'email': payload.email.lower()})
@@ -308,7 +323,7 @@ async def register(payload: RegisterInput):
     return {
         'pending_verification': False,
         'token': create_token(user['id']),
-        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
+        'user': _session_user(user),
         'adopted_orders': adoptados,
     }
 
@@ -336,7 +351,7 @@ async def login(payload: LoginInput):
     token = create_token(user['id'])
     return {
         'token': token,
-        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
+        'user': _session_user(user),
     }
 
 
@@ -355,7 +370,7 @@ async def totp_login(payload: dict):
     await db.account_tokens.update_one({'token': rec['token']}, {'$set': {'used': True}})
     return {
         'token': create_token(user['id']),
-        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
+        'user': _session_user(user),
     }
 
 
@@ -429,7 +444,7 @@ async def google_login(payload: GoogleAuthInput):
     adoptados = await _adoptar_pedidos_de_invitado(user['id'])
     return {
         'token': create_token(user['id']),
-        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user.get('role', 'user')},
+        'user': _session_user(user),
         'adopted_orders': adoptados,
     }
 
@@ -599,7 +614,7 @@ async def passkey_login_verify(payload: dict):
     # no se pide TOTP encima.
     return {
         'token': create_token(user['id']),
-        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user.get('role', 'user')},
+        'user': _session_user(user),
     }
 
 
@@ -687,7 +702,7 @@ async def verify_email(payload: TokenInput):
     adoptados = await _adoptar_pedidos_de_invitado(user['id'])
     return {
         'token': create_token(user['id']),
-        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user['role']},
+        'user': _session_user(user),
         'adopted_orders': adoptados,
     }
 
@@ -729,7 +744,7 @@ async def activate_account(payload: ActivateInput):
     adoptados = await _adoptar_pedidos_de_invitado(user['id'])
     return {
         'token': create_token(user['id']),
-        'user': {'id': user['id'], 'name': user['name'], 'email': user['email'], 'role': user.get('role', 'user')},
+        'user': _session_user(user),
         'adopted_orders': adoptados,
     }
 
@@ -808,6 +823,70 @@ async def me(user=Depends(get_current_user)):
     # Un distribuidor compra para sí mismo con SU comisión máxima como descuento
     # (Christian, 2026-07-25). El carrito lo necesita para mostrarlo en vivo.
     return {**user, 'self_discount_rate': buyer_own_rate(user)}
+
+
+IDIOMAS_VALIDOS = {'es-MX', 'en-US', 'pt-BR'}
+TEMAS_VALIDOS = {'light', 'dark', 'system'}
+
+
+class PrefsDeCuenta(BaseModel):
+    language: Optional[str] = None
+    theme: Optional[str] = None
+
+
+@api_router.put('/auth/me/prefs')
+async def guardar_prefs(payload: PrefsDeCuenta, user=Depends(get_current_user)):
+    """Idioma y tema viajan con la CUENTA, no con el navegador.
+
+    La cuenta abre con lo que el admin dejó puesto (María: portugués y oscuro)
+    hasta que el propio usuario cambia algo — y entonces manda SU elección."""
+    deny_view_as(user)
+    cambio = {}
+    if payload.language is not None:
+        if payload.language not in IDIOMAS_VALIDOS:
+            raise HTTPException(status_code=400, detail='Idioma desconocido')
+        cambio['preferred_language'] = payload.language
+    if payload.theme is not None:
+        if payload.theme not in TEMAS_VALIDOS:
+            raise HTTPException(status_code=400, detail='Tema desconocido')
+        cambio['preferred_theme'] = payload.theme
+    if cambio:
+        await db.users.update_one({'id': user['id']}, {'$set': cambio})
+    return {'ok': True, **cambio}
+
+
+ROLES_EXTRA_VALIDOS = {'marketing'}
+
+
+class RolesExtra(BaseModel):
+    roles: list[str]
+    language: Optional[str] = None
+    theme: Optional[str] = None
+
+
+@api_router.put('/admin/customers/{user_id}/extra-roles')
+async def set_extra_roles(user_id: str, payload: RolesExtra, admin=Depends(get_current_admin)):
+    """Papeles que SUMAN sin quitar el rol principal (María: distribuidora que
+    además lleva la difusión). De paso el admin puede dejar puestas las
+    preferencias de arranque de la cuenta (idioma/tema)."""
+    if not set(payload.roles) <= ROLES_EXTRA_VALIDOS:
+        raise HTTPException(status_code=400, detail='Rol extra desconocido')
+    target = await db.users.find_one({'id': user_id}, {'_id': 0, 'id': 1, 'email': 1})
+    if not target:
+        raise HTTPException(status_code=404, detail='Usuario no encontrado')
+    cambio = {'extra_roles': sorted(set(payload.roles))}
+    if payload.language is not None:
+        if payload.language not in IDIOMAS_VALIDOS:
+            raise HTTPException(status_code=400, detail='Idioma desconocido')
+        cambio['preferred_language'] = payload.language
+    if payload.theme is not None:
+        if payload.theme not in TEMAS_VALIDOS:
+            raise HTTPException(status_code=400, detail='Tema desconocido')
+        cambio['preferred_theme'] = payload.theme
+    await db.users.update_one({'id': user_id}, {'$set': cambio})
+    logger.info('Admin %s dejó extra_roles=%s a %s', admin.get('email'),
+                cambio['extra_roles'], target.get('email'))
+    return {'id': user_id, **cambio}
 
 
 # ----------------- Categories -----------------
@@ -4210,14 +4289,18 @@ TUTORIAL_DIST_ONLY = {
 # internos: SOLO admin, ni clientes ni distribuidores.
 TUTORIAL_ADMIN_ONLY = {
     'tutorial-12-metricas-difusion.mp4',
+    'tutorial-12-metricas-difusao-pt.mp4',   # el mismo video, narrado en portugués para María
 }
 
 
-def tutorial_allowed(filename: str, role: str) -> bool:
+def tutorial_allowed(filename: str, user: dict) -> bool:
     """Un cliente solo ve videos de cliente; distribuidor/admin ven todo.
-    Los videos internos del negocio son únicamente para admin."""
+    Los videos internos del negocio (difusión) son para admin o para quien
+    lleva la difusión — rol 'marketing' propio o como rol extra (María)."""
+    role = user.get('role', 'client')
+    difusion = role in ('admin', 'marketing') or 'marketing' in (user.get('extra_roles') or [])
     if filename in TUTORIAL_ADMIN_ONLY:
-        return role == 'admin'
+        return difusion
     if filename in TUTORIAL_DIST_ONLY:
         return role in ('distributor', 'admin')
     return True
@@ -4261,12 +4344,12 @@ async def tutorial_video(filename: str, request: Request, token: str = Query(...
         user_id = payload.get('sub')
     except Exception:
         raise HTTPException(status_code=401, detail='No autenticado')
-    user = await db.users.find_one({'id': user_id}, {'_id': 0, 'role': 1, 'blocked': 1})
+    user = await db.users.find_one({'id': user_id}, {'_id': 0, 'role': 1, 'blocked': 1, 'extra_roles': 1})
     if not user or user.get('blocked'):
         raise HTTPException(status_code=401, detail='No autenticado')
     if '/' in filename or '..' in filename or not filename.endswith('.mp4'):
         raise HTTPException(status_code=404, detail='No encontrado')
-    if not tutorial_allowed(filename, user.get('role', 'client')):
+    if not tutorial_allowed(filename, user):
         raise HTTPException(status_code=403, detail='Solo para distribuidores')
     path = TUTORIAL_DIR / filename
     if not path.is_file():
@@ -4565,6 +4648,7 @@ class MetaCsv(BaseModel):
 async def admin_meta_import(payload: MetaCsv, admin=Depends(get_current_marketing)):
     """Sube el CSV del Administrador de Anuncios. Reemplaza la foto anterior:
     el CSV de Meta ya trae el acumulado, no hay que ir sumando."""
+    deny_view_as(admin)   # 'ver como' es de SOLO lectura: aquí se escribe
     rows = meta_ads.parse_csv(payload.csv or '')
     if not rows:
         raise HTTPException(status_code=400,
@@ -4849,6 +4933,7 @@ async def admin_marketing_director(payload: DirectorPedido, admin=Depends(get_cu
     Devuelve una PROPUESTA para que Christian apruebe. No publica nada en Meta:
     eso necesita permisos de escritura, revisión de la app y gasta dinero real.
     """
+    deny_view_as(admin)   # 'ver como' es de SOLO lectura: aquí se escribe
     days = max(7, min(int(payload.days or 90), 365))
     filas, estado = await _meta_filas(min(days, 90))
     _, pedidos, sesiones = await _pedidos_y_sesiones(days)

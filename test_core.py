@@ -879,22 +879,26 @@ from server import tutorial_allowed, parse_range_header
 
 
 def test_tutorial_videos_role_gating():
+    # tutorial_allowed recibe al USUARIO (dict): el acceso ya no es solo el rol
+    # principal — extra_roles también cuenta (ver test_roles_marketing.py).
     dist_video = 'tutorial-2-mis-codigos.mp4'
     client_video = 'tutorial-9-calculadora.mp4'
-    assert not tutorial_allowed(dist_video, 'client')      # cliente NO ve lo de distribuidor
-    assert tutorial_allowed(dist_video, 'distributor')
-    assert tutorial_allowed(dist_video, 'admin')
+    assert not tutorial_allowed(dist_video, {'role': 'client'})   # cliente NO ve lo de distribuidor
+    assert tutorial_allowed(dist_video, {'role': 'distributor'})
+    assert tutorial_allowed(dist_video, {'role': 'admin'})
     for role in ('client', 'distributor', 'admin'):
-        assert tutorial_allowed(client_video, role)        # lo de cliente lo ven todos
+        assert tutorial_allowed(client_video, {'role': role})     # lo de cliente lo ven todos
 
 
 def test_tutorial_video_admin_only():
-    # El video de metricas de difusion trae ventas y gastos internos:
-    # unicamente el admin puede pedirlo, ni el distribuidor adivinando la URL.
+    # El video de metricas de difusion trae ventas y gastos internos: solo el
+    # admin o quien lleva la difusion (rol marketing, propio o extra) lo piden;
+    # ni el distribuidor ni el cliente adivinando la URL.
     admin_video = 'tutorial-12-metricas-difusion.mp4'
-    assert not tutorial_allowed(admin_video, 'client')
-    assert not tutorial_allowed(admin_video, 'distributor')
-    assert tutorial_allowed(admin_video, 'admin')
+    assert not tutorial_allowed(admin_video, {'role': 'client'})
+    assert not tutorial_allowed(admin_video, {'role': 'distributor'})
+    assert tutorial_allowed(admin_video, {'role': 'admin'})
+    assert tutorial_allowed(admin_video, {'role': 'distributor', 'extra_roles': ['marketing']})
 
 
 def test_parse_range_header_variants():

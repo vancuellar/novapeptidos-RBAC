@@ -51,6 +51,9 @@ class _Coll:
     async def count_documents(self, *a, **k):
         return 0
 
+    async def update_one(self, *a, **k):
+        return None
+
 
 class _FakeDB:
     def __getattr__(self, name):
@@ -167,3 +170,76 @@ def test_distribuidor_y_cliente_no_ven_difusion(como):
         assert c.get('/api/admin/funnel').status_code == 403
         assert c.get('/api/admin/marketing/resumen').status_code == 403
         assert c.get('/api/admin/meta/dashboard').status_code == 403
+
+
+# ---------------------------------- extra_roles: papeles que SUMAN (Christián,
+# 2026-07-29): María sigue de distribuidora y ADEMÁS lleva la difusión.
+MARIA_DIST = {'id': 'u-maria', 'name': 'María', 'email': 'marianeunfeld0@gmail.com',
+              'role': 'distributor', 'extra_roles': ['marketing']}
+
+
+def test_distribuidora_con_extra_marketing_entra_al_embudo(como):
+    r = como(MARIA_DIST).get('/api/admin/funnel')
+    assert r.status_code == 200
+
+
+def test_distribuidora_con_extra_marketing_entra_a_meta(como):
+    assert como(MARIA_DIST).get('/api/admin/meta/dashboard').status_code == 200
+
+
+def test_extra_marketing_no_abre_el_resto_del_admin(como):
+    c = como(MARIA_DIST)
+    assert c.get('/api/admin/orders').status_code == 403
+    assert c.get('/api/admin/customers').status_code == 403
+    assert c.get('/api/admin/credenciales').status_code == 403
+
+
+def test_distribuidor_sin_extra_sigue_sin_entrar(como):
+    assert como(DIST).get('/api/admin/funnel').status_code == 403
+
+
+def test_extra_roles_desconocido_se_rechaza(como):
+    r = como(ADMIN).put('/api/admin/customers/u-x/extra-roles', json={'roles': ['superadmin']})
+    assert r.status_code == 400
+
+
+def test_extra_roles_solo_admin(como):
+    r = como(MARIA_DIST).put('/api/admin/customers/u-x/extra-roles', json={'roles': ['marketing']})
+    assert r.status_code == 403
+
+
+# ------------------------------------------------ preferencias de la cuenta
+def test_prefs_idioma_invalido_se_rechaza(como):
+    r = como(MARIA_DIST).put('/api/auth/me/prefs', json={'language': 'fr-FR'})
+    assert r.status_code == 400
+
+
+def test_prefs_tema_invalido_se_rechaza(como):
+    r = como(MARIA_DIST).put('/api/auth/me/prefs', json={'theme': 'neon'})
+    assert r.status_code == 400
+
+
+def test_prefs_validas_pasan(como):
+    r = como(MARIA_DIST).put('/api/auth/me/prefs', json={'language': 'pt-BR', 'theme': 'dark'})
+    assert r.status_code == 200
+    assert r.json()['preferred_language'] == 'pt-BR'
+
+
+def test_el_video_de_difusion_es_para_quien_lleva_difusion():
+    from server import tutorial_allowed
+    pt = 'tutorial-12-metricas-difusao-pt.mp4'
+    assert tutorial_allowed(pt, MARIA_DIST)
+    assert tutorial_allowed(pt, ADMIN)
+    assert tutorial_allowed(pt, MARIA)          # rol marketing "puro" también
+    assert not tutorial_allowed(pt, DIST)       # distribuidor sin extra, no
+    assert not tutorial_allowed(pt, CLIENTE)
+
+
+def test_ver_como_no_escribe_en_difusion(como):
+    # 'Ver como' es de SOLO lectura: aunque la cuenta impersonada lleve la
+    # difusión, subir el CSV de Meta (escritura) se rechaza con 403.
+    espia = {**MARIA_DIST, 'view_as': True, 'view_as_admin': 'u-admin'}
+    r = como(espia).post('/api/admin/meta/import', json={'csv': 'x'})
+    assert r.status_code == 403
+    # y las lecturas siguen abiertas, que para eso es 'ver como'
+    assert como(espia).get('/api/admin/funnel').status_code == 200
