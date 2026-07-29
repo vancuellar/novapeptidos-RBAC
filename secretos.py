@@ -37,6 +37,9 @@ PERMITIDAS = {
     'NOWPAYMENTS_IPN_SECRET',
     'BTCPAY_API_KEY',
     'BTCPAY_WEBHOOK_SECRET',
+    # Paquetería (Skydropx). No cobra: cotiza envíos y compra guías. Vive aquí por
+    # la misma razón que las de cobro — para poder pegarla desde el teléfono.
+    'SKYDROPX_API_KEY',
 }
 
 

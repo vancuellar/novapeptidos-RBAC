@@ -1563,10 +1563,19 @@ def test_el_cobro_del_pedido_respeta_el_interruptor():
     """El total de la orden tiene que salir del interruptor, no de la regla vieja.
 
     Se lee el código porque `create_order` no se puede correr sin base: lo que se
-    vigila es que nadie deje `shipping = shipping_for(...)` a secas otra vez."""
+    vigila es que nadie deje `shipping = shipping_for(...)` a secas otra vez.
+
+    Desde que existe Skydropx hay DOS caminos y los dos tienen interruptor: la
+    tarifa plana sigue detrás de COBRAR_ENVIO, y la cotización real detrás de
+    `envios.COTIZAR_EN_CHECKOUT`. Ninguno puede quedar suelto."""
     src = open(os.path.join(os.path.dirname(__file__), 'server.py'), encoding='utf-8').read()
     assert 'shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0' in src, \
         'la orden ya no calcula el envío con el interruptor: el sitio y el cobro se separan'
+    import envios
+    assert envios.COTIZAR_EN_CHECKOUT is False, \
+        'la cotización de Skydropx se prendió sin que nadie lo pidiera'
+    assert envios.COMPRAR_GUIA_AL_PAGAR is False, \
+        'la compra automática de guías se prendió sin que nadie lo pidiera'
 
 
 def test_el_sitio_se_entera_de_que_no_se_cobra_envio():
@@ -1854,14 +1863,29 @@ def test_el_navegador_no_puede_poner_el_envio_del_pedido():
     paquete gratis. El servidor no lo lee — lo calcula él — y esto lo deja clavado.
 
     Es el mismo error que ya costó dinero con el PRECIO: hasta el 27-jul el subtotal se
-    calculaba con `item.price` tal como venía en la petición."""
+    calculaba con `item.price` tal como venía en la petición.
+
+    Desde Skydropx la cuenta vive en `_envio_del_pedido`, así que se revisan las DOS:
+    ni el pedido ni la función que le calcula el envío pueden leer el monto que mandó
+    el navegador."""
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server.py'),
                encoding='utf-8').read()
-    ini = src.index('async def create_order(')
-    cuerpo = src[ini:src.index('async def', ini + 10)]
-    assert 'payload.shipping' not in cuerpo, \
-        'el envío del pedido sale de la petición: el navegador decide cuánto paga'
-    assert 'shipping = shipping_for(' in cuerpo, 'el envío ya no lo calcula el servidor'
+
+    def _cuerpo_de(nombre):
+        ini = src.index(nombre)
+        return src[ini:src.index('async def', ini + 10)]
+
+    cuerpo = _cuerpo_de('async def create_order(')
+    envio = _cuerpo_de('async def _envio_del_pedido(')
+    for trozo, donde in ((cuerpo, 'create_order'), (envio, '_envio_del_pedido')):
+        assert 'payload.shipping\n' not in trozo and 'payload.shipping ' not in trozo \
+            and 'payload.shipping)' not in trozo, \
+            f'el envío sale de la petición en {donde}: el navegador decide cuánto paga'
+    # El monto sigue saliendo del servidor: la tarifa plana con su interruptor, o la
+    # cotización que el propio servidor guardó y revalidó.
+    assert 'shipping = shipping_for(' in envio, 'el envío ya no lo calcula el servidor'
+    assert '_cotizacion_valida(' in envio, 'la cotización guardada ya no se revalida'
+    assert 'await _envio_del_pedido(' in cuerpo, 'el pedido ya no le pregunta al servidor'
 
 
 def test_el_envio_gratis_y_la_oferta_de_carrito_abandonado_usan_el_MISMO_umbral():

@@ -443,8 +443,12 @@ def test_el_checkout_le_pasa_al_inventario_vivo_el_slug_y_la_presentacion():
     Panel, y el arreglo de arriba queda muerto en el camino real."""
     src = _fuente()
     ini = src.index('_pdocs = await db.products.find(')
-    trozo = src[ini:ini + 700]
+    trozo = src[ini:ini + 900]
     assert "'slug': 1" in trozo and "'presentation': 1" in trozo, trozo
+    # Y el peso, por la misma razón: sin él el envío se cotiza con el peso por
+    # omisión aunque el producto ya tenga el suyo capturado, y la paquetería cobra
+    # la diferencia al recibir el paquete.
+    assert "'weight_kg': 1" in trozo, trozo
 
 
 def test_borrar_un_producto_se_lleva_su_renglon_de_inventario_vivo():
@@ -503,5 +507,8 @@ def test_el_envio_no_se_cobra_a_proposito_y_nunca_se_resta():
     assert 'COBRAR_ENVIO = False' in src, 'cambió la política de envío sin decirlo'
     assert 'shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0' in src
     assert 'total = paid_merchandise + shipping' in src, 'el envío tiene que SUMAR'
+    # Skydropx no cambia la política: nace apagado y el envío sigue sin cobrarse.
+    import envios
+    assert envios.COTIZAR_EN_CHECKOUT is False, 'cambió la política de envío sin decirlo'
     assert '- 250' not in src and '-250' not in src.replace('-2500', ''), \
         'apareció una resta de 250: el envío no es un descuento'

@@ -113,6 +113,10 @@ class ProductBase(BaseModel):
     sku: str = ''
     commission_cap: float = 0.50
     distributor_eligible: bool = True
+    # Peso de UNA pieza, en kilos, para cotizar el envío por peso real.
+    # ⚠️ PENDIENTE DE CHRISTIAN: capturar los reales. Mientras venga en 0, el
+    # envío usa el peso por omisión del tipo de presentación (ver envios.py).
+    weight_kg: float = 0
     # Un producto vive en su `category` principal y, opcionalmente, aparece
     # también en estas otras (p. ej. un combo en su categoría funcional Y en
     # "stacks"). Christian 2026-07-23.
@@ -161,6 +165,7 @@ class ProductUpdate(BaseModel):
     storage: Optional[str] = None
     featured: Optional[bool] = None
     is_new: Optional[bool] = None
+    weight_kg: Optional[float] = None    # kilos por pieza; 0 = usar el peso por omisión
 
 
 # ---------- Categories ----------
@@ -230,6 +235,10 @@ class OrderCreate(BaseModel):
     discount: float = 0                      # informativo; el servidor recalcula con su propia regla
     distributor_code: Optional[str] = None   # referido por un distribuidor (atribuye la venta)
     points_to_use: int = 0                   # puntos de lealtad a canjear; el servidor valida saldo
+    # Cotización de envío que eligió el cliente. Viaja el ID, NUNCA el precio: el
+    # servidor va por el precio a la cotización que ÉL guardó. Ver `shipping_quotes`
+    # en server.py. Lo que el navegador mande en `shipping` se sigue ignorando.
+    shipping_quote_id: Optional[str] = None
     attribution: Optional[Attribution] = None
     # Cuándo aceptó el comprador el aviso 18+/RUO en la puerta del sitio (ISO).
     # Antes se le volvía a pedir lo MISMO con una casilla en el checkout, y sin
@@ -278,6 +287,15 @@ class Order(BaseModel):
     shipped_at: Optional[str] = None
     delivered_at: Optional[str] = None
     eta: str = ''                       # texto libre: '3-5 días hábiles'
+    # Skydropx: qué se cotizó, qué se cobró y qué guía se compró sola al pagarse.
+    # `shipping_quote` guarda la cotización COMPLETA tal como la validó el servidor
+    # (paquetería, servicio, precio real, peso) — no lo que dijo el navegador.
+    shipping_quote: dict = Field(default_factory=dict)
+    shipping_cost: float = 0            # lo que cuesta la guía de verdad
+    shipping_absorbed: float = 0        # lo que la casa absorbió del envío
+    label_url: str = ''                 # PDF de la guía
+    label_provider: str = ''            # 'skydropx'
+    label_error: str = ''               # por qué no se pudo comprar sola (si pasó)
     # Marketing: de dónde vino este cliente y si era su PRIMERA compra.
     # `first_order` es la pieza que hace honesto el costo por cliente: si un
     # cliente que ya compraba vuelve a comprar, esa venta NO es un cliente que
@@ -292,6 +310,19 @@ class Order(BaseModel):
 
 class OrderStatusUpdate(BaseModel):
     status: str
+
+
+class ShippingQuoteRequest(BaseModel):
+    """Lo que el checkout manda para cotizar: a dónde va y qué lleva.
+
+    NO trae precio de envío ni peso: los dos los calcula el servidor. Un peso que
+    manda el navegador es un envío barato que alguien se inventó.
+    """
+    postal_code: str
+    items: List[OrderItem] = []
+    state: str = ''
+    city: str = ''
+    country: str = 'MX'
 
 
 class OrderShippingUpdate(BaseModel):

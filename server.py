@@ -18,7 +18,8 @@ from models import (
     RegisterInput, LoginInput, ForgotPasswordInput, ResetPasswordInput,
     ProfileUpdate, ChangePasswordInput,
     ProductCreate, ProductUpdate, Product, Category,
-    OrderCreate, Order, OrderItem, CustomerInfo, OrderStatusUpdate, OrderShippingUpdate, TrackEvent,
+    OrderCreate, Order, OrderItem, CustomerInfo, OrderStatusUpdate, OrderShippingUpdate,
+    ShippingQuoteRequest, TrackEvent,
     ProtocolInput, ProtocolUpdate, PerfilSalud, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
@@ -42,6 +43,8 @@ import auth_factors
 import btcpay
 import mercadopago
 import nowpayments
+import envios
+import skydropx
 from fastapi import Request
 
 
@@ -932,7 +935,10 @@ SHIPPING_FLAT = 250          # lo que de verdad cuesta el envio nacional
 # la compra. Arriba de eso se cobra. Por eso el umbral se DERIVA del costo del envio en vez
 # de escribirse a mano: si algun dia el envio sube a $300, el umbral sube solo a $3,000 y la
 # regla se sigue cumpliendo. Escrito a mano se desalineaba en silencio (2026-07-27).
-TOPE_ENVIO_SOBRE_COMPRA = 0.10
+# El 10% vive en UN solo lugar (`envios.py`), donde también vive la regla que lo
+# usa contra el costo real de Skydropx. Escrito dos veces se desalinea en silencio,
+# que es exactamente lo que pasó el 2026-07-27.
+TOPE_ENVIO_SOBRE_COMPRA = envios.TOPE_ENVIO_SOBRE_COMPRA
 FREE_SHIPPING_FROM = int(SHIPPING_FLAT / TOPE_ENVIO_SOBRE_COMPRA)   # 250 / 10% = 2,500
 
 
@@ -954,6 +960,236 @@ def shipping_for(merchandise_paid):
 
     OJO: hoy no la llama nadie para cobrar — ver COBRAR_ENVIO arriba."""
     return 0 if float(merchandise_paid or 0) >= FREE_SHIPPING_FROM else SHIPPING_FLAT
+
+
+# ==========================================================================
+#  ENVÍO POR SKYDROPX — cotizar en el checkout y comprar la guía al pagarse
+# ==========================================================================
+# ⛔ TODO ESTO NACE APAGADO (`envios.COTIZAR_EN_CHECKOUT` y
+# `envios.COMPRAR_GUIA_AL_PAGAR`, los dos en False). Con ellos apagados el sitio se
+# comporta EXACTAMENTE como antes: el checkout no cotiza, no cobra envío y nadie
+# compra guías. Christian los prende cuando decida.
+COLECCION_COTIZACIONES = 'shipping_quotes'
+
+
+def envio_se_cotiza() -> bool:
+    """¿Hoy el checkout cotiza y cobra envío real?
+
+    Dos candados, y los dos tienen que ceder: el interruptor de Christian Y que la
+    llave de Skydropx exista. Sin llave no se cotiza y no se rompe nada — el
+    checkout sigue vendiendo igual (ver skydropx.py).
+    """
+    return bool(envios.COTIZAR_EN_CHECKOUT and skydropx.enabled())
+
+
+def _mismo_cp(a: str, b: str) -> bool:
+    return (a or '').strip()[:5] == (b or '').strip()[:5]
+
+
+async def _guardar_cotizacion(cp: str, paquete: dict, opciones: list) -> dict:
+    """Guarda la cotización que se le enseñó al cliente y le pone fecha de muerte.
+
+    ⛔ ES LA PIEZA QUE HACE QUE EL PRECIO LO PONGA EL SERVIDOR. Al navegador solo
+    se le devuelve un ID por opción; el PRECIO se queda aquí. Cuando el pedido
+    llegue diciendo "elegí esta", el servidor va por el monto a este documento —
+    nunca al cuerpo de la petición. Ya costó dinero creerle al navegador un precio
+    (2026-07-27, se podía comprar un vial de $9,359 mandando precio 0).
+    """
+    ahora = datetime.now(timezone.utc)
+    doc = {
+        'id': str(uuid.uuid4()),
+        'postal_code': (cp or '').strip(),
+        'peso_kg': paquete.get('peso_kg'),
+        'paquete': paquete,
+        'created_at': ahora.isoformat(),
+        'expires_at': (ahora + timedelta(minutes=envios.VIGENCIA_COTIZACION_MIN)).isoformat(),
+        'opciones': [dict(o, opcion_id=str(uuid.uuid4())) for o in opciones],
+    }
+    await db[COLECCION_COTIZACIONES].insert_one(dict(doc))
+    doc.pop('_id', None)
+    return doc
+
+
+async def _cotizacion_valida(opcion_id: str, cp: str, peso_kg: float):
+    """La opción guardada que corresponde a ese ID, si TODAVÍA vale. Si no, None.
+
+    Cuatro preguntas, y basta que una falle para tirarla:
+      1. ¿Existe esa cotización? (un ID inventado no compra nada)
+      2. ¿Sigue vigente? (30 min — una tarifa de hace un mes no es la de hoy)
+      3. ¿Es para ESTE código postal? (cotizar a la esquina y mandar a Tijuana)
+      4. ¿Es para ESTE peso? (cotizar un vial y despachar cuarenta)
+    """
+    if not opcion_id:
+        return None
+    doc = await db[COLECCION_COTIZACIONES].find_one(
+        {'opciones.opcion_id': opcion_id}, {'_id': 0})
+    if not doc:
+        return None
+    if (doc.get('expires_at') or '') < now_iso():
+        return None
+    if not _mismo_cp(doc.get('postal_code'), cp):
+        return None
+    if abs(float(doc.get('peso_kg') or 0) - float(peso_kg or 0)) > 0.01:
+        return None
+    opcion = next((o for o in doc.get('opciones', []) if o.get('opcion_id') == opcion_id), None)
+    if not opcion or not skydropx.permitida(opcion.get('paqueteria', '')):
+        return None            # una paquetería fuera de la lista no se cobra ni se compra
+    return dict(opcion, peso_kg=doc.get('peso_kg'), paquete=doc.get('paquete') or {})
+
+
+@api_router.post('/shipping/quote')
+async def shipping_quote(payload: ShippingQuoteRequest):
+    """El checkout pregunta cuánto cuesta mandar ESTE carrito a ESE código postal.
+
+    Devuelve precios reales de Estafeta, por peso y CP. Y se degrada con elegancia:
+    si el envío está apagado, si falta la llave o si Skydropx no contesta, responde
+    `enabled: false` y el checkout se comporta como hoy. Nunca revienta la compra.
+    """
+    if not envio_se_cotiza():
+        if envios.COTIZAR_EN_CHECKOUT and not skydropx.enabled():
+            logger.info('Envio: no se cotiza porque falta SKYDROPX_API_KEY '
+                        '(se pega en Admin → Cobros o en el entorno).')
+        return {'enabled': False, 'options': []}
+    cp = (payload.postal_code or '').strip()
+    if len(cp) < 5:
+        return {'enabled': True, 'options': [], 'detail': 'Falta el código postal'}
+    # El peso lo calcula el SERVIDOR contra el catálogo real. Lo que diga el
+    # navegador del peso no se pregunta siquiera: no viaja en la petición.
+    pflags = await _catalogo_de(payload.items)
+    paquete = envios.paquete_del_pedido(payload.items, pflags)
+    if not paquete['peso_kg']:
+        return {'enabled': True, 'options': [], 'detail': 'El carrito está vacío'}
+    try:
+        opciones = skydropx.cotizar(cp, paquete)
+    except Exception:
+        logger.exception('Skydropx: no se pudo cotizar a %s', cp)
+        return {'enabled': False, 'options': [], 'detail': 'La paquetería no respondió'}
+    if not opciones:
+        return {'enabled': True, 'options': [], 'peso_kg': paquete['peso_kg'],
+                'detail': 'Sin cobertura para ese código postal'}
+    doc = await _guardar_cotizacion(cp, paquete, opciones)
+    return {
+        'enabled': True,
+        'peso_kg': paquete['peso_kg'],
+        'expires_at': doc['expires_at'],
+        'free_shipping_from': FREE_SHIPPING_FROM,
+        # Al navegador se le da el precio para ENSEÑARLO. El que se cobra sale del
+        # documento guardado, no de esta respuesta cuando vuelva.
+        'options': [{'id': o['opcion_id'], 'carrier': o['paqueteria'],
+                     'service': o['servicio'], 'days': o['dias'],
+                     'price': o['precio']} for o in doc['opciones']],
+    }
+
+
+async def _envio_del_pedido(payload, paid_merchandise, pflags):
+    """Cuánto se le cobra de envío a este pedido, y con qué cotización.
+
+    ⛔ EL PRECIO LO PONE EL SERVIDOR. El monto de envío que venga en la petición se
+    ignora por completo, igual que se ignoran los precios de los productos: sale de
+    la cotización que el propio servidor guardó, y solo si sigue siendo válida para
+    este CP y este peso. Si no lo es, se vuelve a cotizar aquí mismo.
+
+    Devuelve (lo que paga el cliente, lo que se guarda en el pedido).
+    """
+    if not envio_se_cotiza():
+        # El camino de siempre: la tarifa plana dormida detrás de COBRAR_ENVIO. La
+        # línea se escribe TAL CUAL porque hay pruebas que la buscan literal — es el
+        # candado que impide que alguien vuelva a dejar el envío sin interruptor.
+        shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0
+        return shipping, {}
+    cp = (payload.customer.postal_code or '').strip()
+    paquete = envios.paquete_del_pedido(payload.items, pflags)
+    opcion = await _cotizacion_valida(payload.shipping_quote_id, cp, paquete['peso_kg'])
+    if not opcion:
+        # Cotización vencida, ausente, de otro CP o de otro peso: se cotiza de nuevo
+        # AQUÍ, con el carrito de verdad. Se toma la más barata de las permitidas.
+        try:
+            frescas = skydropx.cotizar(cp, paquete)
+        except Exception:
+            logger.exception('Skydropx: no se pudo recotizar el pedido a %s', cp)
+            frescas = []
+        if not frescas:
+            return 0, {}                # sin cotización no se inventa un cargo
+        doc = await _guardar_cotizacion(cp, paquete, frescas)
+        opcion = dict(doc['opciones'][0], peso_kg=paquete['peso_kg'], paquete=paquete)
+    costo = float(opcion.get('precio') or 0)
+    cobrado = envios.cobro_de_envio_al_cliente(costo, paid_merchandise, FREE_SHIPPING_FROM)
+    guardado = {
+        'carrier': opcion.get('paqueteria', ''),
+        'service': opcion.get('servicio', ''),
+        'service_code': opcion.get('servicio_codigo', ''),
+        'days': opcion.get('dias', 0),
+        'cost': round(costo, 2),
+        'charged': cobrado,
+        'peso_kg': opcion.get('peso_kg'),
+        'paquete': opcion.get('paquete') or paquete,
+        'postal_code': cp,
+        'quoted_at': now_iso(),
+    }
+    return cobrado, guardado
+
+
+async def comprar_guia_del_pedido(order: dict) -> dict | None:
+    """Compra la guía de un pedido YA PAGADO y la deja en el pedido. Idempotente.
+
+    La llaman los cuatro caminos del dinero: tarjeta y OXXO (Mercado Pago), cripto
+    (NOWPayments/BTCPay) y SPEI (cuando el admin confirma el depósito). Todos pasan
+    por aquí porque todos terminan en el mismo lugar: el pedido en 'confirmado'.
+
+    Nunca revienta hacia arriba: un pedido pagado no se puede quedar a medias
+    porque la paquetería tenga un mal día. Si falla, lo deja escrito en el pedido
+    (`label_error`) y en la bitácora, y el admin compra la guía a mano como hoy.
+    """
+    if not envios.COMPRAR_GUIA_AL_PAGAR:
+        return None
+    if not order or order.get('tracking_number'):
+        return None                     # ya tiene guía: no se compra dos veces
+    if not skydropx.enabled():
+        logger.info('Envio: no se compra guia de %s porque falta SKYDROPX_API_KEY',
+                    order.get('order_number'))
+        return None
+    if not skydropx.remitente_configurado():
+        # ⛔ A PROPÓSITO. Comprar con un remitente inventado es pagar una recolección
+        # en una dirección que no existe. Ver skydropx.py.
+        logger.error('Envio: NO se compra guia de %s — falta la direccion del '
+                     'remitente (SKYDROPX_FROM_*). ⚠️ PENDIENTE de Christian.',
+                     order.get('order_number'))
+        await db.orders.update_one({'id': order['id']},
+                                   {'$set': {'label_error': 'Falta configurar el remitente'}})
+        return None
+    c = order.get('customer') or {}
+    destino = {
+        'name': c.get('full_name', ''), 'company': '',
+        'address1': c.get('address', ''), 'address2': c.get('address_2', ''),
+        'city': c.get('city', ''), 'province': c.get('state', ''),
+        'zip': c.get('postal_code', ''), 'country': c.get('country', 'MX') or 'MX',
+        'phone': c.get('phone', ''), 'email': c.get('email', ''),
+        'reference': c.get('notes', ''), 'contents': 'Insumos de laboratorio',
+    }
+    quote = order.get('shipping_quote') or {}
+    paquete = quote.get('paquete') or envios.paquete_del_pedido(order.get('items') or [], {})
+    try:
+        guia = skydropx.guia_para(destino, paquete, quote.get('service_code', ''))
+    except Exception as e:
+        logger.exception('Skydropx: no se pudo comprar la guia de %s', order.get('order_number'))
+        await db.orders.update_one({'id': order['id']}, {'$set': {'label_error': str(e)[:300]}})
+        return None
+    numero = guia.get('tracking_number') or ''
+    update = {
+        'carrier': guia.get('carrier') or 'Estafeta',
+        'tracking_number': numero,
+        'tracking_url': guia.get('tracking_url') or build_tracking_url(guia.get('carrier', ''), numero),
+        'label_url': guia.get('label_url') or '',
+        'label_provider': 'skydropx',
+        'label_error': '',
+        'shipping_cost': guia.get('costo') or quote.get('cost') or 0,
+        'shipped_at': order.get('shipped_at') or now_iso(),
+        'status': 'enviado',
+    }
+    await db.orders.update_one({'id': order['id']}, {'$set': update})
+    logger.info('Envio: guia comprada para %s — %s %s',
+                order.get('order_number'), update['carrier'], numero)
+    return update
 
 
 def buyer_own_rate(user):
@@ -1184,6 +1420,37 @@ async def _descontar_inventario_vivo(product_id, doc, delta):
     return False
 
 
+async def _catalogo_de(items):
+    """El catálogo REAL de unos renglones del carrito, indexado por id Y por SKU.
+
+    Aceptamos las dos llaves porque el carrito manda cualquiera de las dos: el
+    carrito viejo inventaba ids tipo "slug::5 mg" que no existían, y eso hacía que
+    el producto se saltara su tope de comisión (Christian, 2026-07-25).
+
+    Vive en su propia función porque ahora lo usan DOS rutas —crear el pedido y
+    cotizar el envío— y las dos tienen que mirar exactamente el mismo catálogo. Con
+    la consulta copiada en dos lados, una de las dos se queda sin un campo (el peso,
+    por ejemplo) y el error no se ve hasta que la paquetería cobra de más.
+    """
+    keys = [getattr(it, 'product_id', None) or (it.get('product_id') if isinstance(it, dict) else '')
+            for it in (items or [])]
+    _pdocs = await db.products.find(
+        {'$or': [{'id': {'$in': keys}}, {'sku': {'$in': keys}}]},
+        # `slug` y `presentation` NO son adorno: con ellos se arma la llave del
+        # inventario vivo (`fallback-<familia>::<presentación>`). Sin ellos el descuento
+        # de `db.stock` no encuentra nada y no baja nunca.
+        # `weight_kg` tampoco: es lo que cotiza el envío por peso real.
+        {'_id': 0, 'id': 1, 'sku': 1, 'name': 1, 'commission_cap': 1,
+         'distributor_eligible': 1, 'category': 1, 'stock': 1, 'price': 1,
+         'hidden': 1, 'slug': 1, 'presentation': 1, 'weight_kg': 1}).to_list(500)
+    pflags = {}
+    for d in _pdocs:
+        pflags[d['id']] = d
+        if d.get('sku'):
+            pflags[d['sku']] = d
+    return pflags
+
+
 def _agrupar_por_producto(items, pflags):
     """Junta los renglones del carrito POR PRODUCTO REAL, no por lo que mandó el navegador.
 
@@ -1350,20 +1617,7 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # Resolvemos cada renglon contra el catalogo real. Aceptamos id o SKU: el
     # carrito viejo mandaba ids inventados ("slug::5 mg") que no existian, y eso
     # hacia que el producto se saltara su tope de comision (Christian 2026-07-25).
-    _keys = [it.product_id for it in payload.items]
-    _pdocs = await db.products.find(
-        {'$or': [{'id': {'$in': _keys}}, {'sku': {'$in': _keys}}]},
-        # `slug` y `presentation` NO son adorno: con ellos se arma la llave del
-        # inventario vivo (`fallback-<familia>::<presentación>`). Sin ellos el descuento
-        # de `db.stock` no encuentra nada y no baja nunca.
-        {'_id': 0, 'id': 1, 'sku': 1, 'name': 1, 'commission_cap': 1,
-         'distributor_eligible': 1, 'category': 1, 'stock': 1, 'price': 1,
-         'hidden': 1, 'slug': 1, 'presentation': 1}).to_list(500)
-    _pflags = {}
-    for d in _pdocs:
-        _pflags[d['id']] = d
-        if d.get('sku'):
-            _pflags[d['sku']] = d
+    _pflags = await _catalogo_de(payload.items)
 
     # ⛔ EL PRECIO LO PONE EL SERVIDOR, NUNCA EL NAVEGADOR.
     # Hasta el 2026-07-27 el subtotal se calculaba con `item.price` tal como venía en la
@@ -1507,9 +1761,12 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         balance = int((fresh or {}).get('points_balance', 0) or 0)
         points_used = loyalty.clamp_redeem(payload.points_to_use, balance, after_discount)
     paid_merchandise = after_discount - points_used
-    # El envio lo decide el SERVIDOR, no lo que mande el navegador. Y hoy decide
-    # que no se cobra: el envio se cotiza aparte (ver COBRAR_ENVIO).
-    shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0
+    # El envio lo decide el SERVIDOR, no lo que mande el navegador: el campo
+    # `shipping` de la peticion se ignora por completo — igual que se ignoran los
+    # precios de los productos. Con Skydropx encendido el monto sale de la cotizacion
+    # GUARDADA (revalidada contra este CP y este peso, y recotizada si ya no vale);
+    # apagado, del camino de siempre.
+    shipping, shipping_quote = await _envio_del_pedido(payload, paid_merchandise, _pflags)
     total = paid_merchandise + shipping
     # `discount_rate` es el descuento CONCEDIDO: con el máximo (40%) el pedido no
     # genera puntos. Ver la regla en loyalty.py.
@@ -1568,6 +1825,11 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         discount_rate=discount_rate,
         discount_capped=discount_capped,
         shipping=shipping,
+        shipping_quote=shipping_quote,
+        shipping_cost=float(shipping_quote.get('cost') or 0),
+        # Lo que la casa se comió del envío. Sin este número nadie sabe cuánto
+        # cuesta de verdad la promesa de "envío gratis".
+        shipping_absorbed=max(0.0, float(shipping_quote.get('cost') or 0) - float(shipping or 0)),
         total=total,
         referred_by=referrer['id'] if referrer else None,
         commission=commission,
@@ -1699,6 +1961,10 @@ async def _confirm_paid_order(order_number: str):
         fresh = await db.orders.find_one({'id': order['id']}, {'_id': 0})
         await award_order_points(fresh)
         asyncio.create_task(send_payment_confirmed_email(fresh))
+        # La guía se compra sola en cuanto entra el dinero (tarjeta, OXXO, cripto).
+        # En segundo plano: el webhook de la pasarela no debe quedarse esperando a
+        # la paquetería — si tarda o falla, el pago ya quedó confirmado igual.
+        asyncio.create_task(comprar_guia_del_pedido(fresh))
 
 
 @api_router.get('/payments/config')
@@ -1714,7 +1980,10 @@ async def payments_config():
             'oxxo_enabled': mercadopago.enabled(),   # viaja por la misma pasarela
             'shipping_charged': COBRAR_ENVIO,
             'shipping_flat': SHIPPING_FLAT,
-            'free_shipping_from': FREE_SHIPPING_FROM}
+            'free_shipping_from': FREE_SHIPPING_FROM,
+            # Cotización real por CP y peso (Skydropx). Apagada: el checkout ni
+            # pregunta y la pantalla se ve EXACTAMENTE como hoy.
+            'shipping_quote_enabled': envio_se_cotiza()}
 
 
 @api_router.post('/payments/nowpayments/webhook')
@@ -1951,6 +2220,9 @@ async def update_order_status(order_id: str, payload: OrderStatusUpdate, admin=D
         asyncio.create_task(send_payment_confirmed_email(order, lang))
         await notify(order.get('user_id'), 'payment_confirmed', 'Pago confirmado',
                      f'Confirmamos el pago de tu pedido {num}. ¡Gracias!', link=f'/pedido/{num}')
+        # SPEI llega por aquí: el admin verifica el depósito y marca 'confirmado'.
+        # Es el cuarto método de pago, y compra su guía igual que los otros tres.
+        asyncio.create_task(comprar_guia_del_pedido(order))
     # Notificación de entrega, solo al ENTRAR a 'entregado'.
     if payload.status == 'entregado' and (prev.get('status') or '') != 'entregado':
         await notify(order.get('user_id'), 'order_delivered', 'Pedido entregado',
