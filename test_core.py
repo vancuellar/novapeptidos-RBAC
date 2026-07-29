@@ -1918,3 +1918,28 @@ def test_el_envio_gratis_y_la_oferta_de_carrito_abandonado_usan_el_MISMO_umbral(
     assert recovery.MIN_FOR_OFFER == FREE_SHIPPING_FROM, (
         f'el envío gratis empieza en ${FREE_SHIPPING_FROM:,} y el cupón de carrito '
         f'abandonado en ${recovery.MIN_FOR_OFFER:,}: uno de los dos se movió solo')
+
+
+# ---------- Entrar con Outlook (Microsoft) ----------
+def test_microsoft_apagado_sin_client_id():
+    # Sin MICROSOFT_CLIENT_ID el endpoint dice apagado y el botón no existe:
+    # nada de botones muertos (mismo contrato que Google Sign-In).
+    from microsoft_auth import microsoft_enabled
+    assert microsoft_enabled() is False
+
+
+def test_microsoft_config_endpoint_apagado():
+    from fastapi.testclient import TestClient
+    from server import app
+    with TestClient(app) as c:
+        r = c.get('/api/auth/microsoft/config')
+        assert r.status_code == 200
+        assert r.json() == {'enabled': False, 'client_id': ''}
+
+
+def test_microsoft_login_sin_config_da_401():
+    from fastapi.testclient import TestClient
+    from server import app
+    with TestClient(app) as c:
+        r = c.post('/api/auth/microsoft', json={'credential': 'basura'})
+        assert r.status_code == 401

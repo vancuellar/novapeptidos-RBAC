@@ -38,6 +38,7 @@ import marketing
 import director
 import recovery
 from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
+from microsoft_auth import verify_microsoft_token, microsoft_enabled, MICROSOFT_CLIENT_ID
 import loyalty
 import pyramid
 import auth_factors
@@ -381,34 +382,28 @@ async def google_config():
     return {'enabled': google_enabled(), 'client_id': GOOGLE_CLIENT_ID if google_enabled() else ''}
 
 
-@api_router.post('/auth/google')
-async def google_login(payload: GoogleAuthInput):
-    """Entra o crea la cuenta con una credencial de Google.
+async def _social_login(info: dict, payload: GoogleAuthInput, sub_field: str, source: str):
+    """Entra o crea la cuenta con una identidad ya verificada (Google/Microsoft).
 
-    Google ya verifico el correo, asi que la cuenta nace confirmada: no tiene
-    sentido mandar un correo de confirmacion a una direccion que Google acaba
-    de validar. Si el correo ya existe con contrasena, se vincula y entra: es
-    la misma persona.
+    El proveedor ya verifico el correo, asi que la cuenta nace confirmada: no
+    tiene sentido mandar un correo de confirmacion a una direccion recien
+    validada. Si el correo ya existe con contrasena, se vincula y entra: es la
+    misma persona.
     """
-    try:
-        info = await verify_google_token(payload.credential)
-    except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc))
-
     user = await db.users.find_one({'email': info['email']})
     if user and user.get('blocked'):
         raise HTTPException(status_code=403, detail='Esta cuenta esta deshabilitada')
     if user:
-        # Cuenta existente: se vincula con Google y se da por confirmada.
+        # Cuenta existente: se vincula con el proveedor y se da por confirmada.
         # No se piden consentimientos: ya los dio al registrarse.
         await db.users.update_one(
             {'id': user['id']},
-            {'$set': {'google_sub': info['google_sub'], 'email_verified': True}},
+            {'$set': {sub_field: info[sub_field], 'email_verified': True}},
         )
     else:
-        # Cuenta NUEVA: Google avala el correo, pero 18+/Terminos y Privacidad
-        # los tiene que aceptar la persona. Sin eso, el sitio pide las casillas
-        # y reintenta con la misma credencial.
+        # Cuenta NUEVA: el proveedor avala el correo, pero 18+/Terminos y
+        # Privacidad los tiene que aceptar la persona. Sin eso, el sitio pide
+        # las casillas y reintenta con la misma credencial.
         if not (payload.age_confirmed and payload.privacy_accepted):
             return {'needs_consent': True, 'name': info['name'], 'email': info['email']}
         referrer = await resolve_distributor(payload.distributor_code)
@@ -417,13 +412,13 @@ async def google_login(payload: GoogleAuthInput):
             'id': str(uuid.uuid4()),
             'name': info['name'],
             'email': info['email'],
-            # Sin contrasena: solo entra por Google hasta que use "recuperar
-            # contrasena" para ponerse una.
+            # Sin contrasena: solo entra con el proveedor hasta que use
+            # "recuperar contrasena" para ponerse una.
             'password_hash': '',
             'role': 'user',
             'language': normalize_language(payload.language),
             'referred_by': referrer['id'] if referrer else None,
-            'google_sub': info['google_sub'],
+            sub_field: info[sub_field],
             'email_verified': True,
             'consents': {
                 'age_confirmed': True,
@@ -431,22 +426,48 @@ async def google_login(payload: GoogleAuthInput):
                 'marketing_email': bool(payload.marketing_email),
                 'promos': bool(payload.promos),
                 'accepted_at': consented_at,
-                'source': 'google',
+                'source': source,
             },
             'created_at': consented_at,
         }
         await db.users.insert_one(user)
         asyncio.create_task(send_welcome_email(user['name'], user['email'], user['language']))
 
-    # Google ya avalo el correo, asi que la cuenta entra confirmada: es un momento
-    # de confirmacion igual de bueno que abrir el enlace, y sirve para las dos ramas
-    # (la cuenta que ya existia y la que se acaba de crear).
+    # El proveedor ya avalo el correo, asi que la cuenta entra confirmada: es un
+    # momento de confirmacion igual de bueno que abrir el enlace, y sirve para
+    # las dos ramas (la cuenta que ya existia y la que se acaba de crear).
     adoptados = await _adoptar_pedidos_de_invitado(user['id'])
     return {
         'token': create_token(user['id']),
         'user': _session_user(user),
         'adopted_orders': adoptados,
     }
+
+
+@api_router.post('/auth/google')
+async def google_login(payload: GoogleAuthInput):
+    try:
+        info = await verify_google_token(payload.credential)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    return await _social_login(info, payload, 'google_sub', 'google')
+
+
+@api_router.get('/auth/microsoft/config')
+async def microsoft_config():
+    """El sitio pregunta si el login con Outlook esta encendido y con que
+    client id. Si no hay client id configurado, el boton no se muestra."""
+    return {'enabled': microsoft_enabled(), 'client_id': MICROSOFT_CLIENT_ID if microsoft_enabled() else ''}
+
+
+@api_router.post('/auth/microsoft')
+async def microsoft_login(payload: GoogleAuthInput):
+    # El payload es identico al de Google (credencial + consentimientos).
+    try:
+        info = await verify_microsoft_token(payload.credential)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc))
+    return await _social_login(info, payload, 'microsoft_sub', 'microsoft')
 
 
 SITE_URL = os.environ.get('SITE_URL', 'https://exygenlabs.com')
