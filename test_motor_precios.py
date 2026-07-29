@@ -505,17 +505,17 @@ def test_el_inventario_vivo_del_panel_no_admite_cantidades_negativas():
 
 # ---------- Envío: la política es deliberada ----------
 
-def test_el_envio_no_se_cobra_a_proposito_y_nunca_se_resta():
-    """Christian decidió no cobrar envío. Lo que se comprueba aquí no es el número, es
+def test_el_envio_se_cobra_parejo_y_nunca_se_resta():
+    """Christian cobra $250 parejo (2026-07-28). Lo que se comprueba aquí no es el número, es
     que el envío sólo pueda SUMAR: no existe ningún descuento de $250 en ninguna parte,
     así que no hay forma de que se aplique donde no corresponde ni dos veces."""
     src = _fuente()
-    assert 'COBRAR_ENVIO = False' in src, 'cambió la política de envío sin decirlo'
+    assert 'COBRAR_ENVIO = True' in src, 'cambió la política de envío sin decirlo'
     assert 'shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0' in src
     assert 'total = paid_merchandise + shipping' in src, 'el envío tiene que SUMAR'
     # Skydropx no cambia la política: nace apagado y el envío sigue sin cobrarse.
     import envios
-    assert envios.COTIZAR_EN_CHECKOUT is False, 'cambió la política de envío sin decirlo'
+    assert envios.COTIZAR_EN_CHECKOUT is False, 'la cotización en vivo sigue apagada'
     assert '- 250' not in src and '-250' not in src.replace('-2500', ''), \
         'apareció una resta de 250: el envío no es un descuento'
 

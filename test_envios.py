@@ -578,8 +578,9 @@ def test_apagado_el_envio_se_comporta_EXACTAMENTE_como_hoy(db):
     assert envios.COTIZAR_EN_CHECKOUT is False      # ⛔ nace apagado
     assert envios.COMPRAR_GUIA_AL_PAGAR is False    # ⛔ nace apagado
     assert server.envio_se_cotiza() is False
+    # Sin cotización viva se cae a la tarifa plana de $250, que es la política nueva.
     cobrado, guardado = asyncio.run(server._envio_del_pedido(_pedido(), 1000, PFLAGS))
-    assert cobrado == 0 and guardado == {}
+    assert cobrado == 250 and guardado == {}
 
 
 def test_sin_credenciales_no_se_cotiza_aunque_este_prendido(monkeypatch):
@@ -924,9 +925,13 @@ def test_las_funciones_del_tope_no_revientan_con_basura():
 def test_el_pedido_guarda_lo_que_la_casa_absorbe_aunque_no_cobre_envio():
     """Con el cobro apagado el pedido guardaba costo $0 y absorbido $0: los $250
     que la casa se come no existían en ningún reporte."""
-    assert server.COBRAR_ENVIO is False              # ⛔ política del dueño, no se toca
-    cobrado = server.shipping_for(179) if server.COBRAR_ENVIO else 0
-    costo_guia = server.SHIPPING_FLAT                 # sin cotización, la tarifa plana
-    assert cobrado == 0
-    assert envios.envio_que_absorbe_la_casa(costo_guia, cobrado) == 250
-    assert envios.absorcion_fuera_de_tope(costo_guia, 179, cobrado) > 0
+    assert server.COBRAR_ENVIO is True               # política nueva: $250 parejo
+    # Pedido de $179: el cliente paga los $250, la casa no absorbe nada.
+    cobrado = server.shipping_for(179)
+    costo_guia = server.SHIPPING_FLAT
+    assert cobrado == 250
+    assert envios.envio_que_absorbe_la_casa(costo_guia, cobrado) == 0
+    # Pedido de $3,000: va gratis, y ahí SÍ lo absorbe la casa — y queda registrado.
+    assert server.shipping_for(3000) == 0
+    assert envios.envio_que_absorbe_la_casa(costo_guia, 0) == 250
+    assert envios.absorcion_fuera_de_tope(costo_guia, 3000, 0) == 0   # 250 cabe en el 10%

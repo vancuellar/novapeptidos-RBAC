@@ -1554,9 +1554,14 @@ def test_el_envio_gratis_nunca_pasa_del_10_por_ciento_de_la_compra():
 # borró: quedó dormida detrás de un interruptor, con sus pruebas corriendo, para
 # el día que se vuelva a cobrar.
 
-def test_el_pedido_ya_no_cobra_envio():
-    from server import COBRAR_ENVIO
-    assert COBRAR_ENVIO is False, 'el pedido volvió a cobrar envío sin que nadie lo pidiera'
+def test_el_pedido_cobra_250_parejo():
+    """Christian, 2026-07-28: "$250 parejo y pagamos un poco más por envío express".
+    Abajo de $2,500 se cobran $250; arriba va gratis con el tope del 10%."""
+    from server import COBRAR_ENVIO, SHIPPING_FLAT, shipping_for
+    assert COBRAR_ENVIO is True, 'el pedido dejó de cobrar envío sin que nadie lo pidiera'
+    assert SHIPPING_FLAT == 250
+    assert shipping_for(1000) == 250        # pedido chico: paga
+    assert shipping_for(3000) == 0          # arriba de $2,500: gratis, cabe en el 10%
 
 
 def test_el_cobro_del_pedido_respeta_el_interruptor():
