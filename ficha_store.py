@@ -80,11 +80,49 @@ def slugs_disponibles() -> list:
     return sorted(out)
 
 
+# En la base cada PRESENTACIÓN es su propio producto ("retatrutida-40-mg"),
+# pero la ficha es del COMPUESTO ("retatrutida"). Estos son los sufijos de
+# presentación que hay que recortar para emparejarlos.
+_UNIDAD = r'(?:mg|mcg|g|ml|iu|ui)'
+_SUFIJOS = (
+    re.compile(rf'-\d+-{_UNIDAD}$'),        # retatrutida-40-mg
+    re.compile(rf'-\d+-\d+-{_UNIDAD}$'),    # retatrutida-2-5-mg (el decimal)
+    re.compile(rf'-\d+{_UNIDAD}$'),         # ...-60mg, con la unidad pegada
+)
+
+
+def compuesto_de(slug: str, disponibles=None) -> str | None:
+    """La ficha que le toca a un slug del catálogo. None si no hay ninguna.
+
+    Sin este recorte no emparejaba NI UNO: los 193 productos del catálogo
+    daban cero fichas, porque ninguno se llama igual que su compuesto. Se
+    descubrió el 2026-07-29 probando en vivo con el cliente que sí compró.
+
+    Se prueba del recorte más corto al más largo y gana el primero que TENGA
+    ficha. El orden importa porque hay compuestos cuyo nombre lleva número:
+    `thymosin-alpha-1` y `snap-8` no se pueden recortar hasta `thymosin-alpha`
+    ni `snap`. Como se exige que el resultado exista en disco, un recorte de
+    más nunca puede entregar la ficha de otro compuesto.
+    """
+    if not slug or not isinstance(slug, str):
+        return None
+    disp = set(slugs_disponibles() if disponibles is None else disponibles)
+    if slug in disp:
+        return slug
+    for rx in _SUFIJOS:
+        base = rx.sub('', slug)
+        if base != slug and base in disp:
+            return base
+    return None
+
+
 def para_slugs(slugs) -> list:
     """Fichas que le corresponden a una lista de slugs comprados."""
     disponibles = set(slugs_disponibles())
+    encontradas = {compuesto_de(s, disponibles) for s in slugs if s}
+    encontradas.discard(None)
     return [{'product_slug': s, 'nombre_archivo': nombre_descarga(s)}
-            for s in sorted({x for x in slugs if x}) if s in disponibles]
+            for s in sorted(encontradas)]
 
 
 # ----------------------------------------------------------- enlaces firmados
