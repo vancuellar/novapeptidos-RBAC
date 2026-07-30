@@ -2054,3 +2054,56 @@ def test_microsoft_login_sin_config_da_401():
     with TestClient(app) as c:
         r = c.post('/api/auth/microsoft', json={'credential': 'basura'})
         assert r.status_code == 401
+
+
+# ---------- Correos alternos: dos direcciones, UNA cuenta ----------
+def test_usuario_por_correo_busca_principal_y_alternos():
+    # La cuenta admin y su Gmail son la misma persona: la búsqueda debe mirar
+    # el correo principal Y los alternos, siempre en minúsculas.
+    import asyncio
+    import server as S
+
+    consultas = []
+
+    class _Users:
+        async def find_one(self, query, *a, **k):
+            consultas.append(query)
+            return {'id': 'u-admin', 'email': 'admin@exygenlabs.com'}
+
+    class _Db:
+        users = _Users()
+
+    original = S.db
+    S.db = _Db()
+    try:
+        user = asyncio.run(S._usuario_por_correo('EXYGENLABS@GMAIL.COM'))
+    finally:
+        S.db = original
+
+    assert user['id'] == 'u-admin'
+    q = consultas[0]
+    assert '$or' in q, 'la búsqueda debe cubrir principal y alternos'
+    campos = {list(c.keys())[0]: list(c.values())[0] for c in q['$or']}
+    assert campos.get('email') == 'exygenlabs@gmail.com'      # minúsculas
+    assert campos.get('alt_emails') == 'exygenlabs@gmail.com'  # y el alterno
+
+
+def test_usuario_por_correo_aguanta_vacio():
+    # Con correo vacío no debe tronar ni consultar con None.
+    import asyncio
+    import server as S
+
+    class _Users:
+        async def find_one(self, query, *a, **k):
+            assert query['$or'][0]['email'] == ''
+            return None
+
+    class _Db:
+        users = _Users()
+
+    original = S.db
+    S.db = _Db()
+    try:
+        assert asyncio.run(S._usuario_por_correo(None)) is None
+    finally:
+        S.db = original

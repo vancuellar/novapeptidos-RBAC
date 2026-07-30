@@ -292,9 +292,19 @@ def _session_user(user):
         'preferred_theme': user.get('preferred_theme'),
     }
 
+async def _usuario_por_correo(email: str):
+    """Busca la cuenta por su correo principal O por un correo alterno.
+
+    Una misma persona puede tener dos direcciones (p. ej. la cuenta admin y su
+    Gmail): `alt_emails` las liga a UNA sola cuenta, y todas las puertas de
+    entrada (contraseña, Google, Outlook, recuperación) deben mirar ambas."""
+    e = (email or '').lower()
+    return await db.users.find_one({'$or': [{'email': e}, {'alt_emails': e}]})
+
+
 @api_router.post('/auth/register')
 async def register(payload: RegisterInput):
-    existing = await db.users.find_one({'email': payload.email.lower()})
+    existing = await _usuario_por_correo(payload.email)
     if existing:
         raise HTTPException(status_code=400, detail='Este correo ya esta registrado')
     if not payload.age_confirmed:
@@ -350,7 +360,7 @@ async def register(payload: RegisterInput):
 
 @api_router.post('/auth/login')
 async def login(payload: LoginInput):
-    user = await db.users.find_one({'email': payload.email.lower()})
+    user = await _usuario_por_correo(payload.email)
     if not user or not verify_password(payload.password, user.get('password_hash', '')):
         raise HTTPException(status_code=401, detail='Correo o contrasena incorrectos')
     if user.get('blocked'):
@@ -409,7 +419,7 @@ async def _social_login(info: dict, payload: GoogleAuthInput, sub_field: str, so
     validada. Si el correo ya existe con contrasena, se vincula y entra: es la
     misma persona.
     """
-    user = await db.users.find_one({'email': info['email']})
+    user = await _usuario_por_correo(info['email'])
     if user and user.get('blocked'):
         raise HTTPException(status_code=403, detail='Esta cuenta esta deshabilitada')
     if user:
@@ -750,7 +760,7 @@ async def verify_email(payload: TokenInput):
 @api_router.post('/auth/resend-verification')
 async def resend_verification(payload: ResendVerificationInput):
     """Siempre responde ok: no revelamos si el correo existe."""
-    user = await db.users.find_one({'email': payload.email.lower()})
+    user = await _usuario_por_correo(payload.email)
     if user and user.get('email_verified') is False:
         user['language'] = payload.language or user.get('language')
         await _send_verification(user)
@@ -792,7 +802,7 @@ async def activate_account(payload: ActivateInput):
 @api_router.post('/auth/forgot-password')
 async def forgot_password(payload: ForgotPasswordInput):
     """Siempre responde ok (no revela si el correo existe)."""
-    user = await db.users.find_one({'email': payload.email.lower()}, {'_id': 0, 'password_hash': 0})
+    user = await _usuario_por_correo(payload.email)
     if user:
         token = uuid.uuid4().hex
         await db.password_resets.insert_one({
@@ -840,7 +850,7 @@ async def update_profile(payload: ProfileUpdate, user=Depends(get_current_user))
         full = await db.users.find_one({'id': user['id']})
         if not payload.current_password or not verify_password(payload.current_password, full['password_hash']):
             raise HTTPException(status_code=400, detail='Para cambiar el correo, confirma tu contrasena actual')
-        if await db.users.find_one({'email': payload.email.lower()}):
+        if await _usuario_por_correo(payload.email):
             raise HTTPException(status_code=400, detail='Ese correo ya esta registrado')
         update['email'] = payload.email.lower()
     if update:
@@ -3143,7 +3153,7 @@ async def _email_announcement(audience, title, body):
 @api_router.post('/admin/customers/invite')
 async def invite_customer(payload: DistributorCreate, admin=Depends(get_current_admin)):
     """Invita a un cliente: crea la cuenta y le manda un enlace para que elija su contrasena."""
-    existing = await db.users.find_one({'email': payload.email.lower()})
+    existing = await _usuario_por_correo(payload.email)
     if existing:
         raise HTTPException(status_code=400, detail='Este correo ya esta registrado')
     user = {
@@ -3242,7 +3252,7 @@ async def admin_distributors(admin=Depends(get_current_admin)):
 
 @api_router.post('/admin/distributors')
 async def create_distributor(payload: DistributorCreate, admin=Depends(get_current_admin)):
-    existing = await db.users.find_one({'email': payload.email.lower()})
+    existing = await _usuario_por_correo(payload.email)
     if existing:
         raise HTTPException(status_code=400, detail='Este correo ya esta registrado')
     code = gen_distributor_code(payload.name)
@@ -3328,7 +3338,7 @@ async def resolve_distributor_application(app_id: str, payload: dict, admin=Depe
         raise HTTPException(status_code=400, detail='Acción inválida')
     commission = max(0.0, min(COMMISSION_CAP, float(payload.get('commission_rate', 0.25) or 0)))
     discount = max(0.05, min(0.50, float(payload.get('customer_discount_rate', 0.10) or 0.10)))
-    existing = await db.users.find_one({'email': app_doc['email']})
+    existing = await _usuario_por_correo(app_doc['email'])
     if existing and existing.get('role') == 'distributor':
         result = {'already': True}
     elif existing:
