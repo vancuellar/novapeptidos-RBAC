@@ -393,22 +393,23 @@ apagar_el_viejo() {
     sleep "$GRACIA"
   fi
 
-  if [ -z "$viejo" ]; then
-    # Primer despliegue con colores: lo que hay que apagar es el contenedor del
-    # esquema viejo, el que ocupa el 8000.
-    if legado_vivo; then
-      gris "Apagando el contenedor del esquema viejo ($CONTENEDOR_LEGADO)."
-      docker rm -f "$CONTENEDOR_LEGADO" >/dev/null 2>&1 || true
-      # Ya libero el 8000: ahora Caddy si puede quedarse con el atajo local.
-      apuntar_caddy_a "$(color_activo)" || rojo "No pude publicar el atajo 127.0.0.1:8000 (la tienda no se entera; revisa Caddy)."
-    fi
-    return 0
+  if [ -n "$viejo" ]; then
+    # El color viejo se APAGA, no se borra: su contenedor guarda la version
+    # anterior lista para volver a encenderla en un comando.
+    gris "Apagando el color $viejo (queda guardado para la marcha atras)."
+    docker compose stop -t 20 "$(servicio_de "$viejo")" >/dev/null 2>&1 || true
   fi
 
-  # El color viejo se APAGA, no se borra: su contenedor guarda la version
-  # anterior lista para volver a encenderla en un comando.
-  gris "Apagando el color $viejo (queda guardado para la marcha atras)."
-  docker compose stop -t 20 "$(servicio_de "$viejo")" >/dev/null 2>&1 || true
+  # El contenedor del esquema viejo (un solo "api" en el 8000) sobra en cuanto
+  # hay colores. Se comprueba SIEMPRE, no solo el primer dia: si por lo que sea
+  # sigue vivo, se queda con el 8000 y Caddy no puede publicar el atajo local.
+  if legado_vivo; then
+    gris "Quitando el contenedor del esquema viejo ($CONTENEDOR_LEGADO): ya no sirve trafico."
+    docker rm -f "$CONTENEDOR_LEGADO" >/dev/null 2>&1 || true
+    # Ya libero el 8000: ahora Caddy si puede quedarse con el atajo local.
+    apuntar_caddy_a "$(color_activo)" \
+      || rojo "No pude publicar el atajo 127.0.0.1:8000 (la tienda no se entera; revisa Caddy)."
+  fi
 }
 
 # ============================================================================
