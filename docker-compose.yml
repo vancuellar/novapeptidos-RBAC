@@ -6,6 +6,88 @@
 #
 # El despliegue NO se hace con "docker compose up" a pelo. Se hace con
 # ./deploy.sh, que prueba la imagen nueva ANTES de apagar la que esta sirviendo.
+#
+# ---------------------------------------------------------------------------
+#  DOS COLORES (azul / verde) — por que
+# ---------------------------------------------------------------------------
+#  Antes habia UN solo servicio "api" en el 8000. Cada despliegue lo apagaba y
+#  lo volvia a arrancar: entre una cosa y la otra, la tienda contestaba error
+#  durante unos segundos. Con varios agentes desplegando al dia, eso pasaba
+#  varias veces al dia.
+#
+#  Ahora hay dos contenedores gemelos, en dos puertos distintos:
+#
+#      api-azul   ->  127.0.0.1:8001
+#      api-verde  ->  127.0.0.1:8002
+#
+#  Solo UNO recibe trafico a la vez. Quien decide cual es Caddy, con una linea
+#  en /etc/caddy/exygen-color.caddy. El despliegue levanta el color que esta
+#  apagado, espera a que este SANO de verdad, y solo entonces mueve a Caddy
+#  (recarga en caliente: no se pierde ni una peticion en vuelo). El color viejo
+#  se apaga despues, pasado un periodo de gracia.
+#
+#  Los dos servicios llevan "profiles" para que un "docker compose up -d" a
+#  secas NO los levante a los dos de golpe. Se manejan siempre por deploy.sh.
+# ---------------------------------------------------------------------------
+
+# Los dos colores son EL MISMO contenedor. Se describe una sola vez aqui para
+# que no puedan desincronizarse: si alguien cambia un volumen o el healthcheck,
+# lo cambia para los dos a la vez.
+x-api-comun: &api-comun
+  build: .
+  image: app-api:latest
+  # "unless-stopped" en vez de "always": si alguien apaga el contenedor a
+  # proposito (y deploy.sh apaga el color viejo a proposito), un reinicio del
+  # servidor no lo revive por su cuenta.
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    - COA_DIR=/data/coa
+    - FICHA_DIR=/data/fichas
+  volumes:
+    # Los PDF de los certificados viven fuera del contenedor: se copian a
+    # /opt/exygen/coa y se leen en cada consulta, sin volver a desplegar.
+    - /opt/exygen/coa:/data/coa:ro
+    # Las fichas tecnicas: mismo esquema que los COA. Se copian a
+    # /opt/exygen/fichas y se leen sin volver a desplegar.
+    - /opt/exygen/fichas:/data/fichas:ro
+  depends_on:
+    - mongo
+  # EL PUNTO CLAVE. Sin esto, un contenedor que arranca, revienta al importar
+  # y vuelve a arrancar se ve como "Up" en docker ps: un ciclo de muerte
+  # silencioso. Con el healthcheck se ve "unhealthy" y deploy.sh lo detecta.
+  # La imagen es python:3.11-slim y NO trae curl ni wget: se usa urllib.
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - |
+        import sys, urllib.request
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:8000/api/", timeout=5) as r:
+                sys.exit(0 if r.status == 200 else 1)
+        except Exception:
+            sys.exit(1)
+    interval: 30s
+    timeout: 10s
+    retries: 3
+    # El arranque real toma unos segundos (importa pandas/numpy y conecta a
+    # mongo). Antes de este plazo un fallo no cuenta como "unhealthy".
+    start_period: 60s
+    # Mientras dura ese plazo se pregunta cada 2 segundos en vez de cada 30.
+    # Asi el color nuevo se declara "healthy" a los pocos segundos de estar
+    # listo, y el despliegue no tiene que esperar medio minuto de mas.
+    start_interval: 2s
+  # Un ciclo de reinicios llena el disco de logs en horas. El disco de esta
+  # instancia es de 20 GB y ya va al 79%: sin tope, un crash-loop de una
+  # noche la deja sin espacio y entonces ya no levanta ni el mongo.
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   mongo:
     image: mongo:7
@@ -25,57 +107,17 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  api:
-    build: .
-    image: app-api:latest
-    # "unless-stopped" en vez de "always": si alguien apaga el contenedor a
-    # proposito, un reinicio del servidor no lo revive por su cuenta.
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      - COA_DIR=/data/coa
-      - FICHA_DIR=/data/fichas
-    volumes:
-      # Los PDF de los certificados viven fuera del contenedor: se copian a
-      # /opt/exygen/coa y se leen en cada consulta, sin volver a desplegar.
-      - /opt/exygen/coa:/data/coa:ro
-      # Las fichas tecnicas: mismo esquema que los COA. Se copian a
-      # /opt/exygen/fichas y se leen sin volver a desplegar.
-      - /opt/exygen/fichas:/data/fichas:ro
+  api-azul:
+    <<: *api-comun
+    profiles: ["colores"]
     ports:
-      - "127.0.0.1:8000:8000"
-    depends_on:
-      - mongo
-    # EL PUNTO CLAVE. Sin esto, un contenedor que arranca, revienta al importar
-    # y vuelve a arrancar se ve como "Up" en docker ps: un ciclo de muerte
-    # silencioso. Con el healthcheck se ve "unhealthy" y deploy.sh lo detecta.
-    # La imagen es python:3.11-slim y NO trae curl ni wget: se usa urllib.
-    healthcheck:
-      test:
-        - CMD
-        - python
-        - -c
-        - |
-          import sys, urllib.request
-          try:
-              with urllib.request.urlopen("http://127.0.0.1:8000/api/", timeout=5) as r:
-                  sys.exit(0 if r.status == 200 else 1)
-          except Exception:
-              sys.exit(1)
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      # El arranque real toma unos segundos (importa pandas/numpy y conecta a
-      # mongo). Antes de este plazo un fallo no cuenta como "unhealthy".
-      start_period: 60s
-    # Un ciclo de reinicios llena el disco de logs en horas. El disco de esta
-    # instancia es de 20 GB y ya va al 79%: sin tope, un crash-loop de una
-    # noche la deja sin espacio y entonces ya no levanta ni el mongo.
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      - "127.0.0.1:8001:8000"
+
+  api-verde:
+    <<: *api-comun
+    profiles: ["colores"]
+    ports:
+      - "127.0.0.1:8002:8000"
 
 volumes:
   mongodata:
