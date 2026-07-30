@@ -3910,6 +3910,86 @@ async def distributor_orders(dist=Depends(get_current_distributor)):
     return out
 
 
+def _detalle_de_pedido(o, dist_id=None):
+    """El detalle de UN pedido para verlo en una ficha. `dist_id` = quién pregunta.
+
+    Lleva lo que hace falta para responder "¿qué compró y qué pasó con su dinero?": los
+    renglones con precio unitario, el descuento y de dónde salió, cuánto se pagó y cuánto
+    falta, el envío (y si la casa lo absorbió), los puntos y el estado del paquete.
+
+    ⛔ NUNCA VIAJA UN DATO DE PAGO. No los guardamos —la tarjeta se teclea en Mercado
+    Pago, nunca en nuestro servidor— así que aquí no hay nada que filtrar; se dice por
+    escrito para que a nadie se le ocurra añadirlo.
+
+    Y el DINERO INTERNO tampoco: al distribuidor se le dice SU comisión de este pedido,
+    no el margen de la casa ni lo que ganaron los demás en la pirámide."""
+    c = o.get('customer') or {}
+    envio = float(o.get('shipping', 0) or 0)
+    return {
+        'order_number': o.get('order_number'),
+        'created_at': o.get('created_at'),
+        'status': o.get('status', 'pendiente'),
+        'customer_name': c.get('full_name') or '',
+        'items': [{
+            'name': it.get('name'), 'presentation': it.get('presentation', ''),
+            'quantity': int(it.get('quantity', 0) or 0),
+            'unit_price': float(it.get('price', 0) or 0),
+            'line_total': float(it.get('price', 0) or 0) * int(it.get('quantity', 0) or 0),
+        } for it in o.get('items', [])],
+        'subtotal': o.get('subtotal', 0),
+        'discount': o.get('discount', 0),
+        'discount_rate': o.get('discount_rate', 0),
+        'discount_code': o.get('distributor_code') or '',
+        'points_used': int(o.get('points_used', 0) or 0),
+        'points_earned': int(o.get('points_earned', 0) or 0),
+        # El envío, con la verdad completa: gratis NO quiere decir que no costó.
+        'shipping': envio,
+        'shipping_free': envio <= 0,
+        'shipping_absorbed': float(o.get('shipping_absorbed', 0) or 0),
+        'total': o.get('total', 0),
+        # Pagado ≠ entregado (Christián, 2026-07-29): son dos preguntas distintas.
+        'paid': esta_pagado(o),
+        'paid_at': o.get('paid_at'),
+        'por_cobrar': por_cobrar_de(o),
+        'payment_method': o.get('payment_method'),
+        # Envío partido: qué salió ya y qué quedó por surtir.
+        'backorder': bool(o.get('backorder')),
+        'backorder_items': o.get('backorder_items') or [],
+        'carrier': o.get('carrier', ''),
+        'tracking_number': o.get('tracking_number', ''),
+        'tracking_url': o.get('tracking_url', ''),
+        'shipped_at': o.get('shipped_at'),
+        'delivered_at': o.get('delivered_at'),
+        'eta': o.get('eta', ''),
+        'my_commission': _my_amount(o, dist_id) if dist_id else None,
+    }
+
+
+@api_router.get('/distributor/orders/{order_number}')
+async def distributor_order_detail(order_number: str, dist=Depends(get_current_distributor)):
+    """El detalle de un pedido SUYO. De otro, 403.
+
+    ⛔ EL CANDADO VIVE AQUÍ, NO EN LA PANTALLA. Una ficha que solo se esconde en el
+    navegador se abre tecleando el número de pedido de otro en la barra de direcciones —
+    y ahí va el nombre del cliente ajeno, qué compró y cuánto pagó. El servidor exige que
+    el pedido traiga SU `referred_by`; si no, no existe para él."""
+    o = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
+    if not o:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    if o.get('referred_by') != dist['id']:
+        raise HTTPException(status_code=403, detail='Ese pedido no es tuyo')
+    return _detalle_de_pedido(o, dist['id'])
+
+
+@api_router.get('/admin/orders/{order_number}/detalle')
+async def admin_order_detail(order_number: str, admin=Depends(get_current_admin)):
+    """El mismo detalle para el admin, que sí ve todos."""
+    o = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
+    if not o:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    return _detalle_de_pedido(o, o.get('referred_by'))
+
+
 # ----------------- Protocolos: consumo y recompra -----------------
 REPURCHASE_WARN_DAYS = 14   # a partir de aquí sugerimos recomprar
 

@@ -1131,3 +1131,65 @@ def test_el_pedido_E2E_no_manda_correo_y_el_real_si():
 
     assert len(enviados) == 1, f'el pedido de prueba mandó correo: {enviados}'
     assert enviados[0].startswith('Nuevo pedido EX-20260730-9999'), enviados
+
+
+# ---------- La ficha de UN pedido: el candado vive en el servidor ----------
+
+_PEDIDO_DETALLE = {
+    'order_number': 'EX-20260730-2906', 'created_at': '2026-07-30T10:00:00',
+    'status': 'entregado', 'referred_by': _MARIA, 'paid': True,
+    'paid_at': '2026-07-30T11:00:00', 'payment_method': 'spei',
+    'customer': {'full_name': 'Aidee Liliana García'},
+    'items': [{'name': 'Semaglutida', 'presentation': '2 mg', 'quantity': 2, 'price': 1079.0}],
+    'subtotal': 2158.0, 'discount': 300.0, 'discount_rate': 0.14,
+    'distributor_code': 'MARIA10', 'points_used': 0, 'points_earned': 60,
+    'shipping': 0, 'shipping_absorbed': 250.0, 'total': 2830.0,
+    'commissions': [{'distributor_id': _MARIA, 'role': 'seller', 'amount': 780.0}],
+    'carrier': 'Estafeta', 'tracking_number': '123', 'backorder': False,
+}
+
+
+def test_la_ficha_del_pedido_responde_que_compro_y_que_paso_con_su_dinero():
+    import server as _srv
+    d = _srv._detalle_de_pedido(_PEDIDO_DETALLE, _MARIA)
+    assert d['items'][0] == {'name': 'Semaglutida', 'presentation': '2 mg', 'quantity': 2,
+                             'unit_price': 1079.0, 'line_total': 2158.0}
+    assert d['discount'] == 300.0 and d['discount_code'] == 'MARIA10'
+    assert d['paid'] is True and d['paid_at'] == '2026-07-30T11:00:00'
+    assert d['my_commission'] == 780.0
+    assert d['points_earned'] == 60
+    # Envío gratis NO quiere decir que no costó: se dice lo que la casa absorbió.
+    assert d['shipping_free'] is True and d['shipping_absorbed'] == 250.0
+    assert d['carrier'] == 'Estafeta' and d['tracking_number'] == '123'
+
+
+def test_la_ficha_del_pedido_NUNCA_lleva_datos_de_pago():
+    """No se guardan (la tarjeta se teclea en Mercado Pago), así que no hay nada que
+    filtrar. La prueba existe para que a nadie se le ocurra añadirlos."""
+    import server as _srv
+    d = _srv._detalle_de_pedido(dict(_PEDIDO_DETALLE, card_preference_id='mp-123'), _MARIA)
+    crudo = json.dumps(d).lower() if 'json' in dir() else str(d).lower()
+    for prohibido in ('card', 'tarjeta', 'cvv', 'preference'):
+        assert prohibido not in crudo, f'se coló {prohibido!r} en la ficha del pedido'
+
+
+def test_el_candado_del_pedido_ajeno_vive_en_el_SERVIDOR():
+    """Una ficha que solo se esconde en el navegador se abre tecleando el número de
+    pedido de otro en la barra de direcciones, y ahí va el cliente ajeno completo."""
+    src = _fuente()
+    ini = src.index('async def distributor_order_detail(')
+    cuerpo = src[ini:src.index('\n@api_router', ini)]
+    assert "o.get('referred_by') != dist['id']" in cuerpo, (
+        'no compara contra el referred_by: cualquier distribuidor ve cualquier pedido')
+    assert 'status_code=403' in cuerpo, 'no rechaza el pedido ajeno'
+    assert 'status_code=404' in cuerpo, 'un pedido que no existe debería dar 404'
+
+
+def test_el_admin_ve_cualquier_pedido_pero_por_su_propia_ruta():
+    """Dos rutas distintas a propósito: la del distribuidor filtra, la del admin no. Con
+    una sola y un `if es_admin` dentro, el día que alguien mueva el if se abre todo."""
+    src = _fuente()
+    ini = src.index('async def admin_order_detail(')
+    cuerpo = src[ini:src.index('\n\n# ----------------- Protocolos', ini)]
+    assert 'get_current_admin' in cuerpo
+    assert "referred_by' != " not in cuerpo
