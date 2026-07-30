@@ -1,0 +1,81 @@
+# Composicion de produccion del backend de Exygen (EC2, /opt/exygen/app).
+#
+# Este archivo vive en el repo A PROPOSITO: antes se generaba a mano en el
+# servidor (userdata) y nadie podia revisarlo ni versionarlo. Ahora cualquier
+# cambio de infraestructura pasa por un commit.
+#
+# El despliegue NO se hace con "docker compose up" a pelo. Se hace con
+# ./deploy.sh, que prueba la imagen nueva ANTES de apagar la que esta sirviendo.
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongodata:/data/db
+    # Un mongo caido tambien tumba la tienda: que se note en "docker ps".
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  api:
+    build: .
+    image: app-api:latest
+    # "unless-stopped" en vez de "always": si alguien apaga el contenedor a
+    # proposito, un reinicio del servidor no lo revive por su cuenta.
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - COA_DIR=/data/coa
+      - FICHA_DIR=/data/fichas
+    volumes:
+      # Los PDF de los certificados viven fuera del contenedor: se copian a
+      # /opt/exygen/coa y se leen en cada consulta, sin volver a desplegar.
+      - /opt/exygen/coa:/data/coa:ro
+      # Las fichas tecnicas: mismo esquema que los COA. Se copian a
+      # /opt/exygen/fichas y se leen sin volver a desplegar.
+      - /opt/exygen/fichas:/data/fichas:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      - mongo
+    # EL PUNTO CLAVE. Sin esto, un contenedor que arranca, revienta al importar
+    # y vuelve a arrancar se ve como "Up" en docker ps: un ciclo de muerte
+    # silencioso. Con el healthcheck se ve "unhealthy" y deploy.sh lo detecta.
+    # La imagen es python:3.11-slim y NO trae curl ni wget: se usa urllib.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          try:
+              with urllib.request.urlopen("http://127.0.0.1:8000/api/", timeout=5) as r:
+                  sys.exit(0 if r.status == 200 else 1)
+          except Exception:
+              sys.exit(1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # El arranque real toma unos segundos (importa pandas/numpy y conecta a
+      # mongo). Antes de este plazo un fallo no cuenta como "unhealthy".
+      start_period: 60s
+    # Un ciclo de reinicios llena el disco de logs en horas. El disco de esta
+    # instancia es de 20 GB y ya va al 79%: sin tope, un crash-loop de una
+    # noche la deja sin espacio y entonces ya no levanta ni el mongo.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  mongodata:

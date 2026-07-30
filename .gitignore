@@ -92,3 +92,7 @@ credentials.json
 # sincronice) y .venv es un enlace hacia ella. Ninguna de las dos se sube.
 .venv.nosync/
 .venv
+
+# Estado del ultimo despliegue (imagen + commit para la marcha atras).
+# Lo escribe deploy.sh en el servidor; es local de cada maquina.
+.despliegue-anterior
