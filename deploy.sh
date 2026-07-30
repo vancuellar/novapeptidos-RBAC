@@ -177,7 +177,7 @@ rollback() {
   fi
 
   docker tag "$IMAGEN_ANTERIOR" "$IMAGEN"
-  docker compose up -d --no-build "$SERVICIO"
+  docker compose up -d --no-build --no-deps "$SERVICIO"
 
   if esperar_200 "$URL_LOCAL" 90; then
     verde "Marcha atras lista: la API vuelve a contestar 200."
@@ -263,8 +263,13 @@ desplegar() {
   prueba_arranque
 
   # -- 4. Recien ahora se cambia el contenedor.
+  #       "--no-deps" a proposito: un despliegue de la API NO debe reiniciar la
+  #       base de datos. Sin esta bandera, cualquier cambio en el compose del
+  #       mongo lo recrea de rebote y la tienda se queda sin base unos segundos.
+  #       Si algun dia hay que aplicar un cambio al mongo, se hace aparte y a
+  #       proposito:  sudo docker compose up -d mongo
   paso "Las dos pruebas pasaron — cambiando el contenedor"
-  docker compose up -d --no-build "$SERVICIO"
+  docker compose up -d --no-build --no-deps "$SERVICIO"
 
   # -- 5. Verificacion final. Si esto falla, marcha atras sola.
   paso "Verificando la API ya en produccion"
