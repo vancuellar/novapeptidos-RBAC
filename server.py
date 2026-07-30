@@ -187,9 +187,13 @@ async def _resolve_code(code):
 
 
 # ----------------- Centro de noticias / notificaciones -----------------
-async def notify(user_id, ntype, title, body='', link=None, dedup=None):
+async def notify(user_id, ntype, title, body='', link=None, dedup=None, meta=None):
     """Crea una notificación PERSONAL para un usuario. `dedup`: si se pasa, no
-    duplica una del mismo tipo+dedup en los últimos 30 días (para 'por terminarse')."""
+    duplica una del mismo tipo+dedup en los últimos 30 días (para 'por terminarse').
+
+    `meta` cuelga datos duros del aviso (`order_number`, `client_id`) para que TOCAR LA
+    CAMPANITA ABRA LA COSA, no una pantalla donde hay que volver a buscarla. Sin esto el
+    aviso decía "entró el pedido EX-…" y dejaba al lector a media calle."""
     if not user_id:
         return
     if dedup:
@@ -200,7 +204,8 @@ async def notify(user_id, ntype, title, body='', link=None, dedup=None):
             return
     await db.notifications.insert_one({
         'id': str(uuid.uuid4()), 'kind': 'personal', 'user_id': user_id, 'type': ntype,
-        'title': title, 'body': body, 'link': link, 'dedup': dedup, 'created_at': now_iso()})
+        'title': title, 'body': body, 'link': link, 'dedup': dedup, 'created_at': now_iso(),
+        **{k: v for k, v in (meta or {}).items() if v}})
 
 
 async def avisar_de_la_venta(order, commissions=None):
@@ -218,6 +223,8 @@ async def avisar_de_la_venta(order, commissions=None):
     """
     commissions = commissions if commissions is not None else (order.get('commissions') or [])
     numero = order.get('order_number') or ''
+    # Para que el aviso ABRA el pedido y la ficha de quien compró, no sólo los nombre.
+    donde = {'order_number': numero, 'client_id': _id_de_cliente(order)}
     vendedor = None
     if order.get('referred_by'):
         vendedor = await db.users.find_one({'id': order['referred_by']},
@@ -230,7 +237,7 @@ async def avisar_de_la_venta(order, commissions=None):
         titulo, cuerpo = avisos_de_venta.aviso_para_el_admin(
             order, (vendedor or {}).get('name', ''), a.get('preferred_language'))
         await notify(a['id'], 'venta_admin', titulo, cuerpo,
-                     link=f'/admin?tab=orders', dedup=f'venta:{numero}')
+                     link=f'/admin?tab=orders', dedup=f'venta:{numero}', meta=donde)
     # 2) Quien ganó comisión: el vendedor y los uplines, cada uno con SU tajada.
     for row in (commissions or []):
         if row.get('amount', 0) <= 0:
@@ -242,7 +249,7 @@ async def avisar_de_la_venta(order, commissions=None):
         titulo, cuerpo = avisos_de_venta.aviso_para_el_vendedor(
             order, row['amount'], row.get('role') != 'seller', quien.get('preferred_language'))
         await notify(quien['id'], 'new_sale', titulo, cuerpo,
-                     link='/distribuidor', dedup=f'venta:{numero}')
+                     link='/distribuidor', dedup=f'venta:{numero}', meta=donde)
 
 
 async def broadcast_notification(ntype, title, body='', audience='all', link=None):
@@ -4416,6 +4423,18 @@ async def distributor_clients(dist=Depends(get_current_distributor)):
     return out
 
 
+def _id_de_cliente(order):
+    """A QUÉ FICHA APUNTA EL NOMBRE DE ESTE PEDIDO.
+
+    Con cuenta, su id de usuario; sin cuenta, `invitado:<correo>` — la misma llave que
+    usan las listas de clientes. Va en TODAS las listas donde sale un nombre para que el
+    clic abra la ficha desde cualquier lado y no sólo desde la lista de Clientes."""
+    if order.get('user_id'):
+        return order['user_id']
+    correo = ((order.get('customer') or {}).get('email') or '').strip().lower()
+    return f'invitado:{correo}' if correo else None
+
+
 async def _distributor_orders(dist):
     """Órdenes atribuidas al distribuidor: SOLO las hechas con su código
     (regla Christian 2026-07-22). Un pedido sin código no le pertenece."""
@@ -4436,6 +4455,7 @@ async def distributor_sales(dist=Depends(get_current_distributor)):
         # libera: hasta que entre el dinero, la fila se ve pero no se paga.
         'pagado': esta_pagado(o),
         'customer_name': ((o.get('customer') or {}).get('full_name') or '').split(' ')[0],
+        'client_id': _id_de_cliente(o),
         'total': o.get('total', 0),
         'commission': _my_amount(o, dist['id']),
         'items_count': sum(int(it.get('quantity', 0) or 0) for it in o.get('items', [])),
@@ -4461,6 +4481,7 @@ async def distributor_orders(dist=Depends(get_current_distributor)):
             'created_at': o.get('created_at'),
             'status': o.get('status', 'pendiente'),
             'customer_name': (c.get('full_name') or '').split(' ')[0],
+            'client_id': _id_de_cliente(o),
             'payment_method': o.get('payment_method'),
             'items_count': sum(int(it.get('quantity', 0) or 0) for it in o.get('items', [])),
             'total': o.get('total', 0),
