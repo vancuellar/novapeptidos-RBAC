@@ -1124,6 +1124,43 @@ COMMISSION_CAP = 0.50
 # productos y estos quedan a precio de lista.
 NO_DISCOUNT_CATEGORIES = {'suministros', 'accesorios'}
 
+
+def es_hgh_neto(product_id, name):
+    """Familia HGH (no el Fragment): precio NETO siempre — su margen no aguanta
+    ningún descuento (Christian, 2026-07-22).
+
+    Miramos id Y nombre porque en producción el product_id es un UUID (no dice
+    "hgh"); el nombre sí. Vive a nivel de módulo porque ahora lo usan DOS caminos
+    —el checkout y el cotizador del distribuidor— y con la regla copiada en dos
+    lados una de las dos se queda atrás y el cotizador promete lo que la caja no
+    respeta."""
+    key = f'{product_id or ""} {name or ""}'.lower()
+    return 'hgh' in key and 'fragment' not in key
+
+
+def tope_de_descuento(doc):
+    """Cuánto descuento aguanta UN producto del catálogo. Cero = no participa.
+
+    Es la MISMA regla que aplica el checkout renglón por renglón (ver `_cap_of` /
+    `_eligible` en `create_order`): insumos fuera, productos que no dejan 5x neto
+    fuera, familia HGH a precio neto, y el resto acotado por su `commission_cap`.
+
+    ⛔ Devuelve un número y nada más: aquí NO se asoma el costo, el proveedor ni el
+    ROI. Justo por eso se puede publicar a un distribuidor."""
+    doc = doc or {}
+    if (doc.get('category') or '') in NO_DISCOUNT_CATEGORIES:
+        return 0.0
+    if not bool(doc.get('distributor_eligible', True)):
+        return 0.0
+    if es_hgh_neto(doc.get('id') or doc.get('sku'), doc.get('name')):
+        return 0.0
+    try:
+        cap = float(doc.get('commission_cap', COMMISSION_CAP) or COMMISSION_CAP)
+    except (TypeError, ValueError):
+        cap = COMMISSION_CAP
+    return max(0.0, min(COMMISSION_CAP, cap))
+
+
 # ENVIO (Christian, 2026-07-26). Mandar un paquete dentro de Mexico cuesta ~$250.
 # Absorberlo en un pedido de \$879 se comia el 28% del ingreso. En vez de dejar de
 # vender las presentaciones chicas — que son la puerta de entrada del cliente
@@ -2340,12 +2377,11 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         + (['cripto'] if crypto_enabled() else [])
     if payload.payment_method not in allowed_methods:
         raise HTTPException(status_code=400, detail='Metodo de pago no disponible')
-    # Familia HGH (no el Fragment): precio neto SIEMPRE — su margen no aguanta
-    # ningún descuento (Christian, 2026-07-22). Miramos id Y nombre porque en
-    # producción el product_id es un UUID (no dice "hgh"); el nombre sí.
+    # Familia HGH (no el Fragment): precio neto SIEMPRE (Christian, 2026-07-22).
+    # La regla vive en `es_hgh_neto`, a nivel de módulo, porque el cotizador del
+    # distribuidor tiene que aplicar EXACTAMENTE la misma.
     def _is_hgh_net(item):
-        key = f"{item.product_id} {item.name}".lower()
-        return 'hgh' in key and 'fragment' not in key
+        return es_hgh_neto(item.product_id, item.name)
     # Tope de comisión y elegibilidad POR PRODUCTO (regla Christian 2026-07-23):
     # si un producto no deja 5x neto, no participa del canal de distribuidores
     # (ni descuento de código, ni promo, ni comisión) — solo venta directa.
@@ -3672,6 +3708,47 @@ async def list_discount_codes(dist=Depends(get_current_distributor)):
     return {'max_discount': pyramid.effective_rate(dist),
             'rotate_days': CODE_TTL_DAYS,
             'codes': [_code_projection(c) for c in codes]}
+
+
+@api_router.get('/distributor/quote-caps')
+async def distributor_quote_caps(dist=Depends(get_current_distributor)):
+    """Lo ÚNICO que el COTIZADOR del distribuidor necesita del servidor: hasta
+    cuánto descuento aguanta cada producto y hasta cuánto puede dar ÉL.
+
+    ⛔ REGLA DE ORO (Christián, 2026-07-30). Ni el distribuidor ni el cliente ven
+    JAMÁS el costo real, el proveedor ni el ROI: eso es territorio EXCLUSIVO del
+    admin. Por eso esta ruta NO devuelve productos, devuelve DOS NÚMEROS por
+    llave —`product_id` y `discount_cap`— y nada más. El precio público sale del
+    catálogo que el sitio ya trae en el navegador; de aquí no sale ni un peso de
+    costo. Hay una prueba que lee el payload entero y truena si aparece.
+
+    El tope se calcula con `tope_de_descuento`, LA MISMA función que usa el
+    checkout. Si aquí saliera más alto, el distribuidor cotizaría un descuento que
+    la caja no le va a respetar y el cliente vería otro total al pagar.
+
+    Se emite una fila por CADA llave con la que el carrito puede nombrar al
+    producto (su id y su SKU), porque el navegador manda cualquiera de las dos.
+    """
+    productos = await db.products.find(
+        {},
+        {'_id': 0, 'id': 1, 'sku': 1, 'name': 1, 'category': 1,
+         'commission_cap': 1, 'distributor_eligible': 1, 'hidden': 1},
+    ).to_list(2000)
+    caps = []
+    for p in productos:
+        if p.get('hidden'):
+            continue          # lo que no está a la venta no se cotiza
+        tope = round(tope_de_descuento(p), 4)
+        for llave in (p.get('id'), p.get('sku')):
+            if llave:
+                caps.append({'product_id': llave, 'discount_cap': tope})
+    return {
+        # Su descuento máximo: el mayor de los niveles que le tocan por su comisión
+        # (con la base de 30% del canal son 25%). Es el MISMO número que ya ve en
+        # "Mis Códigos"; no es información nueva, y menos aún un costo.
+        'max_discount': max(pyramid.discount_tiers_for(pyramid.effective_rate(dist)) or [0]),
+        'caps': caps,
+    }
 
 
 @api_router.post('/distributor/codes/rotate')
@@ -6616,6 +6693,220 @@ async def admin_gift_points(user_id: str, payload: GiftPoints, admin=Depends(get
                  link='/cuenta')
     fresh = await db.users.find_one({'id': user_id}, {'_id': 0, 'points_balance': 1})
     return {'points_balance': int((fresh or {}).get('points_balance', 0) or 0)}
+
+
+# ----------------- LA FICHA DE UN CLIENTE (una sola verdad) -----------------
+#
+# ⛔ UNA SOLA FICHA PARA TODA LA PLATAFORMA (Christián, 2026-07-30). El nombre de un
+# cliente sale en seis listas distintas —Clientes y Pedidos del admin, la ficha del
+# distribuidor, Mis Clientes, Ventas, Envíos— y cada una enseñaba una cosa distinta;
+# desde varias ni se podía abrir nada. Ahora todas piden ESTA ruta.
+#
+# ⛔ EL CANDADO DECIDE QUÉ SE ENTREGA, NO QUÉ PANTALLA PREGUNTA. Si cada lista
+# recortara lo suyo en JavaScript, la que se olvide de recortar enseña de más — y un
+# distribuidor tecleando el id de un cliente ajeno en la barra de direcciones se lleva
+# el domicilio y el historial de compras de alguien que no es suyo. Aquí el rol de
+# quien pregunta arma la respuesta: admin ve todo; distribuidor ve SÓLO a los suyos y
+# SÓLO sus pedidos con él; cliente ajeno = 403; sin sesión = 401.
+
+def _es_invitado(client_id):
+    """`invitado:aidee@correo.com` — el que compró con un código pero no abrió cuenta."""
+    return str(client_id or '').startswith('invitado:')
+
+
+def _correo_de_invitado(client_id):
+    return str(client_id or '')[len('invitado:'):].strip().lower()
+
+
+def _contacto_de_pedidos(orders):
+    """Teléfonos y domicilios que dejó en sus pedidos, del más nuevo al más viejo.
+
+    Es la única fuente de contacto de un INVITADO (no tiene cuenta), y para el que sí
+    tiene cuenta es lo que completa su ficha: la gente corrige su dirección al recomprar.
+    """
+    telefonos, domicilios = [], []
+    for o in sorted(orders, key=lambda x: x.get('created_at', ''), reverse=True):
+        c = o.get('customer') or {}
+        pais = c.get('country') if c.get('country') not in (None, '', 'MX') else None
+        dom = ', '.join(x for x in [c.get('address'), c.get('city'), c.get('state'),
+                                    c.get('postal_code'), pais] if x)
+        if dom and dom not in domicilios:
+            domicilios.append(dom)
+        tel = (c.get('phone') or '').strip()
+        if tel and tel not in telefonos:
+            telefonos.append(tel)
+    return telefonos, domicilios
+
+
+def _fila_de_pedido_de_ficha(o, dist_id=None):
+    """Un renglón de la lista de pedidos de la ficha.
+
+    Lo mismo para los dos roles salvo la comisión: el distribuidor ve LO SUYO de ese
+    pedido; el admin no ve una comisión "propia" porque no la tiene. Ni aquí ni en
+    ningún lado viaja el costo, el proveedor ni el margen."""
+    fila = {
+        'id': o.get('id'),
+        'order_number': o.get('order_number'),
+        'created_at': o.get('created_at'),
+        'status': o.get('status', 'pendiente'),
+        'total': o.get('total', 0),
+        'pagado': esta_pagado(o),
+        'payment_method': o.get('payment_method'),
+        'items_count': sum(int(it.get('quantity', 0) or 0) for it in (o.get('items') or [])),
+    }
+    if dist_id:
+        fila['my_commission'] = _my_amount(o, dist_id)
+    return fila
+
+
+async def _nota_de_cliente(client_id, es_invitado):
+    """La nota privada del admin sobre esta persona. Del que tiene cuenta vive en su
+    usuario (`admin_notes`, el mismo campo que la ficha del distribuidor, para que la
+    nota sobreviva si mañana lo convertimos en distribuidor); la del invitado no tiene
+    usuario dónde vivir y va en su propia colección."""
+    if es_invitado:
+        doc = await db.client_notes.find_one({'client_id': client_id}, {'_id': 0, 'note': 1})
+        return (doc or {}).get('note', '')
+    u = await db.users.find_one({'id': client_id}, {'_id': 0, 'admin_notes': 1})
+    return (u or {}).get('admin_notes', '')
+
+
+@api_router.get('/clientes/{client_id}/ficha')
+async def ficha_de_cliente(client_id: str, user=Depends(get_current_user)):
+    """LA ficha de un cliente. La misma desde donde sea que se le haga clic.
+
+    `client_id` es el id del usuario, o `invitado:<correo>` para quien compró sin cuenta.
+    """
+    rol = user.get('role')
+    if rol not in ('admin', 'distributor'):
+        raise HTTPException(status_code=403, detail='No tienes acceso a esta ficha')
+    es_admin = rol == 'admin'
+    dist_id = None if es_admin else user['id']
+
+    orders_all = await db.orders.find({}, {'_id': 0}).to_list(20000)
+
+    invitado = _es_invitado(client_id)
+    cuenta = None
+    if invitado:
+        correo = _correo_de_invitado(client_id)
+        if not correo:
+            raise HTTPException(status_code=404, detail='Cliente no encontrado')
+        # Si con el tiempo abrió cuenta con ese mismo correo, deja de ser invitado:
+        # una persona, una ficha. Si no, existe únicamente dentro de sus pedidos.
+        cuenta = await db.users.find_one({'email': correo},
+                                         {'_id': 0, 'password_hash': 0, 'totp_secret': 0})
+        if cuenta:
+            invitado = False
+            client_id = cuenta['id']
+    if not invitado and cuenta is None:
+        cuenta = await db.users.find_one({'id': client_id},
+                                         {'_id': 0, 'password_hash': 0, 'totp_secret': 0})
+        if not cuenta:
+            raise HTTPException(status_code=404, detail='Cliente no encontrado')
+
+    if invitado:
+        correo = _correo_de_invitado(client_id)
+        suyos = [o for o in orders_all
+                 if not o.get('user_id')
+                 and ((o.get('customer') or {}).get('email') or '').strip().lower() == correo]
+        if not suyos:
+            raise HTTPException(status_code=404, detail='Cliente no encontrado')
+        reciente = max(suyos, key=lambda o: o.get('created_at', ''))
+        c = reciente.get('customer') or {}
+        persona = {'id': f'invitado:{correo}', 'guest': True,
+                   'name': c.get('full_name') or correo, 'email': correo,
+                   'created_at': min((o.get('created_at', '') for o in suyos), default=None)}
+    else:
+        suyos = [o for o in orders_all if o.get('user_id') == cuenta['id']]
+        persona = {'id': cuenta['id'], 'guest': False, 'name': cuenta.get('name'),
+                   'email': cuenta.get('email'), 'created_at': cuenta.get('created_at')}
+
+    if dist_id:
+        # ⛔ SÓLO LO SUYO. Un pedido que el cliente hizo por su cuenta (o con el código
+        # de otro distribuidor) no es asunto de éste, aunque la persona sea su cliente.
+        conmigo = [o for o in suyos if o.get('referred_by') == dist_id]
+        de_su_red = (not invitado) and cuenta.get('referred_by') == dist_id
+        if not conmigo and not de_su_red:
+            raise HTTPException(status_code=403, detail='Ese cliente no es tuyo')
+        if not invitado and cuenta.get('role') not in ('user', None, ''):
+            # Ni otro distribuidor ni el admin se abren como "cliente".
+            raise HTTPException(status_code=403, detail='Ese cliente no es tuyo')
+        suyos = conmigo
+
+    vivos = [o for o in suyos if esta_vivo(o)]
+    vivos.sort(key=lambda o: o.get('created_at', ''), reverse=True)
+    telefonos, domicilios = _contacto_de_pedidos(suyos)
+    if not invitado and cuenta.get('phone') and cuenta['phone'] not in telefonos:
+        telefonos.insert(0, cuenta['phone'])
+
+    persona['phones'] = telefonos
+    persona['addresses'] = domicilios
+
+    ficha = {
+        'scope': 'admin' if es_admin else 'distributor',
+        'client': persona,
+        'orders': [_fila_de_pedido_de_ficha(o, dist_id) for o in vivos[:100]],
+        'totals': {
+            'orders_count': len(vivos),
+            'paid_total': sum(cobrado_de(o) for o in vivos),
+            'paid_count': len(solo_cobrados(vivos)),
+            'por_cobrar': sum(por_cobrar_de(o) for o in vivos),
+            'last_order_at': max((o.get('created_at', '') for o in vivos), default=None),
+        },
+    }
+    if dist_id:
+        ficha['totals']['my_earnings'] = sum(_my_amount(o, dist_id) for o in vivos)
+        return ficha
+
+    # De aquí para abajo, SÓLO EL ADMIN. Puntos, cupones, quién lo refirió y la nota
+    # privada no son cosa del distribuidor ni siquiera sobre sus propios clientes.
+    persona['blocked'] = bool((cuenta or {}).get('blocked', False))
+    persona['points_balance'] = int((cuenta or {}).get('points_balance', 0) or 0)
+    persona['personal_discount_rate'] = float((cuenta or {}).get('personal_discount_rate') or 0)
+    persona['email_verified'] = bool((cuenta or {}).get('email_verified', False)) if cuenta else None
+    ref_id = (cuenta or {}).get('referred_by') or next(
+        (o.get('referred_by') for o in vivos if o.get('referred_by')), None)
+    if ref_id:
+        ref = await db.users.find_one({'id': ref_id}, {'_id': 0, 'id': 1, 'name': 1,
+                                                      'distributor_code': 1})
+        if ref:
+            persona['referred_by'] = {'id': ref['id'], 'name': ref.get('name'),
+                                      'code': ref.get('distributor_code')}
+    ficha['coupons'] = []
+    ficha['points_ledger'] = []
+    if cuenta:
+        cupones = await db.discount_codes.find(
+            {'kind': 'coupon', 'user_id': cuenta['id']}, {'_id': 0}).to_list(100)
+        ficha['coupons'] = [{'code': c['code'], 'discount_rate': c.get('discount_rate', 0),
+                             'expires_at': c.get('expires_at'), 'used': c.get('used', False),
+                             'active': c.get('active', False), 'note': c.get('note', '')}
+                            for c in cupones]
+        ledger = await db.points.find({'user_id': cuenta['id']}, {'_id': 0}).to_list(200)
+        ledger.sort(key=lambda e: e.get('created_at', ''), reverse=True)
+        ficha['points_ledger'] = ledger[:50]
+    ficha['note'] = await _nota_de_cliente(persona['id'], invitado)
+    return ficha
+
+
+class NotaDeCliente(BaseModel):
+    note: str = ''
+
+
+@api_router.put('/admin/clientes/{client_id}/nota')
+async def guardar_nota_de_cliente(client_id: str, payload: NotaDeCliente,
+                                  admin=Depends(get_current_admin)):
+    """La nota privada del admin sobre un cliente. Nunca la ve nadie más."""
+    deny_view_as(admin)
+    texto = (payload.note or '')[:2000]
+    if _es_invitado(client_id):
+        await db.client_notes.update_one({'client_id': client_id},
+                                         {'$set': {'note': texto, 'updated_at': now_iso()}},
+                                         upsert=True)
+        return {'ok': True, 'note': texto}
+    res = await db.users.update_one({'id': client_id}, {'$set': {'admin_notes': texto}})
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail='Cliente no encontrado')
+    return {'ok': True, 'note': texto}
 
 
 app.include_router(api_router)
