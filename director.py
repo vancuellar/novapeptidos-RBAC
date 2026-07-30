@@ -19,6 +19,9 @@ import json
 import os
 
 from marketing import slug, campana_del_pedido
+# El director aprende de lo que SÍ se cobró: un pedido fiado no prueba que la campaña
+# funcione hasta que el dinero entra. Ver cobrado.py.
+from cobrado import cobrado_de
 
 # Sin al menos esto, cualquier lectura del pasado es ruido y hay que decirlo.
 MIN_PEDIDOS_PARA_APRENDER = 5
@@ -42,6 +45,8 @@ def briefing(campanas=None, pedidos=None, productos=None, fx=18.0):
     # ---- qué se vende de verdad ----
     por_sku = {}
     for o in pedidos:
+        if not cobrado_de(o):
+            continue          # entregado y sin pagar: todavía no es una venta que enseñe nada
         for it in (o.get('items') or []):
             k = it.get('product_id') or it.get('name') or '?'
             d = por_sku.setdefault(k, {'sku': k, 'nombre': it.get('name', k),
@@ -49,7 +54,7 @@ def briefing(campanas=None, pedidos=None, productos=None, fx=18.0):
             d['piezas'] += int(it.get('quantity') or 0)
             d['ingreso'] += float(it.get('price') or 0) * int(it.get('quantity') or 0)
 
-    totales = [float(o.get('total') or 0) for o in pedidos]
+    totales = [cobrado_de(o) for o in pedidos if cobrado_de(o)]
     ticket = round(sum(totales) / len(totales)) if totales else 0
     nuevos = sum(1 for o in pedidos if o.get('first_order'))
 

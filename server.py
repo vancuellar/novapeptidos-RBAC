@@ -41,6 +41,11 @@ from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
 from microsoft_auth import verify_microsoft_token, microsoft_enabled, MICROSOFT_CLIENT_ID
 import loyalty
 import pyramid
+# ⛔ QUÉ CUENTA COMO INGRESO. Una sola regla para todo el backend: ver cobrado.py.
+# Los nombres se re-exportan aquí porque medio server.py (y los tests) ya los usaban
+# cuando la regla vivía dentro de este archivo.
+from cobrado import (ESTADOS_PAGADOS, esta_pagado, esta_vivo, cobrado_de,
+                     por_cobrar_de, solo_cobrados)
 import auth_factors
 import btcpay
 import mercadopago
@@ -220,9 +225,14 @@ async def _upline_chain(dist, levels=len(pyramid.TIER_ORDER)):
 
 async def _downline_stats(dist_id):
     """Estadísticas de la RED (downline) de un distribuidor, para la barra de nivel:
-    - active_recruits: distribuidores en su red con ≥1 venta propia (no cancelada).
-    - team_sales: ventas propias del distribuidor + de toda su red.
-    Recorre el árbol por upline_id (BFS), corta ciclos."""
+    - active_recruits: distribuidores en su red con ≥1 venta propia COBRADA.
+    - team_sales: ventas propias del distribuidor + de toda su red, ya cobradas.
+    Recorre el árbol por upline_id (BFS), corta ciclos.
+
+    ⛔ UNA VENTA FIADA NO ASCIENDE A NADIE. La barra de nivel contaba todo lo no
+    cancelado, así que entregar sin cobrar subía de nivel (y con el nivel, la tasa de
+    comisión de todas las ventas siguientes). El nivel se gana con dinero cobrado, igual
+    que la comisión."""
     dists = await db.users.find({'role': 'distributor'}, {'_id': 0, 'id': 1, 'upline_id': 1}).to_list(5000)
     children = {}
     for d in dists:
@@ -240,11 +250,11 @@ async def _downline_stats(dist_id):
     ids = network + [dist_id]
     rows = await db.orders.find(
         {'referred_by': {'$in': ids}, 'status': {'$ne': 'cancelado'}},
-        {'_id': 0, 'referred_by': 1, 'total': 1},
+        {'_id': 0, 'referred_by': 1, 'total': 1, 'status': 1, 'paid': 1},
     ).to_list(20000)
     sales_by = {}
     for o in rows:
-        sales_by[o['referred_by']] = sales_by.get(o['referred_by'], 0) + o.get('total', 0)
+        sales_by[o['referred_by']] = sales_by.get(o['referred_by'], 0) + cobrado_de(o)
     active_recruits = sum(1 for nid in network if sales_by.get(nid, 0) > 0)
     team_sales = sum(sales_by.values())
     return {'active_recruits': active_recruits, 'team_sales': team_sales,
@@ -1349,8 +1359,16 @@ async def _points_entry(user_id, order, kind, points):
 
 async def award_order_points(order):
     """Deposita los puntos de una orden pagada. Idempotente: el flag
-    points_awarded se toma con una sola actualizacion condicional."""
+    points_awarded se toma con una sola actualizacion condicional.
+
+    ⛔ SIN COBRAR NO HAY PUNTOS. Los que llaman aquí miraban sólo el `status`, así que
+    un pedido ENTREGADO Y FIADO regalaba puntos —dinero de la casa— por una venta que
+    todavía no se ha cobrado. El candado va aquí dentro, en el único lugar por donde
+    pasan todos los caminos (checkout, pasarela, venta directa, cambio de estado).
+    Cuando el pago se marque después, este mismo camino los deposita."""
     if not order.get('user_id') or int(order.get('points_earned', 0) or 0) <= 0:
+        return
+    if not esta_pagado(order):
         return
     res = await db.orders.update_one(
         {'id': order['id'], 'points_awarded': {'$ne': True}},
@@ -1710,6 +1728,27 @@ async def revoke_order_points(order):
         if res.modified_count:
             await db.users.update_one({'id': order['user_id']}, {'$inc': {'points_balance': int(order['points_used'])}})
             await _points_entry(order['user_id'], order, 'refund', order['points_used'])
+
+
+async def retirar_puntos_ganados(order):
+    """Quita SÓLO los puntos que este pedido depositó. Idempotente.
+
+    ⛔ NO ES `revoke_order_points`. Esa además DEVUELVE los puntos canjeados, que es lo
+    correcto al CANCELAR (el pedido desaparece) pero un regalo si el pedido sigue en pie:
+    desmarcar el pago de un pedido vivo con esa función le devolvería al cliente los
+    puntos que ya gastó en él, y podría gastarlos otra vez. Aquí sólo se deshace el
+    depósito.
+    """
+    if not order.get('user_id') or not order.get('points_awarded'):
+        return
+    res = await db.orders.update_one(
+        {'id': order['id'], 'points_awarded': True},
+        {'$set': {'points_awarded': False}},
+    )
+    if res.modified_count:
+        ganados = int(order.get('points_earned', 0) or 0)
+        await db.users.update_one({'id': order['user_id']}, {'$inc': {'points_balance': -ganados}})
+        await _points_entry(order['user_id'], order, 'revoke', -ganados)
 
 
 async def recobrar_puntos_canjeados(order):
@@ -2177,7 +2216,13 @@ async def _confirm_paid_order(order_number: str):
     """
     order = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
     if order and order.get('status') == 'pendiente':
-        await db.orders.update_one({'id': order['id']}, {'$set': {'status': 'confirmado', 'paid_at': now_iso()}})
+        # ⛔ `paid: True` VA AQUÍ, no sólo `paid_at`. Los pedidos nacen con `paid: False`
+        # (es el default del modelo), así que sin esta línea una tarjeta o un pago en
+        # cripto REALMENTE COBRADO nunca contaría como ingreso: el tablero se iría a
+        # cero al revés. Es el espejo del bug de Alanís.
+        await db.orders.update_one(
+            {'id': order['id']},
+            {'$set': {'status': 'confirmado', 'paid': True, 'paid_at': now_iso()}})
         fresh = await db.orders.find_one({'id': order['id']}, {'_id': 0})
         await award_order_points(fresh)
         asyncio.create_task(send_payment_confirmed_email(fresh))
@@ -2415,32 +2460,17 @@ async def admin_orders(archivados: bool = False, admin=Depends(get_current_admin
     filtro = {'archived': True} if archivados else {'archived': {'$ne': True}}
     orders = await db.orders.find(filtro, {'_id': 0}).to_list(500)
     orders.sort(key=lambda o: o.get('created_at', ''), reverse=True)
-    return orders
+    # `pagado` YA RESUELTO por el servidor. El campo `paid` no existe en los pedidos
+    # viejos, y si el panel tuviera que adivinarlo tendríamos dos reglas de qué es un
+    # ingreso —una aquí y otra en JavaScript— que tarde o temprano se separan. La
+    # inferencia se hace en un solo lado (cobrado.py) y viaja resuelta.
+    return [{**o, 'pagado': esta_pagado(o)} for o in orders]
 
 
-# Estados en los que el cliente YA PAGÓ. Un pedido así no se borra en masa por
-# accidente: es una venta real, con dinero que entró y contabilidad detrás.
-ESTADOS_PAGADOS = ('confirmado', 'enviado', 'entregado')
-
-
-def esta_pagado(order):
-    """¿Entró el dinero de este pedido?
-
-    ⛔ PAGADO Y ENTREGADO SON COSAS DISTINTAS (Christián, 2026-07-29). El `status`
-    cuenta el viaje de la mercancía; el dinero lo cuenta `paid`. Se separaron porque
-    Christián entrega en persona y a veces cobra después: la venta de Alanís salió
-    ENTREGADA y SIN PAGAR, y el tablero la sumaba como ingreso.
-
-    Los pedidos viejos no tienen el campo, así que para ellos se sigue infiriendo del
-    estado — así ningún reporte histórico cambia de golpe y no hace falta una
-    migración que toque la base de producción. Sólo cuando alguien marca el pago a
-    mano (o lo confirma una pasarela) el campo manda sobre el estado.
-    """
-    if order.get('status') == 'cancelado':
-        return False
-    if 'paid' in order:
-        return bool(order['paid'])
-    return order.get('status') in ESTADOS_PAGADOS
+# `ESTADOS_PAGADOS` y `esta_pagado` viven en cobrado.py y se importan arriba: los
+# reportes de marketing y de pirámide también los necesitan y no pueden importar
+# server.py. Un pedido en esos estados no se borra en masa por accidente: es una venta
+# real, con dinero que entró y contabilidad detrás.
 
 
 class MarcaDePago(BaseModel):
@@ -2457,6 +2487,14 @@ async def admin_marcar_pago(order_id: str, payload: MarcaDePago,
     cambio = {'paid': payload.pagado,
               'paid_at': datetime.now(timezone.utc).isoformat() if payload.pagado else None}
     await db.orders.update_one({'id': order_id}, {'$set': cambio})
+    # Los PUNTOS siguen al dinero, no a la mercancía. Un pedido fiado no los genera
+    # (ver `award_order_points`), así que se depositan justo aquí, cuando por fin se
+    # cobra; y si el admin desmarca el pago, se retiran. Ambos caminos son idempotentes.
+    fresco = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    if payload.pagado:
+        await award_order_points(fresco)
+    else:
+        await retirar_puntos_ganados(fresco)
     logger.info('Admin %s marcó el pedido %s como %s', admin.get('email'),
                 order.get('order_number'), 'PAGADO' if payload.pagado else 'NO pagado')
     return {'order_number': order.get('order_number'), **cambio}
@@ -2520,7 +2558,8 @@ async def admin_orders_lote(payload: LoteDePedidos, admin=Depends(get_current_ad
 
 @api_router.put('/admin/orders/{order_id}/status')
 async def update_order_status(order_id: str, payload: OrderStatusUpdate, admin=Depends(get_current_admin)):
-    prev = await db.orders.find_one({'id': order_id}, {'_id': 0, 'status': 1})
+    prev = await db.orders.find_one({'id': order_id}, {'_id': 0, 'status': 1, 'paid': 1,
+                                                       'paid_at': 1})
     if not prev:
         raise HTTPException(status_code=404, detail='Pedido no encontrado')
     update = {'status': payload.status}
@@ -2528,6 +2567,15 @@ async def update_order_status(order_id: str, payload: OrderStatusUpdate, admin=D
         update['shipped_at'] = now_iso()
     elif payload.status == 'entregado':
         update['delivered_at'] = now_iso()
+    # ⛔ 'confirmado' ES EL PASO DEL DINERO; 'enviado' y 'entregado' NO.
+    # Marcar confirmado es literalmente lo que hace Christián cuando ve el depósito
+    # SPEI en el banco (y el cliente recibe el correo "Pago confirmado"), así que ese
+    # paso —y sólo ese— marca el pedido como cobrado. Mover la mercancía no cobra
+    # nada: por eso un pedido puede quedar ENTREGADO y seguir debiendo.
+    if payload.status == 'confirmado':
+        update['paid'] = True
+        if not prev.get('paid_at'):
+            update['paid_at'] = now_iso()
     await db.orders.update_one({'id': order_id}, {'$set': update})
     order = await db.orders.find_one({'id': order_id}, {'_id': 0})
     # Lealtad: pago verificado deposita puntos; cancelacion los revierte.
@@ -2779,7 +2827,7 @@ async def admin_customers(admin=Depends(get_current_admin)):
     out = []
     for u in users:
         uo = sorted(by_user.get(u['id'], []), key=lambda o: o.get('created_at', ''), reverse=True)
-        valid = [o for o in uo if o.get('status') != 'cancelado']
+        valid = [o for o in uo if esta_vivo(o)]
         addresses, phones = [], []
         for o in uo:
             c = o.get('customer') or {}
@@ -2793,7 +2841,11 @@ async def admin_customers(admin=Depends(get_current_admin)):
         out.append({
             **u,
             'orders_count': len(uo),
-            'total_spent': sum(o.get('total', 0) for o in valid),
+            # Lo que este cliente REALMENTE PAGÓ, y aparte lo que debe. "Gastado" era
+            # todo lo no cancelado, así que un cliente fiado se veía como el que mejor
+            # paga — justo al revés de lo que hay que saber de él.
+            'total_spent': sum(cobrado_de(o) for o in valid),
+            'por_cobrar': sum(por_cobrar_de(o) for o in valid),
             'last_order_at': uo[0].get('created_at') if uo else None,
             'addresses': addresses,
             'phones': phones,
@@ -2806,32 +2858,48 @@ async def admin_customers(admin=Depends(get_current_admin)):
 # ----------------- Admin: Analytics -----------------
 @api_router.get('/admin/analytics')
 async def admin_analytics(admin=Depends(get_current_admin)):
-    """Ventas agregadas: por mes, por producto, por metodo de pago y por estado."""
+    """Ventas agregadas: por mes, por producto, por metodo de pago y por estado.
+
+    ⛔ AQUÍ SEGUÍA VIVO EL BUG DE ALANÍS. `/admin/stats` ya separaba lo cobrado de lo
+    fiado, pero esta pantalla —la gráfica de ventas por mes, el ticket promedio, el
+    ranking de productos— filtraba sólo por "no cancelado", así que la venta ENTREGADA
+    Y SIN PAGAR seguía pintada como ingreso ($7,204 en vez de $3,347). Todo el dinero
+    de aquí pasa por `cobrado_de`; lo que se debe viaja aparte en `por_cobrar`.
+    """
     orders = await db.orders.find({}, {'_id': 0}).to_list(10000)
-    valid = [o for o in orders if o.get('status') != 'cancelado']
+    vivos = [o for o in orders if esta_vivo(o)]
+    cobrados = solo_cobrados(vivos)
     by_month, by_pay, by_status, prod = {}, {}, {}, {}
     for o in orders:
         s = o.get('status', 'pendiente')
         by_status[s] = by_status.get(s, 0) + 1
-    for o in valid:
+    for o in vivos:
         month = (o.get('created_at') or '')[:7]
-        e = by_month.setdefault(month, {'month': month, 'revenue': 0, 'orders': 0})
-        e['revenue'] += o.get('total', 0)
+        e = by_month.setdefault(month, {'month': month, 'revenue': 0, 'por_cobrar': 0, 'orders': 0})
+        # `orders` sigue contando TODO lo vivo: un pedido fiado sí es una venta hecha.
+        # Lo que no es, es dinero en la cuenta — y eso es lo único que cambia de cajón.
+        e['revenue'] += cobrado_de(o)
+        e['por_cobrar'] += por_cobrar_de(o)
         e['orders'] += 1
+    for o in cobrados:
         pm = o.get('payment_method', 'otro')
         by_pay[pm] = by_pay.get(pm, 0) + o.get('total', 0)
         for it in o.get('items', []):
             p = prod.setdefault(it.get('name', '?'), {'name': it.get('name', '?'), 'units': 0, 'revenue': 0})
             p['units'] += it.get('quantity', 1)
             p['revenue'] += it.get('price', 0) * it.get('quantity', 1)
-    revenue_total = sum(o.get('total', 0) for o in valid)
+    revenue_total = sum(cobrado_de(o) for o in vivos)
+    por_cobrar_total = sum(por_cobrar_de(o) for o in vivos)
     return {
         'monthly': sorted(by_month.values(), key=lambda e: e['month']),
         'top_products': sorted(prod.values(), key=lambda p: -p['revenue'])[:10],
         'by_payment': [{'method': k, 'revenue': v} for k, v in sorted(by_pay.items(), key=lambda x: -x[1])],
         'by_status': by_status,
-        'avg_ticket': round(revenue_total / len(valid)) if valid else 0,
+        # El ticket se saca de los pedidos COBRADOS: dividir ingreso cobrado entre
+        # todos los pedidos daría un ticket inventado, más bajo que cualquier venta real.
+        'avg_ticket': round(revenue_total / len(cobrados)) if cobrados else 0,
         'revenue_total': revenue_total,
+        'por_cobrar': por_cobrar_total,
     }
 
 
@@ -3079,8 +3147,9 @@ def _distributor_rollup(dist, users, orders):
     cliente NO cuentan, aunque el cliente este ligado a el. 'clients' sigue siendo
     la relacion (quien uso su codigo/registro), solo para listarlos."""
     clients = [u for u in users if u.get('referred_by') == dist['id']]
-    # VENTAS propias = pedidos hechos con SU código (no canceladas).
-    valid = [o for o in orders if o.get('referred_by') == dist['id'] and o.get('status') != 'cancelado']
+    # VENTAS propias = pedidos hechos con SU código, vivos. El DINERO de esas ventas
+    # sólo cuenta si se cobró: `sales_total` es lo cobrado y `por_cobrar` lo fiado.
+    valid = [o for o in orders if o.get('referred_by') == dist['id'] and esta_vivo(o)]
     # Red (downline) desde los usuarios ya cargados, para ventas de equipo,
     # reclutas activos y la señal secreta de Diamond (solo la ve el admin).
     children = {}
@@ -3097,8 +3166,8 @@ def _distributor_rollup(dist, users, orders):
     sales_by = {}
     for o in orders:
         rb = o.get('referred_by')
-        if rb in net_ids and o.get('status') != 'cancelado':
-            sales_by[rb] = sales_by.get(rb, 0) + o.get('total', 0)
+        if rb in net_ids and esta_vivo(o):
+            sales_by[rb] = sales_by.get(rb, 0) + cobrado_de(o)
     team_sales = sum(sales_by.values())
     active_recruits = sum(1 for nid in network if sales_by.get(nid, 0) > 0)
     return {
@@ -3120,8 +3189,11 @@ def _distributor_rollup(dist, users, orders):
         'admin_notes': dist.get('admin_notes', ''),
         'clients_count': len(clients),
         'sales_count': len(valid),
-        'sales_total': sum(o.get('total', 0) for o in valid),
-        # GANANCIAS = su tajada como vendedor + sobrecomisiones de su downline.
+        'sales_total': sum(cobrado_de(o) for o in valid),
+        # Lo que sus clientes recibieron y todavía no pagaron.
+        'por_cobrar': sum(por_cobrar_de(o) for o in valid),
+        # GANANCIAS = su tajada como vendedor + sobrecomisiones de su downline. Sólo de
+        # ventas COBRADAS: no se le paga comisión de dinero que la casa no tiene.
         'earnings': pyramid.earnings_for(dist['id'], orders),
         'team_sales': team_sales,
         'active_recruits': active_recruits,
@@ -3423,7 +3495,14 @@ async def update_distributor_pyramid(dist_id: str, payload: dict, admin=Depends(
 def _my_amount(order, dist_id):
     """Lo que ESTE distribuidor gana en una orden: su tajada en el reparto de la
     pirámide (vendedor o upline). Cae al campo viejo `commission` si la orden es
-    anterior a la pirámide y fue su venta directa."""
+    anterior a la pirámide y fue su venta directa.
+
+    ⛔ CERO SI LA VENTA NO SE COBRÓ. El candado va aquí, en el único lugar por donde
+    pasan todos los totales de ganancias del portal, para que ninguna pantalla enseñe
+    como ganado un dinero que la casa todavía no recibió. Ver `por_cobrar` en el mismo
+    resumen: la venta no se esconde, sólo deja de contarse como ganancia."""
+    if not esta_pagado(order):
+        return 0
     rows = order.get('commissions')
     if rows:
         return sum(r.get('amount', 0) for r in rows if r.get('distributor_id') == dist_id)
@@ -3439,15 +3518,16 @@ async def distributor_summary(dist=Depends(get_current_distributor)):
     orders = await db.orders.find(
         {'$or': [{'referred_by': dist['id']}, {'commissions.distributor_id': dist['id']}]}, {'_id': 0}
     ).to_list(10000)
-    valid = [o for o in orders if o.get('status') != 'cancelado']
+    valid = [o for o in orders if esta_vivo(o)]
     own_sales = [o for o in valid if o.get('referred_by') == dist['id']]
     by_month = {}
     for o in valid:
         m = (o.get('created_at') or '')[:7]
-        e = by_month.setdefault(m, {'month': m, 'earnings': 0, 'sales': 0})
+        e = by_month.setdefault(m, {'month': m, 'earnings': 0, 'sales': 0, 'por_cobrar': 0})
         e['earnings'] += _my_amount(o, dist['id'])
         if o.get('referred_by') == dist['id']:
-            e['sales'] += o.get('total', 0)
+            e['sales'] += cobrado_de(o)
+            e['por_cobrar'] += por_cobrar_de(o)
     earnings_total = sum(_my_amount(o, dist['id']) for o in valid)
     own_earnings = sum(_my_amount(o, dist['id']) for o in own_sales)
     # Red: reclutas activos y ventas de equipo, para la barra de nivel (ventas + reclutas).
@@ -3462,7 +3542,10 @@ async def distributor_summary(dist=Depends(get_current_distributor)):
         'max_discount': rate,
         'clients_count': len(users),
         'sales_count': len(own_sales),
-        'sales_total': sum(o.get('total', 0) for o in own_sales),
+        # VENTAS = lo cobrado. Lo entregado y no pagado va aparte, como deuda: ni suma
+        # en ventas ni genera comisión, pero tampoco desaparece de su tablero.
+        'sales_total': sum(cobrado_de(o) for o in own_sales),
+        'por_cobrar': sum(por_cobrar_de(o) for o in own_sales),
         'earnings_total': earnings_total,
         # Desglose: cuánto es de ventas propias y cuánto de sobrecomisión del equipo.
         'own_earnings': own_earnings,
@@ -3504,14 +3587,17 @@ async def distributor_clients(dist=Depends(get_current_distributor)):
             by_user.setdefault(o['user_id'], []).append(o)
     out = []
     for u in users:
-        uo = [o for o in by_user.get(u['id'], []) if o.get('status') != 'cancelado']
+        uo = [o for o in by_user.get(u['id'], []) if esta_vivo(o)]
         # Privacidad (Christian 2026-07-23): el distribuidor ve un RESUMEN, no la
         # ficha del cliente. Nada de correo, teléfono ni domicilio.
         out.append({
             'id': u['id'], 'name': u['name'], 'created_at': u.get('created_at'),
             'orders_count': len(uo),
-            'total_spent': sum(o.get('total', 0) for o in uo),
-            'my_earnings': sum(o.get('commission', 0) for o in uo),
+            # Pagado y por cobrar, separados: es la información que el distribuidor
+            # necesita para saber a quién tiene que cobrarle.
+            'total_spent': sum(cobrado_de(o) for o in uo),
+            'por_cobrar': sum(por_cobrar_de(o) for o in uo),
+            'my_earnings': sum(_my_amount(o, dist['id']) for o in uo),
             'last_order_at': max([o.get('created_at', '') for o in uo], default=None),
         })
     out.sort(key=lambda u: -u['total_spent'])
@@ -3534,9 +3620,12 @@ async def distributor_sales(dist=Depends(get_current_distributor)):
         'order_number': o.get('order_number'),
         'created_at': o.get('created_at'),
         'status': o.get('status'),
+        # `pagado` es lo que dice si esa comisión ya es COBRABLE. La entrega no la
+        # libera: hasta que entre el dinero, la fila se ve pero no se paga.
+        'pagado': esta_pagado(o),
         'customer_name': ((o.get('customer') or {}).get('full_name') or '').split(' ')[0],
         'total': o.get('total', 0),
-        'commission': o.get('commission', 0),
+        'commission': _my_amount(o, dist['id']),
         'items_count': sum(int(it.get('quantity', 0) or 0) for it in o.get('items', [])),
     } for o in orders]
 
@@ -4753,18 +4842,22 @@ async def admin_meta_dashboard(days: int = 30, admin=Depends(get_current_marketi
     # Cruce con la realidad: qué vendió el sitio en el mismo periodo.
     desde = summary.get('date_start') or (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()[:10]
     orders = await db.orders.find({'created_at': {'$gte': desde}}, {'_id': 0}).to_list(5000)
-    pagadas = [o for o in orders if o.get('status') not in ('cancelado',)]
+    # La variable se llamaba `pagadas` pero eran "las no canceladas": el ROAS de Meta
+    # se calculaba con dinero que todavía no había entrado. Ahora los pedidos vivos y
+    # los cobrados son dos cosas distintas, y el ingreso sale sólo de los segundos.
+    vivas = [o for o in orders if esta_vivo(o)]
     evs = await db.events.find({'created_at': {'$gte': desde}, 'type': 'visit'},
                                {'_id': 0, 'session_id': 1}).to_list(50000)
     visitas = len({e.get('session_id') for e in evs if e.get('session_id')})
-    ingreso = sum(o.get('total', 0) for o in pagadas)
+    ingreso = sum(cobrado_de(o) for o in vivas)
     return {
         **estado,
         'resumen': summary,
         'campanas': sorted(rows, key=lambda r: -r.get('spend', 0)),
-        'sitio': {'visitas': visitas, 'pedidos': len(pagadas), 'ingreso': ingreso},
+        'sitio': {'visitas': visitas, 'pedidos': len(vivas), 'ingreso': ingreso,
+                  'por_cobrar': sum(por_cobrar_de(o) for o in vivas)},
         'recomendaciones': meta_ads.advise(summary, site_visits=visitas,
-                                           site_orders=len(pagadas), site_revenue=ingreso),
+                                           site_orders=len(vivas), site_revenue=ingreso),
         'apagar': meta_ads.dead_weight(rows),
     }
 
@@ -4829,24 +4922,30 @@ async def _ventas_por_cupon(desde: str):
     usados = {c.get('used_order') for c in cupones if c.get('used') and c.get('used_order')}
     pedidos = await db.orders.find(
         {'order_number': {'$in': list(usados)}, 'status': {'$nin': list(NO_CUENTAN)}},
-        {'_id': 0, 'order_number': 1, 'total': 1, 'first_order': 1}).to_list(5000) if usados else []
+        {'_id': 0, 'order_number': 1, 'total': 1, 'first_order': 1, 'status': 1,
+         'paid': 1}).to_list(5000) if usados else []
     por_pedido = {o['order_number']: o for o in pedidos}
 
     grupos = {}
     for c in cupones:
         origen = ORIGEN_POR_PREFIJO.get(str(c.get('code', '')).split('-')[0].upper(), 'otro')
         g = grupos.setdefault(origen, {'origen': origen, 'mandados': 0, 'usados': 0,
-                                       'clientes_nuevos': 0, 'ingreso_mxn': 0.0})
+                                       'clientes_nuevos': 0, 'ingreso_mxn': 0.0,
+                                       'por_cobrar_mxn': 0.0})
         g['mandados'] += 1
         o = por_pedido.get(c.get('used_order'))
         if o:
+            # El cupón SÍ se usó (por eso cuenta en `usados`), pero el dinero sólo
+            # entra en el ingreso si de verdad se cobró.
             g['usados'] += 1
-            g['ingreso_mxn'] += float(o.get('total') or 0)
+            g['ingreso_mxn'] += cobrado_de(o)
+            g['por_cobrar_mxn'] += por_cobrar_de(o)
             if o.get('first_order'):
                 g['clientes_nuevos'] += 1
     filas = []
     for g in grupos.values():
         filas.append({**g, 'ingreso_mxn': round(g['ingreso_mxn']),
+                      'por_cobrar_mxn': round(g['por_cobrar_mxn']),
                       'ingreso': round(marketing.a_usd(g['ingreso_mxn'], _fx()), 2),
                       # De cada 100 cupones mandados, cuántos se usaron. Es la
                       # medida de si la oferta sirve o solo estamos regalando.
@@ -5024,7 +5123,8 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
     if et_hoy and et_hoy not in periodos:
         periodos.append(et_hoy)
 
-    filas = {p: {'periodo': p, 'visitas': 0, 'sesiones': 0, 'pedidos': 0, 'ingreso': 0.0}
+    filas = {p: {'periodo': p, 'visitas': 0, 'sesiones': 0, 'pedidos': 0, 'ingreso': 0.0,
+                 'por_cobrar': 0.0, 'pedidos_cobrados': 0}
              for p in periodos}
     sesiones = {p: set() for p in periodos}
     # Únicas de TODO el rango, aparte de las de cada cajón. Una sesión que cruza
@@ -5048,24 +5148,34 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
         if e.get('visitor_id'):
             visitantes_rango.add(e['visitor_id'])
 
+    # ⛔ `paid` VIAJA EN LA CONSULTA. Sin ese campo la gráfica no puede distinguir lo
+    # cobrado de lo fiado y la línea de ingreso pintaba la venta de Alanís como dinero
+    # que entró ($3,857 el 29 de julio). La deuda no desaparece: sale en `por_cobrar`,
+    # su propia línea.
     orders = await db.orders.find(
         {'created_at': {'$gte': desde}},
-        {'_id': 0, 'created_at': 1, 'total': 1, 'status': 1}).to_list(20000)
+        {'_id': 0, 'created_at': 1, 'total': 1, 'status': 1, 'paid': 1}).to_list(20000)
     for o in orders:
-        if o.get('status') == 'cancelado':      # una venta cancelada no es una venta
+        if not esta_vivo(o):                    # una venta cancelada no es una venta
             continue
         p = etiqueta(o.get('created_at'))
         if p in filas:
             filas[p]['pedidos'] += 1
-            filas[p]['ingreso'] += float(o.get('total') or 0)
+            filas[p]['ingreso'] += cobrado_de(o)
+            filas[p]['por_cobrar'] += por_cobrar_de(o)
+            if esta_pagado(o):
+                filas[p]['pedidos_cobrados'] += 1
 
     for p in filas:
         filas[p]['sesiones'] = len(sesiones[p])
         filas[p]['ingreso'] = round(filas[p]['ingreso'], 2)
+        filas[p]['por_cobrar'] = round(filas[p]['por_cobrar'], 2)
 
     serie = [filas[p] for p in periodos]
     total_ing = sum(f['ingreso'] for f in serie)
+    total_deuda = sum(f['por_cobrar'] for f in serie)
     total_ped = sum(f['pedidos'] for f in serie)
+    total_ped_cobrados = sum(f['pedidos_cobrados'] for f in serie)
     total_ses = len(sesiones_rango)
     return {
         'bucket': bucket,
@@ -5079,10 +5189,16 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
             'visitantes': len(visitantes_rango),
             'pedidos': total_ped,
             'ingreso': round(total_ing, 2),
+            # Entregado o en camino y todavía sin cobrar. Va al lado del ingreso, no
+            # dentro: son las dos mitades de la misma venta y no se pueden sumar.
+            'por_cobrar': round(total_deuda, 2),
             # Cuántas de las sesiones acabaron comprando. Es EL número que dice si
             # la publicidad sirve: 683 clics y 1 pedido no es lo mismo que 10 y 1.
+            # Un pedido fiado SÍ cuenta como conversión: la publicidad hizo su trabajo.
             'conversion': round(total_ped / total_ses * 100, 2) if total_ses else 0,
-            'ticket': round(total_ing / total_ped) if total_ped else 0,
+            # El ticket se saca de lo cobrado entre los pedidos cobrados. Mezclar
+            # ingreso cobrado con TODOS los pedidos daría un ticket que nunca existió.
+            'ticket': round(total_ing / total_ped_cobrados) if total_ped_cobrados else 0,
         },
     }
 
@@ -5103,7 +5219,45 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
 
     visitas = len(pasos['visit']) or 1
     compras = len(pasos['purchase'])
-    ingreso = sum(e.get('value', 0) for e in evs if e.get('type') == 'purchase')
+
+    # ⛔ EL INGRESO DEL EMBUDO SE VERIFICA CONTRA LOS PEDIDOS, NO CONTRA EL EVENTO.
+    # El evento `purchase` lo escribe el navegador al terminar el checkout y trae el
+    # monto pegado, así que sumarlo a secas cuenta como ingreso una venta que después
+    # no se cobró (o que se canceló). Con el número de pedido que ya viaja en el
+    # evento se le pregunta a la base quién pagó de verdad; lo que no, se va a la
+    # cubeta de deuda. Un evento sin número de pedido (los viejos) se sigue creyendo:
+    # es lo único que hay de esa época, y borrarlo sería perder historia.
+    nums = {e.get('order_number') for e in evs
+            if e.get('type') == 'purchase' and e.get('order_number')}
+    pagado_por_num = {}
+    if nums:
+        docs = await db.orders.find({'order_number': {'$in': list(nums)}},
+                                    {'_id': 0, 'order_number': 1, 'status': 1,
+                                     'paid': 1}).to_list(20000)
+        pagado_por_num = {d['order_number']: esta_pagado(d) for d in docs}
+
+    def _cobrado_del_evento(e) -> bool:
+        """¿El pedido de este evento de compra sí se cobró?
+
+        Sin número de pedido no hay nada contra qué verificar (eventos viejos): se
+        cree. Con número, manda la base — y si el pedido ya no existe (se canceló y se
+        borró) el dinero tampoco: no se cuenta.
+        """
+        num = e.get('order_number')
+        if not num:
+            return True
+        return bool(pagado_por_num.get(num, False))
+
+    ingreso = 0.0
+    ingreso_por_cobrar = 0.0
+    for e in evs:
+        if e.get('type') != 'purchase':
+            continue
+        monto = float(e.get('value', 0) or 0)
+        if _cobrado_del_evento(e):
+            ingreso += monto
+        else:
+            ingreso_por_cobrar += monto
 
     # Por origen: de donde vino y cuanto convirtio (esto mide la publicidad).
     origen = {}
@@ -5122,15 +5276,21 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
             sesion_origen[sid] = src
     for e in evs:
         src = sesion_origen.get(e.get('session_id'), 'directo')
-        o = origen.setdefault(src, {'origen': src, 'visitas': set(), 'compras': set(), 'ingreso': 0})
+        o = origen.setdefault(src, {'origen': src, 'visitas': set(), 'compras': set(),
+                                    'ingreso': 0, 'por_cobrar': 0})
         if e.get('type') == 'visit':
             o['visitas'].add(e.get('session_id'))
         if e.get('type') == 'purchase':
             o['compras'].add(e.get('session_id'))
-            o['ingreso'] += e.get('value', 0)
+            # Mismo candado que arriba: por origen tampoco se cuenta como ingreso
+            # una venta que no se cobró. Si no, el ROAS de un canal se infla con fiado.
+            if _cobrado_del_evento(e):
+                o['ingreso'] += float(e.get('value', 0) or 0)
+            else:
+                o['por_cobrar'] += float(e.get('value', 0) or 0)
     por_origen = sorted(
         [{'origen': v['origen'], 'visitas': len(v['visitas']), 'compras': len(v['compras']),
-          'ingreso': round(v['ingreso']),
+          'ingreso': round(v['ingreso']), 'por_cobrar': round(v['por_cobrar']),
           'conversion': round(len(v['compras']) / len(v['visitas']) * 100, 1) if v['visitas'] else 0}
          for v in origen.values()],
         key=lambda x: -x['visitas'])
@@ -5148,6 +5308,7 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
         'embudo': embudo,
         'conversion_total': round(compras / visitas * 100, 2),
         'ingreso': round(ingreso),
+        'por_cobrar': round(ingreso_por_cobrar),
         'por_origen': por_origen,
         'top_vistos': top_vistos,
         'sin_datos': len(evs) == 0,
@@ -5161,6 +5322,13 @@ class ManualOrderCreate(BaseModel):
     discount_rate: float = 0.0        # p. ej. 0.40 en venta directa con Christian
     status: str = 'confirmado'
     note: str = ''
+    # ⛔ ¿YA TE PAGARON? Nace en True porque la venta directa normal es de mano en mano:
+    # Christián entrega y cobra en el mismo momento, y así los cientos de ventas
+    # directas siguen contando como ingreso igual que siempre. Se apaga para el caso de
+    # Alanís: entregado y a deber. Sin este interruptor la separación pagado/entregado
+    # no serviría de nada, porque el pedido nace con `paid: False` (default del modelo)
+    # y TODA venta directa habría dejado de contar como ingreso.
+    pagado: bool = True
 
 
 @api_router.post('/admin/orders')
@@ -5239,6 +5407,8 @@ async def admin_create_order(payload: ManualOrderCreate, admin=Depends(get_curre
         payment_method='directa',
         subtotal=subtotal, discount=discount, discount_rate=rate,
         shipping=0, total=total, status=payload.status,
+        paid=payload.pagado,
+        paid_at=now_iso() if payload.pagado else None,
         referred_by=None, commission=0, commissions=[],
         points_used=0, points_earned=points_earned,
     )
@@ -5260,6 +5430,8 @@ async def admin_create_order(payload: ManualOrderCreate, admin=Depends(get_curre
                                      {'$inc': {'stock': -int(item.quantity)}})
         await _descontar_inventario_vivo(item.product_id, _catalogo.get(item.product_id),
                                          -int(item.quantity))
+    # Los puntos los pone `award_order_points`, que ya se niega si el pedido no está
+    # cobrado: una venta directa fiada no regala puntos hasta que se pague.
     if payload.status in loyalty.PAID_STATUSES:
         fresh = await db.orders.find_one({'id': order.id}, {'_id': 0})
         await award_order_points(fresh)
@@ -5303,22 +5475,27 @@ async def admin_distributor_detail(dist_id: str, admin=Depends(get_current_admin
     codes = [_code_projection(c) | {'active': c.get('active', False)} for c in codes]
 
     # Clientes: SOLO nombre, correo y números de negocio (nada personal).
-    my_orders = [o for o in orders if o.get('referred_by') == dist_id and o.get('status') != 'cancelado']
+    my_orders = [o for o in orders if o.get('referred_by') == dist_id and esta_vivo(o)]
     by_user = {}
     for o in my_orders:
         if o.get('user_id'):
-            b = by_user.setdefault(o['user_id'], {'orders': 0, 'total': 0.0, 'commission': 0.0, 'last': ''})
+            b = by_user.setdefault(o['user_id'], {'orders': 0, 'total': 0.0, 'por_cobrar': 0.0,
+                                                  'commission': 0.0, 'last': ''})
             b['orders'] += 1
-            b['total'] += o.get('total', 0)
-            b['commission'] += next((r.get('amount', 0) for r in o.get('commissions', [])
-                                     if r.get('distributor_id') == dist_id), o.get('commission', 0) if o.get('referred_by') == dist_id else 0)
+            # `total` es lo COBRADO a ese cliente; lo fiado va en `por_cobrar`. Y la
+            # comisión sale de `_my_amount`, que ya devuelve cero si no se cobró.
+            b['total'] += cobrado_de(o)
+            b['por_cobrar'] += por_cobrar_de(o)
+            b['commission'] += _my_amount(o, dist_id)
             b['last'] = max(b['last'], o.get('created_at', ''))
     clients = []
     for u in users:
         if u.get('referred_by') == dist_id or u['id'] in by_user:
-            b = by_user.get(u['id'], {'orders': 0, 'total': 0, 'commission': 0, 'last': ''})
+            b = by_user.get(u['id'], {'orders': 0, 'total': 0, 'por_cobrar': 0,
+                                      'commission': 0, 'last': ''})
             clients.append({'id': u['id'], 'name': u.get('name'), 'email': u.get('email'),
                             'orders': b['orders'], 'total': b['total'],
+                            'por_cobrar': b['por_cobrar'],
                             'commission': b['commission'], 'last_order': b['last'] or None})
     clients.sort(key=lambda c: -c['total'])
 
@@ -5335,8 +5512,8 @@ async def admin_distributor_detail(dist_id: str, admin=Depends(get_current_admin
 
     sales = [{'order_number': o.get('order_number'), 'created_at': o.get('created_at'),
               'status': o.get('status'), 'total': o.get('total', 0),
-              'commission': next((r.get('amount', 0) for r in o.get('commissions', [])
-                                  if r.get('distributor_id') == dist_id), o.get('commission', 0))}
+              'pagado': esta_pagado(o),
+              'commission': _my_amount(o, dist_id)}
              for o in sorted(my_orders, key=lambda o: o.get('created_at', ''), reverse=True)[:50]]
 
     return {'distributor': roll, 'codes': codes, 'clients': clients, 'subdistributors': subs, 'sales': sales}
@@ -5350,7 +5527,9 @@ async def admin_customer_detail(user_id: str, admin=Depends(get_current_admin)):
         raise HTTPException(status_code=404, detail='Cliente no encontrado')
     orders = await db.orders.find({'user_id': user_id}, {'_id': 0}).to_list(1000)
     orders.sort(key=lambda o: o.get('created_at', ''), reverse=True)
-    paid = [o for o in orders if o.get('status') in loyalty.PAID_STATUSES]
+    # "Pagados" son los COBRADOS, no los entregados: mirar sólo el estado hacía que la
+    # ficha de Alanís dijera que ya pagó $3,857.
+    paid = solo_cobrados(orders)
     coupons = await db.discount_codes.find({'kind': 'coupon', 'user_id': user_id}, {'_id': 0}).to_list(100)
     ledger = await db.points.find({'user_id': user_id}, {'_id': 0}).to_list(200)
     ledger.sort(key=lambda e: e.get('created_at', ''), reverse=True)
@@ -5362,10 +5541,13 @@ async def admin_customer_detail(user_id: str, admin=Depends(get_current_admin)):
                      'points_balance': int(u.get('points_balance', 0) or 0)},
         'orders': [{'id': o['id'], 'order_number': o.get('order_number'), 'created_at': o.get('created_at'),
                     'status': o.get('status'), 'total': o.get('total', 0),
+                    'pagado': esta_pagado(o),
                     'payment_method': o.get('payment_method'), 'discount': o.get('discount', 0),
                     'points_used': o.get('points_used', 0)} for o in orders[:100]],
         'paid_total': sum(o.get('total', 0) for o in paid),
         'paid_count': len(paid),
+        # Lo que este cliente debe: entregado o en camino, sin cobrar.
+        'por_cobrar': sum(por_cobrar_de(o) for o in orders),
         'coupons': [{'code': c['code'], 'discount_rate': c.get('discount_rate', 0),
                      'expires_at': c.get('expires_at'), 'used': c.get('used', False),
                      'active': c.get('active', False), 'note': c.get('note', '')} for c in coupons],

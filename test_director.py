@@ -8,8 +8,10 @@ import json
 import director as D
 
 
-def _pedido(total, sku='BPC157-5MG', nombre='BPC-157', qty=1, precio=None, nuevo=True):
-    return {'total': total, 'first_order': nuevo,
+def _pedido(total, sku='BPC157-5MG', nombre='BPC-157', qty=1, precio=None, nuevo=True,
+            pagado=True):
+    # El director sólo aprende de ventas COBRADAS (cobrado.py, 2026-07-29).
+    return {'total': total, 'first_order': nuevo, 'status': 'entregado', 'paid': pagado,
             'items': [{'product_id': sku, 'name': nombre, 'quantity': qty,
                        'price': precio if precio is not None else total}]}
 

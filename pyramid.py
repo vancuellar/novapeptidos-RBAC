@@ -23,6 +23,8 @@ orden. Los reportes suman lo guardado → cambiar tasas/niveles no toca ventas v
 """
 
 # Niveles en orden y su tasa (comisión = descuento máximo).
+import cobrado
+
 TIER_ORDER = ['junior0', 'junior1', 'senior', 'master', 'elite', 'diamond']
 TIER_RATES = {
     'junior0': 0.20,
@@ -165,10 +167,16 @@ def total_amount(breakdown):
 def earnings_for(distributor_id, orders):
     """Cuánto ganó un distribuidor: su tajada en el `commissions` de cada orden
     (como vendedor O como upline), ignorando canceladas. Cae al campo viejo
-    `commission` si la orden es anterior a la pirámide y fue su venta directa."""
+    `commission` si la orden es anterior a la pirámide y fue su venta directa.
+
+    ⛔ SIN COBRAR NO HAY COMISIÓN QUE PAGAR (Christián, 2026-07-29). Antes bastaba con
+    que la orden no estuviera cancelada, así que una venta ENTREGADA Y FIADA generaba
+    una comisión pagable con dinero que la casa todavía no tiene. La comisión sale del
+    cobro, no de la entrega: en cuanto el pedido se marca pagado, aparece.
+    """
     total = 0
     for o in orders:
-        if o.get('status') == 'cancelado':
+        if not cobrado.esta_pagado(o):
             continue
         rows = o.get('commissions')
         if rows:

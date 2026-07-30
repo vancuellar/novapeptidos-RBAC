@@ -26,6 +26,11 @@ import os
 import re
 import unicodedata
 
+# ⛔ QUÉ CUENTA COMO INGRESO. Un pedido ENTREGADO Y SIN PAGAR no es ingreso, así que
+# tampoco puede inflar el ROAS de una campaña ni abaratar su costo por cliente. Ver
+# cobrado.py; el fiado se reporta aparte, en `por_cobrar_mxn`.
+from cobrado import cobrado_de, por_cobrar_de
+
 # Debajo de esto, el número todavía no dice nada. Acordado con Christian el
 # 2026-07-26: mejor decir "falta datos" que mandarlo a apagar algo que apenas
 # arrancó (Meta ni siquiera sale de aprendizaje con tan poco).
@@ -134,9 +139,12 @@ def cruzar(filas_meta, pedidos, sesiones_por_campana=None, fx=TC_MAESTRA):
         c = campana_del_pedido(p.get('attribution'))
         if not c:
             continue
-        d = por_campana.setdefault(c, {'pedidos': 0, 'clientes_nuevos': 0, 'ingreso': 0.0})
+        d = por_campana.setdefault(c, {'pedidos': 0, 'clientes_nuevos': 0, 'ingreso': 0.0,
+                                       'por_cobrar': 0.0})
+        # El PEDIDO cuenta siempre (el anuncio hizo su trabajo); el DINERO sólo si entró.
         d['pedidos'] += 1
-        d['ingreso'] += float(p.get('total') or 0)
+        d['ingreso'] += cobrado_de(p)
+        d['por_cobrar'] += por_cobrar_de(p)
         if p.get('first_order'):
             d['clientes_nuevos'] += 1
 
@@ -152,7 +160,8 @@ def cruzar(filas_meta, pedidos, sesiones_por_campana=None, fx=TC_MAESTRA):
         gasto = float(r.get('spend') or 0)
         if (r.get('currency') or 'USD').upper() == 'MXN':
             gasto = a_usd(gasto, fx)
-        real = por_campana.get(c, {'pedidos': 0, 'clientes_nuevos': 0, 'ingreso': 0.0})
+        real = por_campana.get(c, {'pedidos': 0, 'clientes_nuevos': 0, 'ingreso': 0.0,
+                                   'por_cobrar': 0.0})
         clics = int(r.get('link_clicks') or 0)
         salida.append(_fila(nombre, c, r, gasto, real,
                             sesiones_por_campana.get(c, 0), clics, fx))
@@ -168,7 +177,8 @@ def cruzar(filas_meta, pedidos, sesiones_por_campana=None, fx=TC_MAESTRA):
 
     salida.sort(key=lambda f: (-f['gasto'], -f['ingreso']))
 
-    sin_etq = por_campana.get(SIN_ETIQUETAR, {'pedidos': 0, 'clientes_nuevos': 0, 'ingreso': 0.0})
+    sin_etq = por_campana.get(SIN_ETIQUETAR, {'pedidos': 0, 'clientes_nuevos': 0,
+                                              'ingreso': 0.0, 'por_cobrar': 0.0})
     gasto_total = sum(f['gasto'] for f in salida)
     nuevos_total = sum(f['clientes_nuevos'] for f in salida) + sin_etq['clientes_nuevos']
     ingreso_total = sum(f['ingreso'] for f in salida) + a_usd(sin_etq['ingreso'], fx)
@@ -181,12 +191,15 @@ def cruzar(filas_meta, pedidos, sesiones_por_campana=None, fx=TC_MAESTRA):
         # grande, el problema no es el reporte, son los anuncios sin etiquetar.
         'sin_etiquetar': {**sin_etq,
                           'ingreso': round(a_usd(sin_etq['ingreso'], fx), 2),
-                          'ingreso_mxn': round(sin_etq['ingreso'])},
+                          'ingreso_mxn': round(sin_etq['ingreso']),
+                          'por_cobrar_mxn': round(sin_etq.get('por_cobrar', 0))},
         'total': {
             'gasto': round(gasto_total, 2),
             'clientes_nuevos': nuevos_total,
             'pedidos': sum(f['pedidos'] for f in salida) + sin_etq['pedidos'],
             'ingreso': round(ingreso_total, 2),
+            'por_cobrar_mxn': round(sum(f.get('por_cobrar_mxn', 0) for f in salida)
+                                    + sin_etq.get('por_cobrar', 0)),
             # Las dos cifras que Christian pidió, sobre TODO el gasto:
             'cac': _dividir(gasto_total, nuevos_total),
             'roas': _dividir(ingreso_total, gasto_total),
@@ -225,6 +238,9 @@ def _fila(nombre, c, r, gasto, real, sesiones, clics, tc=TC_MAESTRA):
         # El ingreso en pesos se conserva: es lo que de verdad se cobró, sin
         # convertir. Sirve para cuadrar contra los pedidos uno por uno.
         'ingreso_mxn': round(ingreso_mxn),
+        # Lo que esta campaña vendió y todavía NO se ha cobrado. Va aparte para que el
+        # ROAS no lo cuente: el dinero que no entró no paga anuncios.
+        'por_cobrar_mxn': round(real.get('por_cobrar', 0)),
         'cac': cac,
         'roas': roas,
         # lo que Meta dice de sí misma, para poder contrastar
@@ -297,9 +313,12 @@ def canales(pedidos, gasto_meta=0.0, tc=TC_MAESTRA):
     origen = {}
     for o in pedidos:
         c = canal_de_origen(o.get('attribution'))
-        d = origen.setdefault(c, {'canal': c, 'pedidos': 0, 'clientes_nuevos': 0, 'ingreso': 0.0})
+        d = origen.setdefault(c, {'canal': c, 'pedidos': 0, 'clientes_nuevos': 0,
+                                  'ingreso': 0.0, 'por_cobrar': 0.0})
         d['pedidos'] += 1
-        d['ingreso'] += float(o.get('total') or 0)
+        # Sólo lo cobrado: si no, el canal que vende a crédito se ve como el mejor.
+        d['ingreso'] += cobrado_de(o)
+        d['por_cobrar'] += por_cobrar_de(o)
         if o.get('first_order'):
             d['clientes_nuevos'] += 1
 
@@ -309,31 +328,42 @@ def canales(pedidos, gasto_meta=0.0, tc=TC_MAESTRA):
         ingreso_usd = a_usd(d['ingreso'], tc)
         filas.append({**d, 'ingreso': round(ingreso_usd, 2),
                       'ingreso_mxn': round(d['ingreso']),
+                      'por_cobrar_mxn': round(d['por_cobrar']),
                       'costo': None if costo is None else round(costo),
                       'cac': _dividir(costo, d['clientes_nuevos']) if costo is not None else None,
                       'roas': _dividir(ingreso_usd, costo) if costo else None})
     filas.sort(key=lambda f: -f['ingreso'])
 
     # --- distribuidores: su costo real es la comisión pagada ---
-    dist = {'pedidos': 0, 'clientes_nuevos': 0, 'ingreso': 0.0, 'comisiones': 0.0}
+    dist = {'pedidos': 0, 'clientes_nuevos': 0, 'ingreso': 0.0, 'por_cobrar': 0.0,
+            'comisiones': 0.0}
     por_dist = {}
     for o in pedidos:
         if not o.get('referred_by'):
             continue
         # La comisión guardada en la orden, no la tasa de hoy: cambiar tasas
         # nunca debe reescribir lo que costó una venta pasada.
+        #
+        # ⛔ Y SÓLO SI LA VENTA SE COBRÓ. La comisión de un pedido fiado no se ha pagado
+        # todavía, así que contarla como costo del canal (y el total como ingreso) hacía
+        # que el reporte comparara dinero imaginario contra dinero imaginario.
         com = sum(float(r.get('amount') or 0) for r in (o.get('commissions') or [])) \
             or float(o.get('commission') or 0)
+        if not cobrado_de(o):
+            com = 0.0
         dist['pedidos'] += 1
-        dist['ingreso'] += float(o.get('total') or 0)
+        dist['ingreso'] += cobrado_de(o)
+        dist['por_cobrar'] += por_cobrar_de(o)
         dist['comisiones'] += com
         if o.get('first_order'):
             dist['clientes_nuevos'] += 1
         d = por_dist.setdefault(o['referred_by'], {'distributor_id': o['referred_by'],
                                                    'pedidos': 0, 'clientes_nuevos': 0,
-                                                   'ingreso': 0.0, 'comisiones': 0.0})
+                                                   'ingreso': 0.0, 'por_cobrar': 0.0,
+                                                   'comisiones': 0.0})
         d['pedidos'] += 1
-        d['ingreso'] += float(o.get('total') or 0)
+        d['ingreso'] += cobrado_de(o)
+        d['por_cobrar'] += por_cobrar_de(o)
         d['comisiones'] += com
         if o.get('first_order'):
             d['clientes_nuevos'] += 1
@@ -350,11 +380,13 @@ def canales(pedidos, gasto_meta=0.0, tc=TC_MAESTRA):
             'clientes_nuevos': dist['clientes_nuevos'],
             'ingreso': round(a_usd(dist['ingreso'], tc), 2),
             'ingreso_mxn': round(dist['ingreso']),
+            'por_cobrar_mxn': round(dist['por_cobrar']),
             'comisiones': round(a_usd(dist['comisiones'], tc), 2),
             'comisiones_mxn': round(dist['comisiones']),
             'cac': _dividir(a_usd(dist['comisiones'], tc), dist['clientes_nuevos']),
             'roas': _dividir(a_usd(dist['ingreso'], tc), a_usd(dist['comisiones'], tc)),
             'detalle': sorted(({**d, 'ingreso': round(a_usd(d['ingreso'], tc), 2),
+                                'por_cobrar_mxn': round(d['por_cobrar']),
                                 'comisiones': round(a_usd(d['comisiones'], tc), 2),
                                 'cac': _dividir(a_usd(d['comisiones'], tc), d['clientes_nuevos'])}
                                for d in por_dist.values()),

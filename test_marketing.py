@@ -42,9 +42,12 @@ def test_referrer_de_facebook_cuenta_aunque_no_haya_utm_ni_fbclid():
 
 
 # ------------------------------------------------------- el costo por cliente
-def _pedido(campana, total, nuevo=True, fbclid=''):
+def _pedido(campana, total, nuevo=True, fbclid='', pagado=True):
+    # `paid` viaja siempre: desde el 2026-07-29 el reporte sólo cuenta como ingreso el
+    # dinero COBRADO (cobrado.py), así que un pedido de prueba tiene que decir si se pagó.
     return {'attribution': {'utm_source': 'facebook', 'utm_campaign': campana, 'fbclid': fbclid},
-            'first_order': nuevo, 'total': total}
+            'first_order': nuevo, 'total': total,
+            'status': 'entregado', 'paid': pagado}
 
 
 def test_cac_es_gasto_entre_clientes_nuevos():
@@ -129,8 +132,9 @@ def test_el_enlace_respeta_una_ruta_con_query():
 
 
 # ------------------------------------------------- todos los canales, no solo Meta
-def _p(total, origen=None, nuevo=True, dist=None, comision=0):
-    o = {'total': total, 'first_order': nuevo, 'attribution': origen or {}}
+def _p(total, origen=None, nuevo=True, dist=None, comision=0, pagado=True):
+    o = {'total': total, 'first_order': nuevo, 'attribution': origen or {},
+         'status': 'entregado', 'paid': pagado}
     if dist:
         o['referred_by'] = dist
         o['commissions'] = [{'distributor_id': dist, 'role': 'seller', 'amount': comision}]
