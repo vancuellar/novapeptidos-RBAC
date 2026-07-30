@@ -58,11 +58,113 @@ PESO_EMPAQUE_KG = 0.30
 # factura no.
 PESO_MINIMO_KG = 1.0
 
-# Caja estándar en la que sale todo hoy (cm). Skydropx exige medidas para cotizar.
-# ⚠️ PENDIENTE: si Christian empieza a usar varias cajas, esto se vuelve una tabla.
-CAJA_LARGO_CM = 30
-CAJA_ANCHO_CM = 20
-CAJA_ALTO_CM = 15
+# --------------------------------------------------------------------- la caja
+# ⛔ LA CAJA ES LO QUE MÁS ENCARECE UN ENVÍO CHICO, NO EL PESO.
+#
+# Las paqueterías cobran por el mayor de dos números: lo que pesa y lo que ABULTA
+# (peso volumétrico = largo × ancho × alto ÷ 5000, el divisor estándar en México).
+#
+# Hasta el 2026-07-30 aquí había UNA sola caja de 30×20×15 para todo. Eso son
+# 9,000 cm³ → 1.8 kg volumétricos. O sea: un pedido de dos viales que pesa 400 g de
+# verdad se cotizaba como 1.8 kg, casi el doble del mínimo facturable. Se pagaba aire.
+#
+# Ahora la caja se elige por lo que de verdad va adentro. Dos viales caben de sobra
+# en la chica (20×15×10 = 0.6 kg volumétricos), y ahí el que manda es el mínimo de
+# 1 kg de la paquetería, que es lo más barato que se puede cotizar.
+#
+# `nombre` es solo para que se lea en el panel y en la bitácora; `peso_max_kg` es
+# hasta cuánto contenido aguanta esa caja antes de pasar a la siguiente.
+CAJAS = (
+    {'nombre': 'chica',   'largo_cm': 20, 'ancho_cm': 15, 'alto_cm': 10,
+     'peso_max_kg': 1.0, 'peso_caja_kg': 0.15},
+    {'nombre': 'mediana', 'largo_cm': 30, 'ancho_cm': 20, 'alto_cm': 15,
+     'peso_max_kg': 3.0, 'peso_caja_kg': 0.30},
+    {'nombre': 'grande',  'largo_cm': 40, 'ancho_cm': 30, 'alto_cm': 20,
+     'peso_max_kg': 999.0, 'peso_caja_kg': 0.60},
+)
+
+# El divisor volumétrico. 5000 es el que usan Estafeta, FedEx y Paquetexpress en
+# territorio nacional. Vive aquí para que se vea, no para que se adivine.
+DIVISOR_VOLUMETRICO = 5000
+
+# Compatibilidad hacia atrás: quien pida "la caja" sin decir cuál, recibe la mediana,
+# que es la que había antes de que esto fuera una tabla.
+CAJA_LARGO_CM = CAJAS[1]['largo_cm']
+CAJA_ANCHO_CM = CAJAS[1]['ancho_cm']
+CAJA_ALTO_CM = CAJAS[1]['alto_cm']
+
+
+# Medidas puestas desde el Panel de Admin (Admin → Envíos). El día que Christián
+# empiece a usar otras cajas las cambia ahí y no hay que tocar código ni desplegar.
+# ⛔ Vacío = manda la tabla de arriba. Se rellena con `cargar_cajas_del_panel`.
+_CAJAS_DEL_PANEL: list = []
+
+
+def cargar_cajas_del_panel(cajas) -> int:
+    """Sustituye la tabla de cajas por la que guardó el admin. Devuelve cuántas quedaron.
+
+    Se valida aquí y no en el panel porque aquí es donde duele: una caja con medidas
+    en cero hace que la paquetería cotice contra basura, y una lista vacía tiene que
+    devolver el control a la tabla de arriba en vez de dejar el sitio sin cajas.
+    """
+    global _CAJAS_DEL_PANEL
+    buenas = []
+    for c in (cajas or []):
+        if not isinstance(c, dict):
+            continue
+        try:
+            medidas = {k: float(c.get(k) or 0) for k in ('largo_cm', 'ancho_cm', 'alto_cm')}
+        except (TypeError, ValueError):
+            continue
+        if any(v <= 0 for v in medidas.values()):
+            continue
+        try:
+            tope = float(c.get('peso_max_kg') or 0) or 999.0
+        except (TypeError, ValueError):
+            tope = 999.0
+        try:
+            propio = max(0.0, float(c.get('peso_caja_kg') or 0))
+        except (TypeError, ValueError):
+            propio = 0.0
+        buenas.append(dict(medidas, nombre=str(c.get('nombre') or 'caja'),
+                           peso_max_kg=tope, peso_caja_kg=propio))
+    _CAJAS_DEL_PANEL = sorted(buenas, key=lambda c: c['peso_max_kg'])
+    return len(_CAJAS_DEL_PANEL)
+
+
+def cajas() -> tuple:
+    """Las cajas vigentes: las del panel si las hay, si no las de fábrica."""
+    return tuple(_CAJAS_DEL_PANEL) if _CAJAS_DEL_PANEL else CAJAS
+
+
+def caja_para(peso_contenido_kg: float) -> dict:
+    """La caja más chica en la que cabe este pedido.
+
+    Se elige por peso porque es el único dato que tenemos de todos los productos.
+    No es perfecto —diez jeringas pesan poco y abultan— pero se equivoca hacia la
+    caja chica, que es la que cotiza barato; y si un día no cabe, se sube el
+    `peso_max_kg` desde el panel.
+    """
+    try:
+        peso = max(0.0, float(peso_contenido_kg or 0))
+    except (TypeError, ValueError):
+        peso = 0.0
+    disponibles = cajas()
+    for c in disponibles:
+        if peso <= float(c.get('peso_max_kg') or 0):
+            return dict(c)
+    return dict(disponibles[-1])
+
+
+def peso_volumetrico(caja: dict) -> float:
+    """Lo que la paquetería va a decir que pesa esta caja por lo que abulta."""
+    caja = caja or {}
+    try:
+        vol = (float(caja.get('largo_cm') or 0) * float(caja.get('ancho_cm') or 0)
+               * float(caja.get('alto_cm') or 0))
+    except (TypeError, ValueError):
+        return 0.0
+    return round(vol / DIVISOR_VOLUMETRICO, 2)
 
 
 def _es(texto: str, *palabras: str) -> bool:
@@ -96,11 +198,11 @@ def peso_de_pieza(doc: dict | None, nombre: str = '') -> float:
     return PESO_VIAL_KG
 
 
-def peso_del_pedido(items, pflags: dict | None = None) -> float:
-    """Peso facturable de un carrito completo, en kg.
+def peso_del_contenido(items, pflags: dict | None = None) -> float:
+    """Lo que pesa la MERCANCÍA sola, sin caja. En kg.
 
-    `items` son los renglones (objetos con `.product_id/.quantity/.name` o dicts) y
-    `pflags` el catálogo ya resuelto por id y por SKU, tal como lo arma el checkout.
+    Se separó del peso facturable el 2026-07-30: la caja ya no es una sola, así que
+    primero hay que saber cuánto va adentro para poder elegir en cuál cabe.
     """
     pflags = pflags or {}
     total = 0.0
@@ -112,18 +214,43 @@ def peso_del_pedido(items, pflags: dict | None = None) -> float:
         except (TypeError, ValueError):
             qty = 0
         total += peso_de_pieza(pflags.get(pid), get('name') or '') * qty
-    if total <= 0:
+    return round(total, 3)
+
+
+def peso_del_pedido(items, pflags: dict | None = None) -> float:
+    """Peso facturable de un carrito completo, en kg.
+
+    `items` son los renglones (objetos con `.product_id/.quantity/.name` o dicts) y
+    `pflags` el catálogo ya resuelto por id y por SKU, tal como lo arma el checkout.
+    """
+    contenido = peso_del_contenido(items, pflags)
+    if contenido <= 0:
         return 0.0                      # carrito vacío: no hay paquete que cotizar
-    return round(max(PESO_MINIMO_KG, total + PESO_EMPAQUE_KG), 2)
+    caja = caja_para(contenido)
+    propio = caja.get('peso_caja_kg')
+    propio = PESO_EMPAQUE_KG if propio is None else propio
+    return round(max(PESO_MINIMO_KG, contenido + propio), 2)
 
 
 def paquete_del_pedido(items, pflags: dict | None = None) -> dict:
-    """Lo que Skydropx necesita saber del bulto: peso y medidas."""
+    """Lo que Skydropx necesita saber del bulto: peso y medidas de la caja que le toca.
+
+    ⛔ Las medidas ya NO son fijas. Van las de la caja más chica en la que cabe el
+    pedido, porque la paquetería cobra por el mayor entre lo que pesa y lo que
+    abulta: mandar dos viales en una caja de 30×20×15 se cotiza como 1.8 kg cuando
+    de verdad son 0.25.
+    """
+    contenido = peso_del_contenido(items, pflags)
+    caja = caja_para(contenido)
     return {
         'peso_kg': peso_del_pedido(items, pflags),
-        'largo_cm': CAJA_LARGO_CM,
-        'ancho_cm': CAJA_ANCHO_CM,
-        'alto_cm': CAJA_ALTO_CM,
+        'largo_cm': caja['largo_cm'],
+        'ancho_cm': caja['ancho_cm'],
+        'alto_cm': caja['alto_cm'],
+        # Para que se vea en el panel y en la bitácora POR QUÉ costó lo que costó.
+        'caja': caja.get('nombre', ''),
+        'peso_contenido_kg': contenido,
+        'peso_volumetrico_kg': peso_volumetrico(caja),
     }
 
 

@@ -453,6 +453,70 @@ async def send_payment_confirmed_email(order, language=None):
         logger.exception('Failed to send payment-confirmed email for %s', number)
 
 
+# ---------- Ya salió: el número de guía ----------
+# El correo de pago confirmado le PROMETE al cliente, por escrito y en tres idiomas,
+# que "en cuanto salga te mandamos el número de guía". Hasta el 2026-07-30 ese correo
+# no existía: el rastreo se guardaba en el pedido y el cliente tenía que entrar a
+# buscarlo. Prometer por correo y no cumplir por correo es lo que genera el mensaje
+# de "¿ya lo mandaron?" que después hay que contestar a mano.
+SHIPPED_SUBJECTS = {
+    'es': 'Tu pedido {number} va en camino',
+    'en': 'Your order {number} is on its way',
+    'pt': 'Seu pedido {number} esta a caminho',
+}
+SHIPPED_BODIES = {
+    'es': ('Hola, {name}:',
+           'Tu pedido <strong>{number}</strong> ya salio con <strong>{carrier}</strong>. '
+           'Numero de guia: <strong>{tracking}</strong>.',
+           'Rastrear mi pedido',
+           'Puede tardar unas horas en aparecer en el sitio de la paqueteria. '
+           'Cualquier duda, responde a este correo.'),
+    'en': ('Hi {name},',
+           'Your order <strong>{number}</strong> shipped with <strong>{carrier}</strong>. '
+           'Tracking number: <strong>{tracking}</strong>.',
+           'Track my order',
+           'It can take a few hours to show up on the carrier site. '
+           'Any questions, just reply to this email.'),
+    'pt': ('Ola, {name}:',
+           'Seu pedido <strong>{number}</strong> ja foi despachado pela <strong>{carrier}</strong>. '
+           'Codigo de rastreio: <strong>{tracking}</strong>.',
+           'Rastrear meu pedido',
+           'Pode levar algumas horas para aparecer no site da transportadora. '
+           'Qualquer duvida, responda a este e-mail.'),
+}
+
+
+async def send_shipped_email(order, language=None):
+    """Le manda al cliente su numero de guia. Nunca lanza.
+
+    El boton lleva al rastreo de la paqueteria si lo conocemos, y si no a la ficha
+    del pedido en el sitio: mas vale mandar a un lugar que existe que a un enlace roto.
+    """
+    if not email_enabled():
+        return
+    customer = (order or {}).get('customer', {}) or {}
+    to = customer.get('email')
+    numero = str((order or {}).get('tracking_number') or '')
+    if not to or not numero:
+        return                       # sin guia no hay nada que avisar
+    lang = normalize_language(language)
+    number = str(order.get('order_number', ''))
+    site = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+    greet, body, cta, footer = SHIPPED_BODIES[lang]
+    cuerpo = (body.replace('{number}', html.escape(number))
+                  .replace('{carrier}', html.escape(str(order.get('carrier') or '')))
+                  .replace('{tracking}', html.escape(numero)))
+    html_body = _action_email_html(
+        greet, cuerpo, cta, footer, name=customer.get('full_name', ''), email='',
+        link=order.get('tracking_url') or f'{site}/pedido/{number}')
+    try:
+        await asyncio.to_thread(_send_email_sync, to,
+                                SHIPPED_SUBJECTS[lang].format(number=number), html_body)
+        logger.info('Shipped email sent to %s (order=%s, guia=%s)', to, number, numero)
+    except Exception:
+        logger.exception('Failed to send shipped email for %s', number)
+
+
 async def send_welcome_email(name, email, language=None):
     """Send the account-confirmation email. Never raises: registration must
     succeed even if the email provider is down or unconfigured."""
@@ -918,6 +982,24 @@ def _aviso_compra_html(order, link_admin):
               if order.get('paid') else
               '<span style="color:#B54708;font-weight:bold;">TODAVÍA NO — está por cobrarse</span>')
     envio = order.get('shipping', 0) or 0
+
+    # ⛔ LO QUE CUESTA LA GUÍA, A LA VISTA. El número que duele no es lo que se cobra
+    # de envío sino lo que la casa NO cobra: un pedido de $179 con guía de $250 se
+    # come el 140% y hasta hoy eso no aparecía en ningún correo.
+    try:
+        costo_guia = float(order.get('shipping_cost') or 0)
+    except (TypeError, ValueError):
+        costo_guia = 0.0
+    guia_fila = ''
+    if costo_guia > 0:
+        absorbe = max(0.0, costo_guia - float(envio or 0))
+        detalle = _money(costo_guia)
+        if order.get('carrier'):
+            detalle += f' · {esc(str(order["carrier"]))}'
+        if absorbe > 0:
+            detalle += (f' <span style="color:#B54708;">(la casa pone '
+                        f'{_money(absorbe)})</span>')
+        guia_fila = fila('Costo de la guía', detalle)
     direccion = '<br>'.join(esc(x) for x in [
         c.get('address', ''), c.get('address_2', ''),
         ', '.join(b for b in [c.get('city', ''), c.get('state', ''), c.get('postal_code', '')] if b),
@@ -944,6 +1026,7 @@ def _aviso_compra_html(order, link_admin):
       {fila('Cómo paga', esc(str(order.get('payment_method', ''))))}
       {fila('Estado', esc(str(order.get('status', ''))))}
       {fila('Envío', 'Gratis (lo absorbe la casa)' if not envio else _money(envio))}
+      {guia_fila}
     </table>
 
     <div style="font-size:13px;font-weight:bold;color:{INK};padding-bottom:4px;">A QUIÉN Y A DÓNDE</div>

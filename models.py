@@ -352,6 +352,46 @@ class ShippingQuoteRequest(BaseModel):
     country: str = 'MX'
 
 
+class RemitenteUpdate(BaseModel):
+    """La dirección de quien despacha, capturada desde Admin → Envíos.
+
+    ⛔ Ningún campo trae valor de ejemplo. Es el domicilio de un trabajador: si el
+    código lo rellenara, alguien acabaría comprando una guía con una dirección
+    inventada y la paquetería iría a recoger a una casa que no existe.
+    """
+    name: str = ''
+    company: str = ''
+    address1: str = ''
+    address2: str = ''
+    colonia: str = ''
+    city: str = ''
+    province: str = ''
+    zip: str = ''
+    country: str = 'MX'
+    phone: str = ''
+    email: str = ''
+    reference: str = ''
+
+
+class CajaEnvio(BaseModel):
+    """Una caja del catálogo de empaque. Las medidas van en cm y los pesos en kg."""
+    nombre: str = 'caja'
+    largo_cm: float
+    ancho_cm: float
+    alto_cm: float
+    peso_max_kg: float = 999.0     # hasta cuánta mercancía le cabe
+    peso_caja_kg: float = 0.0      # lo que pesa vacía, con relleno
+
+
+class CajasUpdate(BaseModel):
+    cajas: List[CajaEnvio] = []
+
+
+class ComprarGuiaRequest(BaseModel):
+    """Qué opción de la cotización quiere comprar el admin. ⚠️ Cuesta dinero real."""
+    option_id: str
+
+
 class OrderShippingUpdate(BaseModel):
     """Datos de envío que captura el admin cuando despacha un pedido."""
     carrier: Optional[str] = None

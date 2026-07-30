@@ -19,7 +19,7 @@ from models import (
     ProfileUpdate, ChangePasswordInput,
     ProductCreate, ProductUpdate, Product, Category,
     OrderCreate, Order, OrderItem, CustomerInfo, OrderStatusUpdate, OrderShippingUpdate,
-    ShippingQuoteRequest, TrackEvent,
+    ShippingQuoteRequest, TrackEvent, RemitenteUpdate, CajasUpdate, ComprarGuiaRequest,
     ProtocolInput, ProtocolUpdate, PerfilSalud, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
@@ -76,7 +76,7 @@ from emails import (
     send_welcome_email, send_reset_email, send_verification_email,
     send_invitation_email, send_order_email, send_payment_confirmed_email, normalize_language, email_enabled,
     send_admin_notification, send_distributor_welcome_email, send_news_email,
-    send_purchase_alert,
+    send_purchase_alert, send_shipped_email,
 )
 from datetime import timedelta
 import asyncio
@@ -1305,6 +1305,262 @@ async def _envio_del_pedido(payload, paid_merchandise, pflags):
     return cobrado, guardado
 
 
+# ==========================================================================
+#  AJUSTES DE ENVÍO QUE SE CAPTURAN EN EL PANEL (remitente y cajas)
+# ==========================================================================
+# ⛔ POR QUÉ NO ESTÁN EN EL CÓDIGO. El remitente es el domicilio de un TRABAJADOR:
+# escribirlo en el repositorio sería publicar los datos personales de alguien en
+# GitHub. Y las cajas cambian cuando cambia el proveedor de empaque, sin que eso
+# tenga por qué costar un despliegue.
+#
+# EL ENTORNO SIGUE MANDANDO. Si la variable existe en el `.env` del servidor, gana
+# sobre lo que haya aquí — misma regla que las llaves de cobro (ver secretos.py).
+COLECCION_AJUSTES_ENVIO = 'shipping_settings'
+
+
+async def _cargar_ajustes_envio() -> dict:
+    """Mete en memoria el remitente y las cajas que capturó el admin.
+
+    Se llama al arrancar y cada vez que se guardan. `skydropx` y `envios` son
+    módulos síncronos y Mongo es asíncrono: por eso el valor se les EMPUJA en vez de
+    que ellos vayan a buscarlo.
+    """
+    doc = await db[COLECCION_AJUSTES_ENVIO].find_one({'id': 'envios'}, {'_id': 0}) or {}
+    skydropx.cargar_remitente_del_panel(doc.get('remitente') or {})
+    envios.cargar_cajas_del_panel(doc.get('cajas') or [])
+    return doc
+
+
+@api_router.get('/admin/envios/config')
+async def admin_envios_config(admin=Depends(get_current_admin)):
+    """Lo que el panel necesita para la pestaña de Envíos.
+
+    A diferencia de las llaves de cobro, el remitente SÍ se devuelve completo: no es
+    un secreto, es una dirección que el admin tiene que poder revisar antes de que
+    salga impresa en una guía. Las credenciales de Skydropx siguen sin devolverse
+    nunca — de ellas solo se dice si están puestas.
+    """
+    doc = await db[COLECCION_AJUSTES_ENVIO].find_one({'id': 'envios'}, {'_id': 0}) or {}
+    return {
+        'credenciales_puestas': skydropx.enabled(),
+        'remitente': skydropx.remitente(),
+        'remitente_completo': skydropx.remitente_configurado(),
+        'remitente_origen': skydropx.origen_del_remitente(doc.get('remitente')),
+        'campos_remitente': [c for c, _ in skydropx.CAMPOS_REMITENTE],
+        'cajas': [dict(c, peso_volumetrico_kg=envios.peso_volumetrico(c))
+                  for c in envios.cajas()],
+        'cajas_de_fabrica': not bool(doc.get('cajas')),
+        'cotiza_en_checkout': envios.COTIZAR_EN_CHECKOUT,
+        'compra_guia_al_pagar': envios.COMPRAR_GUIA_AL_PAGAR,
+    }
+
+
+@api_router.put('/admin/envios/remitente')
+async def admin_guardar_remitente(payload: RemitenteUpdate, admin=Depends(get_current_admin)):
+    """Captura la dirección de quien despacha. Es lo que se imprime en la guía."""
+    datos = {c: (getattr(payload, c, '') or '').strip()
+             for c, _env in skydropx.CAMPOS_REMITENTE}
+    await db[COLECCION_AJUSTES_ENVIO].update_one(
+        {'id': 'envios'},
+        {'$set': {'id': 'envios', 'remitente': datos, 'updated_at': now_iso()}},
+        upsert=True)
+    await _cargar_ajustes_envio()
+    return {'remitente': skydropx.remitente(),
+            'remitente_completo': skydropx.remitente_configurado()}
+
+
+@api_router.put('/admin/envios/cajas')
+async def admin_guardar_cajas(payload: CajasUpdate, admin=Depends(get_current_admin)):
+    """Las cajas con las que se cotiza. Menos volumen = envío más barato."""
+    cajas = [c.model_dump() for c in (payload.cajas or [])]
+    if not envios.cargar_cajas_del_panel(cajas):
+        # Una lista de cajas inválida dejaría el sitio cotizando contra nada.
+        raise HTTPException(status_code=400, detail='Ninguna caja tiene medidas válidas')
+    await db[COLECCION_AJUSTES_ENVIO].update_one(
+        {'id': 'envios'},
+        {'$set': {'id': 'envios', 'cajas': cajas, 'updated_at': now_iso()}},
+        upsert=True)
+    await _cargar_ajustes_envio()
+    return {'cajas': [dict(c, peso_volumetrico_kg=envios.peso_volumetrico(c))
+                      for c in envios.cajas()]}
+
+
+# ==========================================================================
+#  DESPACHAR UN PEDIDO: cotizar de verdad y comprar la guía con un clic
+# ==========================================================================
+# Esto es lo que faltaba. Hasta hoy la única forma de mandar un paquete era ir al
+# mostrador de la paquetería y pagar lo que dijeran — el 2026-07-30 eso costó casi
+# $600 por dos viales a Nuevo León. Cotizar aquí enseña lo que cuesta de verdad por
+# peso y código postal, con TODAS las paqueterías que Skydropx alcance.
+#
+# ⛔ ESTO NO CAMBIA UN PESO DE LO QUE PAGA EL CLIENTE. El cliente sigue con sus $250
+# parejos y su envío gratis arriba de $2,500 con tope del 10% (`COBRAR_ENVIO` /
+# `envios.cobro_de_envio_al_cliente`). Aquí solo se decide qué le cuesta A LA CASA.
+def _destino_del_pedido(order: dict) -> dict:
+    c = (order or {}).get('customer') or {}
+    return {
+        'name': c.get('full_name', ''), 'company': '',
+        'address1': c.get('address', ''), 'address2': c.get('address_2', ''),
+        'city': c.get('city', ''), 'province': c.get('state', ''),
+        'colonia': c.get('colonia', '') or c.get('neighborhood', ''),
+        'zip': c.get('postal_code', ''), 'country': c.get('country', 'MX') or 'MX',
+        'phone': c.get('phone', ''), 'email': c.get('email', ''),
+        'reference': c.get('notes', ''), 'contents': 'Insumos de laboratorio',
+    }
+
+
+async def _paquete_real_del_pedido(order: dict) -> dict:
+    """El bulto de ESTE pedido, pesado contra el catálogo de verdad.
+
+    Se resuelve el catálogo en vez de confiar en lo que quedó guardado: un pedido
+    creado antes de que existieran los pesos traería medidas viejas, y despachar con
+    medidas viejas es cotizar barato y pagar caro en el mostrador.
+    """
+    items = order.get('items') or []
+    pflags = await _catalogo_de(items)
+    return envios.paquete_del_pedido(items, pflags)
+
+
+@api_router.post('/admin/orders/{order_id}/cotizar-envio')
+async def admin_cotizar_envio(order_id: str, admin=Depends(get_current_admin)):
+    """Cuánto cuesta mandar ESTE pedido, de verdad, por cada paquetería.
+
+    Devuelve TODAS las tarifas con precio y días —no solo las tres que ve el
+    cliente— porque quien paga la guía es la casa y tiene derecho a ver la más
+    barata aunque tarde más. Guarda la cotización para que comprar sea un clic.
+    """
+    order = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    if not skydropx.enabled():
+        return {'enabled': False, 'options': [],
+                'detail': 'Faltan SKYDROPX_CLIENT_ID y SKYDROPX_CLIENT_SECRET'}
+    destino = _destino_del_pedido(order)
+    cp = (destino.get('zip') or '').strip()
+    if len(cp) < 5:
+        return {'enabled': True, 'options': [], 'detail': 'El pedido no trae código postal'}
+    paquete = await _paquete_real_del_pedido(order)
+    if not paquete['peso_kg']:
+        return {'enabled': True, 'options': [], 'detail': 'El pedido no trae artículos'}
+    try:
+        cot = skydropx.cotizacion(destino, paquete,
+                                  espera_max=skydropx.ESPERA_MAX_GUIA_S, filtrar=False)
+    except Exception as e:
+        logger.exception('Skydropx: no se pudo cotizar el pedido %s', order.get('order_number'))
+        return {'enabled': True, 'options': [], 'detail': f'La paquetería no respondió: {e}'[:200]}
+    if not cot['opciones']:
+        return {'enabled': True, 'options': [], 'paquete': paquete,
+                'detail': 'Sin tarifas para ese código postal'}
+    doc = await _guardar_cotizacion(cp, paquete, cot['opciones'])
+    # El id de la cotización de Skydropx se guarda con la nuestra: comprar la guía
+    # se hace contra el `rate_id` de ESA cotización y no de otra.
+    await db[COLECCION_COTIZACIONES].update_one(
+        {'id': doc['id']}, {'$set': {'order_id': order_id, 'skydropx_id': cot['id'],
+                                     'packages': cot.get('packages') or []}})
+    recomendada = min(cot['opciones'], key=lambda o: o['precio'])
+    return {
+        'enabled': True,
+        'quote_id': doc['id'],
+        'paquete': paquete,
+        'expires_at': doc['expires_at'],
+        'remitente_completo': skydropx.remitente_configurado(),
+        'requiere_verificar_origen': cot.get('requiere_verificar_origen', False),
+        'recomendada': recomendada['rate_id'],
+        'options': [{'id': o['opcion_id'], 'carrier': o['paqueteria'],
+                     'service': o['servicio'], 'days': o['dias'], 'price': o['precio'],
+                     'para_el_cliente': skydropx.permitida(o['paqueteria_id'])
+                                        and skydropx.dentro_del_plazo(o['dias'])}
+                    for o in doc['opciones']],
+    }
+
+
+@api_router.post('/admin/orders/{order_id}/guia')
+async def admin_comprar_guia(order_id: str, payload: ComprarGuiaRequest,
+                             admin=Depends(get_current_admin)):
+    """Compra la guía de la opción que eligió el admin y la deja en el pedido.
+
+    ⚠️ CUESTA DINERO DE VERDAD. Por eso pide explícitamente qué opción, no adivina.
+
+    ⛔ El precio y la tarifa salen de la cotización que guardó el SERVIDOR; lo que
+    mande el navegador no se usa para nada más que decir cuál de ellas.
+    """
+    order = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    if order.get('tracking_number'):
+        raise HTTPException(status_code=409, detail='Este pedido ya tiene guía')
+    if not skydropx.enabled():
+        raise HTTPException(status_code=400, detail='Faltan las credenciales de Skydropx')
+    if not skydropx.remitente_configurado():
+        raise HTTPException(status_code=400,
+                            detail='Falta capturar el remitente en Admin → Envíos')
+    doc = await db[COLECCION_COTIZACIONES].find_one(
+        {'opciones.opcion_id': payload.option_id}, {'_id': 0})
+    if not doc or doc.get('order_id') != order_id:
+        raise HTTPException(status_code=400, detail='Esa cotización no es de este pedido')
+    if (doc.get('expires_at') or '') < now_iso():
+        raise HTTPException(status_code=400, detail='La cotización venció; vuelve a cotizar')
+    opcion = next((o for o in doc.get('opciones', []) if o.get('opcion_id') == payload.option_id), None)
+    if not opcion:
+        raise HTTPException(status_code=400, detail='Esa opción no existe')
+    numero_paquete = 1
+    paquetes = doc.get('packages') or []
+    if paquetes and isinstance(paquetes[0], dict):
+        try:
+            numero_paquete = int(paquetes[0].get('package_number') or 1)
+        except (TypeError, ValueError):
+            numero_paquete = 1
+    try:
+        guia = skydropx.comprar_guia(opcion['rate_id'], _destino_del_pedido(order),
+                                     doc.get('paquete') or {}, numero_paquete)
+    except Exception as e:
+        logger.exception('Skydropx: no se pudo comprar la guia de %s', order.get('order_number'))
+        await db.orders.update_one({'id': order_id}, {'$set': {'label_error': str(e)[:300]}})
+        raise HTTPException(status_code=502, detail=f'La paquetería no dio la guía: {e}'[:200])
+    numero = guia.get('tracking_number') or ''
+    carrier = opcion.get('paqueteria') or ''
+    update = {
+        'carrier': carrier,
+        'tracking_number': numero,
+        'tracking_url': guia.get('tracking_url') or build_tracking_url(carrier, numero),
+        'label_url': guia.get('label_url') or '',
+        'label_provider': 'skydropx',
+        'label_error': '',
+        'shipping_cost': opcion.get('precio') or 0,
+        'shipping_service': opcion.get('servicio') or '',
+        'shipped_at': order.get('shipped_at') or now_iso(),
+        'status': 'enviado',
+    }
+    await db.orders.update_one({'id': order_id}, {'$set': update})
+    logger.info('Envio: guia comprada a mano para %s — %s %s por $%s',
+                order.get('order_number'), carrier, numero, update['shipping_cost'])
+    fresco = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    await avisar_del_envio(fresco)
+    return fresco
+
+
+async def avisar_del_envio(order: dict) -> bool:
+    """Le manda al cliente su número de guía. Nunca revienta hacia arriba.
+
+    Hasta hoy el rastreo se guardaba en el pedido y ahí se quedaba: el cliente tenía
+    que entrar a su cuenta a buscarlo. El correo de confirmación le PROMETE que se
+    lo vamos a mandar ("en cuanto salga te mandamos el número de guía"), así que no
+    mandarlo era incumplir por escrito.
+    """
+    if not order or not order.get('tracking_number'):
+        return False
+    lang = None
+    if order.get('user_id'):
+        u = await db.users.find_one({'id': order['user_id']}, {'_id': 0, 'language': 1})
+        lang = (u or {}).get('language')
+    num = order.get('order_number')
+    await notify(order.get('user_id'), 'order_shipped', 'Tu pedido va en camino',
+                 f'El pedido {num} ya salió. Guía {order.get("tracking_number")}.',
+                 link=f'/pedido/{num}', dedup=f'shipped:{num}')
+    asyncio.create_task(send_shipped_email(order, lang))
+    return True
+
+
 async def comprar_guia_del_pedido(order: dict) -> dict | None:
     """Compra la guía de un pedido YA PAGADO y la deja en el pedido. Idempotente.
 
@@ -1366,6 +1622,9 @@ async def comprar_guia_del_pedido(order: dict) -> dict | None:
     await db.orders.update_one({'id': order['id']}, {'$set': update})
     logger.info('Envio: guia comprada para %s — %s %s',
                 order.get('order_number'), update['carrier'], numero)
+    # El cliente se entera por correo, no entrando a buscar. Se le manda el pedido ya
+    # actualizado: con el de antes iría sin número de guía, que es justo lo que avisa.
+    await avisar_del_envio(dict(order, **update))
     return update
 
 
@@ -2861,6 +3120,10 @@ async def update_order_shipping(order_id: str, payload: OrderShippingUpdate, adm
     if update:
         await db.orders.update_one({'id': order_id}, {'$set': update})
     result = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    # Si en esta captura APARECIÓ una guía que antes no existía, el cliente se entera.
+    # `dedup` en la notificación impide que reeditar el número mande dos correos.
+    if number and not (order.get('tracking_number') or ''):
+        await avisar_del_envio(result)
     if result.get('status') in loyalty.PAID_STATUSES:
         await award_order_points(result)
         result = await db.orders.find_one({'id': order_id}, {'_id': 0})
@@ -4674,6 +4937,12 @@ async def seed_db():
         cargadas = await secretos.recargar(db)
         if cargadas:
             logger.info('Credenciales de pasarela cargadas del panel: %s', cargadas)
+
+        # Remitente y cajas capturados en Admin → Envíos. Misma regla: el .env manda.
+        await _cargar_ajustes_envio()
+        if not skydropx.remitente_configurado():
+            logger.warning('Envios: el REMITENTE no esta configurado. No se podran '
+                           'comprar guias hasta capturarlo en Admin → Envios.')
 
         admin_email = os.environ.get('ADMIN_EMAIL')
         admin_password = os.environ.get('ADMIN_PASSWORD')

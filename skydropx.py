@@ -172,6 +172,50 @@ def _get(ruta: str):
 # no existe, o que una devolución se va a la nada — con el paquete ya pagado.
 REMITENTE_PENDIENTE = 'PENDIENTE-CONFIGURAR'
 
+# Los campos del remitente, en el orden en que se piden en el panel. La clave es la
+# interna de esta casa y el valor la variable de entorno equivalente. Existe como
+# tabla y no como veinte renglones sueltos para que agregar un campo sea agregar
+# una línea, aquí y en ningún otro lado.
+CAMPOS_REMITENTE = (
+    ('name', 'SKYDROPX_FROM_NAME'),
+    ('company', 'SKYDROPX_FROM_COMPANY'),
+    ('address1', 'SKYDROPX_FROM_ADDRESS1'),
+    ('address2', 'SKYDROPX_FROM_ADDRESS2'),
+    # La colonia: la API PRO la exige (`area_level3`) y no se puede deducir del CP.
+    ('colonia', 'SKYDROPX_FROM_COLONIA'),
+    ('city', 'SKYDROPX_FROM_CITY'),
+    ('province', 'SKYDROPX_FROM_PROVINCE'),
+    ('zip', 'SKYDROPX_FROM_ZIP'),
+    ('country', 'SKYDROPX_FROM_COUNTRY'),
+    ('phone', 'SKYDROPX_FROM_PHONE'),
+    ('email', 'SKYDROPX_FROM_EMAIL'),
+    ('reference', 'SKYDROPX_FROM_REFERENCE'),
+)
+
+# Lo único que se rellena solo cuando nadie lo escribió. El resto va vacío a
+# propósito: un remitente a medias tiene que VERSE a medias, no parecer completo.
+REMITENTE_POR_OMISION = {'company': 'Exygen Labs', 'country': 'MX',
+                         'reference': 'Recepcion'}
+
+# ⛔ SE CONFIGURA DESDE EL PANEL, NO EN EL CÓDIGO. Christián trabaja desde el
+# teléfono y la dirección es la de un trabajador que puede cambiar: hornearla en el
+# repositorio sería publicar el domicilio de una persona en GitHub. Aquí solo vive
+# un hueco; server.py lo rellena desde la base al arrancar y cada vez que se guarda.
+#
+# EL ENTORNO SIEMPRE MANDA sobre el panel, igual que con las llaves de cobro: así un
+# despliegue nunca queda a merced de lo que haya en la base.
+_DEL_PANEL: dict = {}
+
+
+def cargar_remitente_del_panel(datos: dict) -> int:
+    """Guarda en memoria el remitente que capturó el admin. Devuelve cuántos campos."""
+    _DEL_PANEL.clear()
+    for clave, _env in CAMPOS_REMITENTE:
+        valor = str((datos or {}).get(clave) or '').strip()
+        if valor:
+            _DEL_PANEL[clave] = valor
+    return len(_DEL_PANEL)
+
 
 def remitente() -> dict:
     """La dirección de quien envía, en el formato interno de esta casa.
@@ -179,22 +223,22 @@ def remitente() -> dict:
     Se traduce al de Skydropx en `_direccion_*`. Así el resto del sitio (server.py
     arma el destino con estas mismas claves) no tiene que saber cómo se llama cada
     campo en la API de hoy.
+
+    Orden de mando: entorno → panel de Admin → por omisión.
     """
-    return {
-        'name': os.environ.get('SKYDROPX_FROM_NAME', REMITENTE_PENDIENTE),
-        'company': os.environ.get('SKYDROPX_FROM_COMPANY', 'Exygen Labs'),
-        'address1': os.environ.get('SKYDROPX_FROM_ADDRESS1', REMITENTE_PENDIENTE),
-        'address2': os.environ.get('SKYDROPX_FROM_ADDRESS2', ''),
-        'city': os.environ.get('SKYDROPX_FROM_CITY', REMITENTE_PENDIENTE),
-        'province': os.environ.get('SKYDROPX_FROM_PROVINCE', REMITENTE_PENDIENTE),
-        # La colonia: la API PRO la exige (`area_level3`) y no se puede deducir del CP.
-        'colonia': os.environ.get('SKYDROPX_FROM_COLONIA', ''),
-        'zip': os.environ.get('SKYDROPX_FROM_ZIP', ''),
-        'country': os.environ.get('SKYDROPX_FROM_COUNTRY', 'MX'),
-        'phone': os.environ.get('SKYDROPX_FROM_PHONE', ''),
-        'email': os.environ.get('SKYDROPX_FROM_EMAIL', ''),
-        'reference': os.environ.get('SKYDROPX_FROM_REFERENCE', 'Recepcion'),
-    }
+    r = {}
+    for clave, env in CAMPOS_REMITENTE:
+        r[clave] = (os.environ.get(env) or _DEL_PANEL.get(clave)
+                    or REMITENTE_POR_OMISION.get(clave, ''))
+    return r
+
+
+def origen_del_remitente(datos: dict | None = None) -> str:
+    """De dónde salió cada dato: 'servidor', 'panel' o nada. Para que se vea en el panel."""
+    for _clave, env in CAMPOS_REMITENTE:
+        if os.environ.get(env):
+            return 'servidor'
+    return 'panel' if (_DEL_PANEL or datos) else ''
 
 
 def remitente_configurado() -> bool:
@@ -373,7 +417,7 @@ def _esperar_cotizacion(data: dict, espera_max: float) -> dict:
 
 
 def cotizacion(destino: dict, paquete: dict, origen: dict | None = None,
-               espera_max: float | None = None) -> dict:
+               espera_max: float | None = None, filtrar: bool = True) -> dict:
     """Una cotización completa: su id, su bulto y sus opciones ya filtradas.
 
     Devuelve también `id` y `packages` porque comprar la guía los necesita: el
@@ -405,12 +449,20 @@ def cotizacion(destino: dict, paquete: dict, origen: dict | None = None,
                        'sigue sin opciones de envio', data.get('id'), espera_max)
     crudas = data.get('rates') if isinstance(data.get('rates'), list) else []
     opciones = [o for o in (_opcion(t) for t in crudas) if o] if completa else []
+    # ⛔ `filtrar` es la diferencia entre lo que ve el CLIENTE y lo que ve LA CASA.
+    # Al cliente solo se le enseñan las tres paqueterías permitidas y solo las que
+    # cumplen el plazo prometido. Al admin, cuando despacha, se le enseña TODO lo
+    # que la paquetería cotizó: es su dinero y es él quien decide si le conviene
+    # una que tarda siete días. Ocultarle opciones a quien paga la guía es
+    # exactamente lo que hace que un envío cueste $600.
+    utiles = solo_permitidas(opciones) if filtrar else sorted(
+        opciones, key=lambda o: o['precio'])
     return {
         'id': str(data.get('id') or ''),
         'completa': completa,
         'requiere_verificar_origen': bool(data.get('requires_origin_verification')),
         'packages': data.get('packages') or [],
-        'opciones': sorted(solo_permitidas(opciones), key=lambda o: o['precio']),
+        'opciones': sorted(utiles, key=lambda o: o['precio']),
     }
 
 

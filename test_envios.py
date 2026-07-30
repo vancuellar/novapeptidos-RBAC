@@ -91,6 +91,14 @@ class FakeCol:
                 for k, n in (cambio.get('$inc') or {}).items():
                     d[k] = (d.get(k) or 0) + n
                 return _Res(1)
+        if upsert:
+            # El doble ignoraba `upsert` y devolvía 0 en silencio. Los ajustes de
+            # envío (remitente, cajas) se guardan así: sin esto, la prueba decía que
+            # se habían guardado y el documento no existía.
+            nuevo = {k: v for k, v in (filtro or {}).items() if not isinstance(v, dict)}
+            nuevo.update(cambio.get('$set') or {})
+            self.docs.append(nuevo)
+            return _Res(1)
         return _Res(0)
 
 
@@ -762,12 +770,36 @@ def test_sin_remitente_configurado_el_sistema_se_NIEGA_a_comprar(db, con_llave, 
     assert 'remitente' in db.orders.docs[0]['label_error'].lower()
 
 
-def test_el_remitente_de_ejemplo_grita_que_esta_pendiente(monkeypatch):
-    for k in ('NAME', 'ADDRESS1', 'CITY', 'PROVINCE', 'ZIP', 'PHONE', 'EMAIL'):
-        monkeypatch.delenv(f'SKYDROPX_FROM_{k}', raising=False)
+def test_sin_capturar_nada_el_remitente_va_VACIO_no_inventado(monkeypatch):
+    """⛔ Ni un dato de ejemplo. Antes había un 'PENDIENTE-CONFIGURAR' de relleno;
+    ahora el remitente se captura en Admin → Envíos y lo que no se capturó va vacío.
+    Un campo con texto de mentira acaba impreso en una guía."""
+    monkeypatch.setattr(skydropx, '_DEL_PANEL', {})
+    for _c, env in skydropx.CAMPOS_REMITENTE:
+        monkeypatch.delenv(env, raising=False)
     r = skydropx.remitente()
-    assert skydropx.REMITENTE_PENDIENTE in r['address1']
-    assert skydropx.REMITENTE_PENDIENTE in r['name']
+    assert r['name'] == '' and r['address1'] == '' and r['zip'] == ''
+    assert skydropx.remitente_configurado() is False
+    # Lo único que se rellena solo es lo que no es de nadie: la empresa y el país.
+    assert r['company'] == 'Exygen Labs' and r['country'] == 'MX'
+
+
+def test_el_remitente_se_captura_desde_el_panel_y_el_entorno_le_gana(monkeypatch):
+    """Misma regla que las llaves de cobro: el .env manda sobre lo pegado en el panel."""
+    monkeypatch.setattr(skydropx, '_DEL_PANEL', {})
+    for _c, env in skydropx.CAMPOS_REMITENTE:
+        monkeypatch.delenv(env, raising=False)
+    skydropx.cargar_remitente_del_panel({
+        'name': 'Trabajador del Panel', 'address1': 'Calle 1 #2', 'colonia': 'Centro',
+        'city': 'Monterrey', 'province': 'Nuevo León', 'zip': '64000',
+        'phone': '8112345678', 'email': 'envios@exygenlabs.com'})
+    assert skydropx.remitente_configurado() is True
+    assert skydropx.remitente()['name'] == 'Trabajador del Panel'
+    assert skydropx.origen_del_remitente() == 'panel'
+
+    monkeypatch.setenv('SKYDROPX_FROM_NAME', 'El del servidor')
+    assert skydropx.remitente()['name'] == 'El del servidor'
+    assert skydropx.origen_del_remitente() == 'servidor'
 
 
 def test_sin_telefono_ni_correo_del_remitente_TAMPOCO_se_compra(monkeypatch, con_remitente):
@@ -939,3 +971,287 @@ def test_el_pedido_guarda_lo_que_la_casa_absorbe_aunque_no_cobre_envio():
     assert server.shipping_for(3000) == 0
     assert envios.envio_que_absorbe_la_casa(costo_guia, 0) == 250
     assert envios.absorcion_fuera_de_tope(costo_guia, 3000, 0) == 0   # 250 cabe en el 10%
+
+
+# ==========================================================================
+#  9. La caja: lo que abulta cuesta más que lo que pesa
+#
+#  ⛔ ESTA ES LA SECCIÓN DEL PROBLEMA DE LOS $600. El 2026-07-30 Christián mandó
+#  dos viales a Nuevo León y le cobraron casi $600 en el mostrador. Las paqueterías
+#  cobran por el MAYOR entre el peso real y el volumétrico (L×A×H÷5000), y hasta ese
+#  día aquí había una sola caja de 30×20×15 para todo: 1.8 kg volumétricos para un
+#  paquete que pesa 0.25. Se cotizaba aire.
+# ==========================================================================
+def test_dos_viales_van_en_la_caja_CHICA_no_en_la_de_siempre():
+    items = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=2)]
+    p = envios.paquete_del_pedido(items, {'a': {'name': 'BPC-157'}})
+    assert p['caja'] == 'chica'
+    assert (p['largo_cm'], p['ancho_cm'], p['alto_cm']) == (20, 15, 10)
+    # 0.6 kg volumétricos: por debajo del mínimo de 1 kg, o sea lo más barato posible.
+    assert p['peso_volumetrico_kg'] == 0.6
+    assert p['peso_kg'] == envios.PESO_MINIMO_KG
+
+
+def test_la_caja_vieja_cobraba_casi_el_DOBLE_de_peso_volumetrico():
+    """La de 30×20×15 son 1.8 kg volumétricos; la chica, 0.6. Tres veces menos."""
+    chica, mediana = envios.caja_para(0.2), envios.caja_para(2.0)
+    assert envios.peso_volumetrico(mediana) == 1.8
+    assert envios.peso_volumetrico(chica) == 0.6
+    assert envios.peso_volumetrico(chica) < envios.PESO_MINIMO_KG
+
+
+def test_un_pedido_grande_sube_de_caja_solo():
+    muchos = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=40)]
+    p = envios.paquete_del_pedido(muchos, {'a': {'name': 'BPC-157'}})
+    assert p['caja'] == 'mediana'           # 2.0 kg de contenido
+    assert p['peso_kg'] == 2.3              # 2.0 + los 0.30 de la caja
+    gigante = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=100)]
+    assert envios.paquete_del_pedido(gigante, {'a': {'name': 'BPC-157'}})['caja'] == 'grande'
+
+
+def test_las_cajas_se_cambian_desde_el_panel_sin_desplegar(monkeypatch):
+    monkeypatch.setattr(envios, '_CAJAS_DEL_PANEL', [])
+    assert envios.cajas() == envios.CAJAS               # de fábrica
+    envios.cargar_cajas_del_panel([
+        {'nombre': 'sobre', 'largo_cm': 25, 'ancho_cm': 18, 'alto_cm': 3,
+         'peso_max_kg': 0.5, 'peso_caja_kg': 0.05}])
+    assert envios.caja_para(0.2)['nombre'] == 'sobre'
+    assert envios.peso_volumetrico(envios.caja_para(0.2)) == 0.27
+
+
+def test_una_caja_con_medidas_en_cero_NO_se_guarda(monkeypatch):
+    """Cotizar contra una caja de 0×0×0 es cotizar contra basura."""
+    monkeypatch.setattr(envios, '_CAJAS_DEL_PANEL', [])
+    assert envios.cargar_cajas_del_panel([{'nombre': 'mala', 'largo_cm': 0,
+                                           'ancho_cm': 10, 'alto_cm': 10}]) == 0
+    assert envios.cajas() == envios.CAJAS               # se quedó con las de fábrica
+
+
+def test_el_peso_del_contenido_no_incluye_la_caja():
+    items = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=2)]
+    assert envios.peso_del_contenido(items, {'a': {'name': 'BPC-157'}}) == 0.1
+
+
+# ==========================================================================
+#  10. Despachar desde el Panel: cotizar de verdad y comprar con un clic
+#
+#  Es lo que faltaba de toda la integración. Hasta hoy la única forma de mandar un
+#  paquete era ir al mostrador y pagar lo que dijeran.
+# ==========================================================================
+def _admin():
+    return {'id': 'admin', 'role': 'admin'}
+
+
+def _cotizar_pedido(db, order_id='o1'):
+    return asyncio.run(server.admin_cotizar_envio(order_id, admin=_admin()))
+
+
+def test_el_admin_ve_TODAS_las_paqueterias_no_solo_las_tres_del_cliente(
+        db, con_llave, con_remitente, monkeypatch):
+    """⛔ Quien paga la guía es la casa. Al cliente se le enseñan tres paqueterías y
+    solo las de 2-5 días; al admin se le enseña TODO lo que cotizó Skydropx, porque
+    ocultarle la opción de $51 a quien paga es exactamente cómo un envío llega a $600."""
+    _falsear_skydropx(monkeypatch)
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    r = _cotizar_pedido(db)
+    assert r['enabled'] is True
+    carriers = {o['carrier'] for o in r['options']}
+    assert 'DHL' in carriers                       # al cliente NO se le enseña
+    assert {'Estafeta', 'FedEx', 'Paquetexpress'} <= carriers
+    # Y viene ordenado de más barato a más caro, con la más barata marcada.
+    precios = [o['price'] for o in r['options']]
+    assert precios == sorted(precios)
+    assert precios[0] == 51.25
+    # Pero se sigue viendo cuál SÍ cumple la promesa que se le hizo al cliente.
+    nacional = next(o for o in r['options'] if o['price'] == 51.25)
+    assert nacional['para_el_cliente'] is False    # 7 días: rompe los 2-5 prometidos
+
+
+def test_la_cotizacion_del_admin_usa_el_peso_y_la_caja_REALES(db, con_llave, monkeypatch):
+    api = _falsear_skydropx(monkeypatch)
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    r = _cotizar_pedido(db)
+    assert r['paquete']['caja'] == 'chica'          # un vial
+    cuerpo = _peticiones(api, '/quotations')[0]['cuerpo']['quotation']
+    assert cuerpo['parcel'] == {'length': 20, 'width': 15, 'height': 10, 'weight': 1.0}
+    assert cuerpo['address_to']['postal_code'] == '64000'
+
+
+def test_sin_credenciales_el_panel_lo_dice_y_no_revienta(db, monkeypatch):
+    monkeypatch.delenv('SKYDROPX_CLIENT_ID', raising=False)
+    monkeypatch.delenv('SKYDROPX_CLIENT_SECRET', raising=False)
+    monkeypatch.setattr(server.secretos, '_CACHE', {})
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    r = _cotizar_pedido(db)
+    assert r['enabled'] is False and r['options'] == []
+    assert 'SKYDROPX_CLIENT_ID' in r['detail']
+
+
+def test_comprar_la_guia_desde_el_panel_la_deja_en_el_pedido(
+        db, con_llave, con_remitente, monkeypatch):
+    api = _falsear_skydropx(monkeypatch)
+    monkeypatch.setattr(server, 'avisar_del_envio', _async_nada)
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    r = _cotizar_pedido(db)
+    barata = r['options'][0]
+    from models import ComprarGuiaRequest
+    pedido = asyncio.run(server.admin_comprar_guia(
+        'o1', ComprarGuiaRequest(option_id=barata['id']), admin=_admin()))
+
+    assert pedido['tracking_number'] == '7712345678'
+    assert pedido['label_url'] == 'https://skydropx.test/guia.pdf'
+    assert pedido['status'] == 'enviado'
+    assert pedido['shipping_cost'] == 51.25          # lo que le costó A LA CASA
+    # ⛔ Se compró contra el rate_id de LA COTIZACIÓN, no contra nada que mandó el panel.
+    envio = _peticiones(api, '/shipments')[0]['cuerpo']['shipment']
+    assert envio['rate_id'] == 'r-pqx-nac'
+
+
+def test_el_precio_de_la_guia_lo_pone_el_SERVIDOR(db, con_llave, con_remitente, monkeypatch):
+    """El panel solo dice CUÁL opción. El precio sale de la cotización guardada."""
+    _falsear_skydropx(monkeypatch)
+    monkeypatch.setattr(server, 'avisar_del_envio', _async_nada)
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    r = _cotizar_pedido(db)
+    cara = max(r['options'], key=lambda o: o['price'])
+    from models import ComprarGuiaRequest
+    pedido = asyncio.run(server.admin_comprar_guia(
+        'o1', ComprarGuiaRequest(option_id=cara['id']), admin=_admin()))
+    guardada = next(o for o in db[server.COLECCION_COTIZACIONES].docs[0]['opciones']
+                    if o['opcion_id'] == cara['id'])
+    assert pedido['shipping_cost'] == guardada['precio']
+
+
+def test_una_opcion_de_OTRO_pedido_no_compra_guia(db, con_llave, con_remitente, monkeypatch):
+    _falsear_skydropx(monkeypatch)
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    asyncio.run(db.orders.insert_one(_orden('spei', id='o2', order_number='EX-2')))
+    r = _cotizar_pedido(db, 'o1')
+    from models import ComprarGuiaRequest
+    with pytest.raises(server.HTTPException) as e:
+        asyncio.run(server.admin_comprar_guia(
+            'o2', ComprarGuiaRequest(option_id=r['options'][0]['id']), admin=_admin()))
+    assert e.value.status_code == 400
+
+
+def test_sin_remitente_el_panel_TAMPOCO_compra(db, con_llave, monkeypatch):
+    monkeypatch.setattr(skydropx, '_DEL_PANEL', {})
+    for _c, env in skydropx.CAMPOS_REMITENTE:
+        monkeypatch.delenv(env, raising=False)
+    api = _falsear_skydropx(monkeypatch)
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    r = _cotizar_pedido(db)
+    assert r['remitente_completo'] is False
+    from models import ComprarGuiaRequest
+    n = len(api.llamadas)
+    with pytest.raises(server.HTTPException) as e:
+        asyncio.run(server.admin_comprar_guia(
+            'o1', ComprarGuiaRequest(option_id=r['options'][0]['id']), admin=_admin()))
+    assert e.value.status_code == 400 and 'remitente' in e.value.detail.lower()
+    assert len(api.llamadas) == n              # ni le habló a la paquetería
+
+
+def test_un_pedido_que_ya_tiene_guia_no_se_compra_otra(db, con_llave, con_remitente, monkeypatch):
+    _falsear_skydropx(monkeypatch)
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    r = _cotizar_pedido(db)
+    asyncio.run(db.orders.update_one({'id': 'o1'}, {'$set': {'tracking_number': '999'}}))
+    from models import ComprarGuiaRequest
+    with pytest.raises(server.HTTPException) as e:
+        asyncio.run(server.admin_comprar_guia(
+            'o1', ComprarGuiaRequest(option_id=r['options'][0]['id']), admin=_admin()))
+    assert e.value.status_code == 409
+
+
+# ==========================================================================
+#  11. El remitente y las cajas se capturan en el Panel
+# ==========================================================================
+def test_el_panel_guarda_el_remitente_y_ahi_si_se_puede_comprar(db, monkeypatch):
+    monkeypatch.setattr(skydropx, '_DEL_PANEL', {})
+    for _c, env in skydropx.CAMPOS_REMITENTE:
+        monkeypatch.delenv(env, raising=False)
+    from models import RemitenteUpdate
+    assert skydropx.remitente_configurado() is False
+    asyncio.run(server.admin_guardar_remitente(RemitenteUpdate(
+        name='Trabajador de Prueba', address1='Calle 1 #2', colonia='Centro',
+        city='Monterrey', province='Nuevo León', zip='64000',
+        phone='8112345678', email='envios@exygenlabs.com'), admin=_admin()))
+    assert skydropx.remitente_configurado() is True
+    assert skydropx.remitente()['zip'] == '64000'
+
+
+def test_el_remitente_NO_va_horneado_en_el_codigo():
+    """⛔ Es el domicilio de un trabajador. Un dato personal en el repositorio es un
+    dato personal publicado en GitHub."""
+    import re
+    fuente = open('skydropx.py', encoding='utf-8').read()
+    assert '@gmail.com' not in fuente
+    assert not re.search(r'\b\d{10}\b', fuente)          # ningún teléfono
+    # Lo ÚNICO que puede venir relleno es lo que no es de nadie: la empresa y el país.
+    assert set(skydropx.REMITENTE_POR_OMISION) == {'company', 'country', 'reference'}
+
+
+def test_la_config_de_envios_no_devuelve_las_llaves_de_skydropx(db, con_llave):
+    r = asyncio.run(server.admin_envios_config(admin=_admin()))
+    assert r['credenciales_puestas'] is True
+    assert 'id-de-prueba' not in str(r) and 'secreto-de-prueba' not in str(r)
+    assert [c['nombre'] for c in r['cajas']] == ['chica', 'mediana', 'grande']
+
+
+# ==========================================================================
+#  12. El cliente se entera de su guía por correo
+# ==========================================================================
+def test_al_comprar_la_guia_le_llega_el_rastreo_al_cliente(
+        db, con_llave, con_remitente, monkeypatch):
+    """El correo de pago confirmado PROMETE el número de guía por correo, en los tres
+    idiomas. Hasta hoy ese correo no existía."""
+    _falsear_skydropx(monkeypatch)
+    enviados = []
+    monkeypatch.setattr(server, 'send_shipped_email',
+                        lambda o, lang=None: enviados.append(o.get('tracking_number')))
+    monkeypatch.setattr(server.asyncio, 'create_task', lambda c: c)
+    monkeypatch.setattr(envios, 'COMPRAR_GUIA_AL_PAGAR', True)
+    orden = _orden('tarjeta')
+    asyncio.run(db.orders.insert_one(orden))
+    asyncio.run(server.comprar_guia_del_pedido(orden))
+    assert enviados == ['7712345678']
+
+
+def test_capturar_la_guia_A_MANO_tambien_le_avisa_al_cliente(db, monkeypatch):
+    """El admin puede seguir pegando una guía comprada en el mostrador. El cliente
+    tiene que enterarse igual."""
+    avisados = []
+    monkeypatch.setattr(server, 'avisar_del_envio',
+                        lambda o: avisados.append(o.get('tracking_number')) or _async_nada())
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    from models import OrderShippingUpdate
+    asyncio.run(server.update_order_shipping('o1', OrderShippingUpdate(
+        carrier='Estafeta', tracking_number='ABC123'), admin=_admin()))
+    assert avisados == ['ABC123']
+
+
+def test_el_correo_del_rastreo_existe_en_los_TRES_idiomas():
+    import emails
+    for lang in ('es', 'en', 'pt'):
+        assert '{number}' in emails.SHIPPED_SUBJECTS[lang]
+        greet, body, cta, footer = emails.SHIPPED_BODIES[lang]
+        assert '{tracking}' in body and '{carrier}' in body and cta
+
+
+def test_sin_numero_de_guia_no_se_manda_correo_de_envio(db, monkeypatch):
+    """Un correo que dice "ya salió" sin número de guía es peor que no mandarlo."""
+    mandados = []
+    monkeypatch.setattr(server, 'send_shipped_email', lambda *a, **k: mandados.append(1))
+    assert asyncio.run(server.avisar_del_envio({'order_number': 'EX-1'})) is False
+    assert mandados == []
+
+
+def test_el_aviso_interno_dice_lo_que_costo_la_guia():
+    """El número que duele es el que la casa NO cobra."""
+    import emails
+    orden = _orden('spei')
+    orden.update({'shipping': 0, 'carrier': 'Estafeta', 'shipping_cost': 168.33})
+    html_aviso = emails._aviso_compra_html(orden, 'https://exygenlabs.com/admin')
+    assert 'Costo de la guía' in html_aviso
+    assert '168' in html_aviso
+    assert 'la casa pone' in html_aviso        # los $168 que nadie pagó
