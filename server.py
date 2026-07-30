@@ -5236,28 +5236,39 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
                                      'paid': 1}).to_list(20000)
         pagado_por_num = {d['order_number']: esta_pagado(d) for d in docs}
 
-    def _cobrado_del_evento(e) -> bool:
-        """¿El pedido de este evento de compra sí se cobró?
+    def _estado_del_evento(e) -> str:
+        """'cobrado' | 'por_cobrar' | 'fantasma', según el pedido de este evento.
 
-        Sin número de pedido no hay nada contra qué verificar (eventos viejos): se
-        cree. Con número, manda la base — y si el pedido ya no existe (se canceló y se
-        borró) el dinero tampoco: no se cuenta.
+        ⛔ EL FANTASMA IMPORTA. En la base viva hay CINCO eventos de compra ($11,027)
+        cuyos pedidos ya no existen: eran los pedidos de prueba que se borraron. El
+        embudo los sumaba como ingreso, así que enseñaba $11,027 cobrados con $3,347 en
+        la cuenta. Un pedido borrado no es ingreso NI cuenta por cobrar —no hay a quién
+        cobrarle— así que no entra en ninguna de las dos cifras; se cuenta aparte.
+
+        Sin número de pedido no hay nada contra qué verificar (eventos de antes de que
+        el número viajara): se cree, porque es lo único que hay de esa época.
         """
         num = e.get('order_number')
         if not num:
-            return True
-        return bool(pagado_por_num.get(num, False))
+            return 'cobrado'
+        if num not in pagado_por_num:
+            return 'fantasma'
+        return 'cobrado' if pagado_por_num[num] else 'por_cobrar'
 
     ingreso = 0.0
     ingreso_por_cobrar = 0.0
+    ingreso_fantasma = 0.0
     for e in evs:
         if e.get('type') != 'purchase':
             continue
         monto = float(e.get('value', 0) or 0)
-        if _cobrado_del_evento(e):
+        estado = _estado_del_evento(e)
+        if estado == 'cobrado':
             ingreso += monto
-        else:
+        elif estado == 'por_cobrar':
             ingreso_por_cobrar += monto
+        else:
+            ingreso_fantasma += monto
 
     # Por origen: de donde vino y cuanto convirtio (esto mide la publicidad).
     origen = {}
@@ -5284,9 +5295,10 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
             o['compras'].add(e.get('session_id'))
             # Mismo candado que arriba: por origen tampoco se cuenta como ingreso
             # una venta que no se cobró. Si no, el ROAS de un canal se infla con fiado.
-            if _cobrado_del_evento(e):
+            estado_e = _estado_del_evento(e)
+            if estado_e == 'cobrado':
                 o['ingreso'] += float(e.get('value', 0) or 0)
-            else:
+            elif estado_e == 'por_cobrar':
                 o['por_cobrar'] += float(e.get('value', 0) or 0)
     por_origen = sorted(
         [{'origen': v['origen'], 'visitas': len(v['visitas']), 'compras': len(v['compras']),
@@ -5309,6 +5321,10 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
         'conversion_total': round(compras / visitas * 100, 2),
         'ingreso': round(ingreso),
         'por_cobrar': round(ingreso_por_cobrar),
+        # Compras cuyo pedido ya no existe (se borró). No son ingreso ni deuda, pero se
+        # dicen: si el embudo enseña compras y cero pesos, la explicación tiene que estar
+        # a la vista y no parecer un error del reporte.
+        'ingreso_sin_pedido': round(ingreso_fantasma),
         'por_origen': por_origen,
         'top_vistos': top_vistos,
         'sin_datos': len(evs) == 0,

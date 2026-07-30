@@ -277,6 +277,23 @@ def test_el_embudo_verifica_el_ingreso_contra_los_pedidos():
     assert sum(o['ingreso'] for o in r['por_origen']) == round(COBRADO_REAL)
 
 
+def test_una_compra_cuyo_pedido_ya_no_existe_no_es_ingreso_ni_deuda():
+    """⛔ EL CASO REAL DE LA BASE VIVA: hay cinco eventos de compra ($11,027) de los
+    pedidos de prueba que se borraron. El embudo los sumaba como ingreso. Un pedido
+    borrado no tiene a quién cobrarle, así que tampoco es cuenta por cobrar."""
+    base = _Base(orders=[PAZ],
+                 events=[_evento('visit', 's1'), _evento('visit', 's9'),
+                         _evento('purchase', 's1', value=COBRADO_REAL,
+                                 order_number=PAZ['order_number']),
+                         _evento('purchase', 's9', value=5509.0,
+                                 order_number='EX-20260725-7587')])
+    r = _con_base(base, lambda: server.admin_funnel(days=30, admin={'email': 'a@b.c'}))
+    assert r['ingreso'] == round(COBRADO_REAL)
+    assert r['por_cobrar'] == 0
+    assert r['ingreso_sin_pedido'] == 5509
+    assert sum(o['ingreso'] + o['por_cobrar'] for o in r['por_origen']) == round(COBRADO_REAL)
+
+
 def test_el_embudo_le_cree_a_un_evento_viejo_sin_numero_de_pedido():
     """Los eventos de antes no traen `order_number`. Es lo único que hay de esa
     época: descartarlos sería borrar historia."""
