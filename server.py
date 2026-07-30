@@ -1472,7 +1472,31 @@ async def _adoptar_pedidos_de_invitado(user_id: str) -> int:
                 await db.orders.update_one({'id': o['id']}, {'$set': {'points_earned': ganados}})
                 fresco = await db.orders.find_one({'id': o['id']}, {'_id': 0})
                 await award_order_points(fresco)
+    await _heredar_referido_de_pedidos(user, huerfanos)
     return adoptados
+
+
+async def _heredar_referido_de_pedidos(user, pedidos):
+    """Si compró con el código de un distribuidor SIN cuenta, al registrarse queda ligado.
+
+    ⛔ QUIEN USA EL CÓDIGO ES SU CLIENTE (Christián, 2026-07-30). Los pedidos ya traían el
+    `referred_by` y la comisión ya estaba pagada, pero la cuenta nueva nacía huérfana: la
+    relación se perdía justo cuando la persona por fin se registraba, y el distribuidor la
+    veía desaparecer de su lista. Se toma el del pedido MÁS RECIENTE si hubiera varios.
+
+    NO pisa un referido propio: si la cuenta ya viene ligada a alguien —porque se registró
+    con el código de otro— esa decisión es del cliente y manda sobre el historial."""
+    if not user or user.get('referred_by'):
+        return
+    con_codigo = sorted((o for o in pedidos if o.get('referred_by')),
+                        key=lambda o: o.get('created_at', ''))
+    if not con_codigo:
+        return
+    dist_id = con_codigo[-1]['referred_by']
+    # Condicionado dentro del update: si otra corrida ya lo ligó, no se toca.
+    await db.users.update_one(
+        {'id': user['id'], '$or': [{'referred_by': None}, {'referred_by': {'$exists': False}}]},
+        {'$set': {'referred_by': dist_id, 'referred_from_guest_at': now_iso()}})
 
 
 async def _recordar_datos_de_compra(user, customer):
@@ -3753,6 +3777,38 @@ async def distributor_best_sellers(dist=Depends(get_current_distributor)):
     return {'ranking': ranking, 'total_products': len(agg)}
 
 
+def _compradores_invitados(orders, correos_con_cuenta):
+    """Los que compraron con el código del distribuidor SIN tener cuenta.
+
+    ⛔ QUIEN USA EL CÓDIGO ES SU CLIENTE, tenga cuenta o no (Christián, 2026-07-30). Las
+    listas de clientes se armaban únicamente con `users.referred_by`, así que un comprador
+    INVITADO quedaba invisible para su distribuidor aunque su pedido trajera el
+    `referred_by` correcto y la comisión ya estuviera pagada. Le pasó a María con Aidee
+    (EX-20260730-2906, $2,830 cobrados y $780 de comisión): el dinero se contó, la persona
+    no. Un distribuidor que no ve a quién le vendió no puede volver a venderle.
+
+    Se agrupa por correo en minúsculas y se descarta el que YA tiene cuenta, o la misma
+    persona sale dos veces — una como cliente y otra como invitada."""
+    por_correo = {}
+    for o in orders:
+        if o.get('user_id') or not esta_vivo(o):
+            continue                     # con cuenta: ya sale por la otra vía
+        c = o.get('customer') or {}
+        correo = (c.get('email') or '').strip().lower()
+        if not correo or correo in correos_con_cuenta:
+            continue
+        g = por_correo.setdefault(correo, {
+            'id': f'invitado:{correo}', 'guest': True, 'name': c.get('full_name') or correo,
+            'email': correo, 'phone': c.get('phone') or '', 'orders': [],
+        })
+        g['orders'].append(o)
+        # El nombre y el teléfono más recientes: la gente corrige sus datos al recomprar.
+        if o.get('created_at', '') >= max((x.get('created_at', '') for x in g['orders']), default=''):
+            g['name'] = c.get('full_name') or g['name']
+            g['phone'] = c.get('phone') or g['phone']
+    return list(por_correo.values())
+
+
 @api_router.get('/distributor/clients')
 async def distributor_clients(dist=Depends(get_current_distributor)):
     users = await db.users.find({'referred_by': dist['id']}, {'_id': 0, 'password_hash': 0}).to_list(5000)
@@ -3769,9 +3825,24 @@ async def distributor_clients(dist=Depends(get_current_distributor)):
         # ficha del cliente. Nada de correo, teléfono ni domicilio.
         out.append({
             'id': u['id'], 'name': u['name'], 'created_at': u.get('created_at'),
+            'guest': False,
             'orders_count': len(uo),
             # Pagado y por cobrar, separados: es la información que el distribuidor
             # necesita para saber a quién tiene que cobrarle.
+            'total_spent': sum(cobrado_de(o) for o in uo),
+            'por_cobrar': sum(por_cobrar_de(o) for o in uo),
+            'my_earnings': sum(_my_amount(o, dist['id']) for o in uo),
+            'last_order_at': max([o.get('created_at', '') for o in uo], default=None),
+        })
+    # Y los que compraron con su código SIN cuenta: también son suyos.
+    con_cuenta = {(u.get('email') or '').strip().lower() for u in users}
+    for g in _compradores_invitados(orders, con_cuenta):
+        uo = g['orders']
+        out.append({
+            'id': g['id'], 'name': g['name'], 'created_at': min(
+                (o.get('created_at', '') for o in uo), default=None),
+            'guest': True,
+            'orders_count': len(uo),
             'total_spent': sum(cobrado_de(o) for o in uo),
             'por_cobrar': sum(por_cobrar_de(o) for o in uo),
             'my_earnings': sum(_my_amount(o, dist['id']) for o in uo),
@@ -5687,9 +5758,22 @@ async def admin_distributor_detail(dist_id: str, admin=Depends(get_current_admin
             b = by_user.get(u['id'], {'orders': 0, 'total': 0, 'por_cobrar': 0,
                                       'commission': 0, 'last': ''})
             clients.append({'id': u['id'], 'name': u.get('name'), 'email': u.get('email'),
+                            'guest': False,
                             'orders': b['orders'], 'total': b['total'],
                             'por_cobrar': b['por_cobrar'],
                             'commission': b['commission'], 'last_order': b['last'] or None})
+    # Los invitados que usaron su código: la misma regla que en el panel del distribuidor,
+    # o el admin y el distribuidor ven listas distintas de la misma realidad.
+    con_cuenta = {(u.get('email') or '').strip().lower() for u in users}
+    for g in _compradores_invitados([o for o in orders if o.get('referred_by') == dist_id],
+                                    con_cuenta):
+        uo = g['orders']
+        clients.append({'id': g['id'], 'name': g['name'], 'email': g['email'],
+                        'guest': True,
+                        'orders': len(uo), 'total': sum(cobrado_de(o) for o in uo),
+                        'por_cobrar': sum(por_cobrar_de(o) for o in uo),
+                        'commission': sum(_my_amount(o, dist_id) for o in uo),
+                        'last_order': max((o.get('created_at', '') for o in uo), default=None)})
     clients.sort(key=lambda c: -c['total'])
 
     # Red: sub-distribuidores directos con sus números.

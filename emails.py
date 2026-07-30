@@ -962,6 +962,28 @@ def _aviso_compra_html(order, link_admin):
 </html>"""
 
 
+# El correo con el que corre la suite E2E y el marcador que deja en los pedidos.
+CORREO_E2E = 'e2e-no-responder@example.com'
+
+
+def es_pedido_de_prueba(order):
+    """¿Este pedido lo hizo la suite E2E y no una persona?
+
+    ⛔ LOS PEDIDOS DE PRUEBA NO AVISAN. El aviso interno salió el mismo día que la suite
+    E2E y Christián recibió el correo de un pedido que nadie compró — se puso a prepararlo.
+    Un aviso que se equivoca es peor que no tenerlo: la próxima vez que llegue uno de
+    verdad, ya no se le va a creer.
+
+    Solo se calla el AVISO: el pedido de prueba sigue su flujo completo, porque de eso se
+    trata la prueba."""
+    c = (order or {}).get('customer') or {}
+    correo = (c.get('email') or '').strip().lower()
+    if correo == CORREO_E2E:
+        return True
+    marca = f"{c.get('full_name') or ''} {c.get('notes') or ''}".upper()
+    return 'E2E' in marca
+
+
 async def send_purchase_alert(order, momento='nuevo'):
     """Le avisa a Christián que entró un pedido (o que ya se pagó).
 
@@ -973,6 +995,10 @@ async def send_purchase_alert(order, momento='nuevo'):
     no salga."""
     if not email_enabled():
         logger.info('EMAIL_ENABLED != true, skipping purchase alert for %s',
+                    order.get('order_number'))
+        return
+    if es_pedido_de_prueba(order):
+        logger.info('Pedido de prueba (E2E): no se manda aviso interno de %s',
                     order.get('order_number'))
         return
     numero = order.get('order_number', '')

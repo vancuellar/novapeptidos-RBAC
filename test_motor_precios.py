@@ -936,3 +936,198 @@ def test_el_checkout_y_el_webhook_disparan_el_aviso_sin_poder_tumbarlos():
     cuerpo = src[ini:src.index('\nasync def', ini + 10)]
     assert "send_purchase_alert(fresh, 'pagado')" in cuerpo, (
         'no avisa cuando entra el dinero: se prepara mercancía que nadie pagó')
+
+
+# ---------- Quien usa el código ES cliente del distribuidor, tenga cuenta o no ----------
+#
+# EL CASO QUE LO DESTAPÓ (2026-07-30): el pedido EX-20260730-2906 de Aidee Liliana García
+# —invitada, sin cuenta— traía el `referred_by` de María y su comisión de $780 bien
+# registrada. Pero "Mis Clientes" se armaba SOLO con `users.referred_by`, así que María
+# nunca la vio: el dinero se contó y la persona no. Un distribuidor que no ve a quién le
+# vendió no puede volver a venderle.
+
+_MARIA = '37f6feba-0000-4000-8000-000000000001'
+
+_PEDIDO_AIDEE = {
+    'id': 'o-aidee', 'order_number': 'EX-20260730-2906', 'user_id': None,
+    'referred_by': _MARIA, 'status': 'entregado', 'paid': True, 'total': 2830.0,
+    'created_at': '2026-07-30T10:00:00',
+    'customer': {'full_name': 'Aidee Liliana García', 'email': 'lilygarciahdz@hotmail.com',
+                 'phone': '8112345678'},
+    'commissions': [{'distributor_id': _MARIA, 'role': 'seller', 'amount': 780.0}],
+}
+
+
+def test_un_comprador_INVITADO_con_el_codigo_aparece_como_cliente():
+    """El caso de Aidee, exacto. Sin esto el distribuidor cobra la comisión de alguien a
+    quien no puede volver a contactar."""
+    import server as _srv
+    invitados = _srv._compradores_invitados([_PEDIDO_AIDEE], correos_con_cuenta=set())
+    assert len(invitados) == 1, invitados
+    g = invitados[0]
+    assert g['guest'] is True
+    assert g['name'] == 'Aidee Liliana García'
+    assert g['email'] == 'lilygarciahdz@hotmail.com'
+    assert g['phone'] == '8112345678'
+    assert [o['order_number'] for o in g['orders']] == ['EX-20260730-2906']
+
+
+def test_el_invitado_que_YA_tiene_cuenta_no_sale_dos_veces():
+    """Si no se descarta por correo, la misma persona aparece como cliente Y como
+    invitada, y sus compras se cuentan dos veces en la lista."""
+    import server as _srv
+    invitados = _srv._compradores_invitados(
+        [_PEDIDO_AIDEE], correos_con_cuenta={'lilygarciahdz@hotmail.com'})
+    assert invitados == []
+
+
+def test_los_pedidos_de_un_invitado_se_juntan_por_correo():
+    """Dos compras del mismo invitado son UN cliente, no dos."""
+    import server as _srv
+    segundo = dict(_PEDIDO_AIDEE, id='o-2', order_number='EX-2', total=1000.0,
+                   created_at='2026-07-31T10:00:00')
+    invitados = _srv._compradores_invitados([_PEDIDO_AIDEE, segundo], set())
+    assert len(invitados) == 1 and len(invitados[0]['orders']) == 2
+
+
+def test_un_pedido_con_cuenta_no_se_cuenta_como_invitado():
+    import server as _srv
+    con_cuenta = dict(_PEDIDO_AIDEE, user_id='u-1')
+    assert _srv._compradores_invitados([con_cuenta], set()) == []
+
+
+def _hereda(users_doc, pedidos):
+    """Corre la herencia de referido contra un `db.users` de mentiras."""
+    import asyncio
+    import server as _srv
+
+    updates = []
+
+    class _Users:
+        async def update_one(self, query, cambio):
+            updates.append((query, cambio))
+            return type('R', (), {'matched_count': 1, 'modified_count': 1})()
+
+    original = _srv.db
+    _srv.db = type('DB', (), {'users': _Users()})()
+    try:
+        asyncio.new_event_loop().run_until_complete(
+            _srv._heredar_referido_de_pedidos(users_doc, pedidos))
+    finally:
+        _srv.db = original
+    return updates
+
+
+def test_al_registrarse_el_invitado_HEREDA_el_distribuidor_de_sus_pedidos():
+    """Si algún día Aidee se registra, queda ligada a María sola. Antes la cuenta nueva
+    nacía huérfana y la relación se perdía justo cuando la persona por fin se registraba."""
+    updates = _hereda({'id': 'u-aidee'}, [_PEDIDO_AIDEE])
+    assert len(updates) == 1, updates
+    query, cambio = updates[0]
+    assert cambio['$set']['referred_by'] == _MARIA
+    assert 'referred_from_guest_at' in cambio['$set']
+    # y no puede pisar a alguien que ya tenía referido: la condición viaja en la consulta
+    assert '$or' in query, query
+
+
+def test_con_VARIOS_pedidos_hereda_el_del_MAS_RECIENTE():
+    otro = dict(_PEDIDO_AIDEE, id='o-viejo', referred_by='otro-dist',
+                created_at='2026-07-01T10:00:00')
+    updates = _hereda({'id': 'u-aidee'}, [otro, _PEDIDO_AIDEE])
+    assert updates[0][1]['$set']['referred_by'] == _MARIA
+
+
+def test_una_cuenta_que_YA_trae_referido_no_se_le_cambia():
+    """Si se registró con el código de otro, esa decisión es del cliente y manda sobre
+    el historial."""
+    assert _hereda({'id': 'u-aidee', 'referred_by': 'otro-dist'}, [_PEDIDO_AIDEE]) == []
+
+
+def test_sin_pedidos_con_codigo_no_se_inventa_un_referido():
+    sin_codigo = dict(_PEDIDO_AIDEE, referred_by=None)
+    assert _hereda({'id': 'u-aidee'}, [sin_codigo]) == []
+
+
+def test_la_adopcion_de_pedidos_dispara_la_herencia_del_referido():
+    """Candado sobre el código: si alguien quita la llamada, la relación se vuelve a
+    perder en silencio y solo se nota semanas después."""
+    src = _fuente()
+    ini = src.index('async def _adoptar_pedidos_de_invitado(')
+    cuerpo = src[ini:src.index('\nasync def _heredar_referido', ini)]
+    assert '_heredar_referido_de_pedidos(user, huerfanos)' in cuerpo, (
+        'adoptar los pedidos ya no hereda el distribuidor: la cuenta nueva nace huérfana')
+
+
+@pytest.mark.parametrize('ruta,funcion', [
+    ('/distributor/clients', 'distributor_clients'),
+    ('ficha de admin', 'admin_distributor_detail'),
+])
+def test_las_dos_listas_de_clientes_incluyen_a_los_invitados(ruta, funcion):
+    """El admin y el distribuidor tienen que ver la MISMA realidad. Si una lista los
+    incluye y la otra no, cada quien cuenta clientes distintos."""
+    src = _fuente()
+    try:
+        ini = src.index(f'async def {funcion}(')
+    except ValueError:
+        ini = src.index("@api_router.get('/admin/distributors/{dist_id}')")
+    cuerpo = src[ini:ini + 6000]
+    assert '_compradores_invitados(' in cuerpo, f'{ruta} no lista a los invitados'
+
+
+# ---------- Los pedidos de prueba NO le avisan a Christián ----------
+#
+# El aviso interno salió el mismo día que la suite E2E y Christián recibió el correo de un
+# pedido que nadie compró: se puso a prepararlo. Un aviso que se equivoca es peor que no
+# tenerlo — la próxima vez que llegue uno de verdad ya no se le va a creer.
+
+@pytest.mark.parametrize('customer,esPrueba', [
+    ({'full_name': 'E2E Tarjeta', 'email': 'e2e-no-responder@example.com',
+      'notes': 'E2E TARJETA — se borra sola'}, True),
+    ({'full_name': 'E2E Cripto', 'email': 'e2e-no-responder@example.com',
+      'notes': 'E2E CRIPTO — se borra sola'}, True),
+    ({'full_name': 'Auditoría E2E', 'email': 'e2e-no-responder@example.com'}, True),
+    # el correo solo, aunque el nombre no diga nada
+    ({'full_name': 'Quien sea', 'email': 'E2E-No-Responder@Example.com'}, True),
+    # el marcador en las notas, aunque el correo sea otro
+    ({'full_name': 'Quien sea', 'email': 'real@gmail.com', 'notes': 'E2E de humo'}, True),
+    # UN CLIENTE DE VERDAD SÍ AVISA
+    ({'full_name': 'Aidee Liliana García', 'email': 'lilygarciahdz@hotmail.com'}, False),
+    ({'full_name': 'Christián Cuéllar', 'email': 'exygenlabs@gmail.com'}, False),
+])
+def test_solo_los_pedidos_de_verdad_disparan_el_aviso(customer, esPrueba):
+    import emails
+    assert emails.es_pedido_de_prueba({'customer': customer}) is esPrueba
+
+
+def test_el_pedido_E2E_no_manda_correo_y_el_real_si():
+    """La compuerta está DENTRO del envío, no en quien llama: el flujo E2E sigue igual en
+    todo lo demás y no hay que acordarse de saltarse el aviso en cada sitio."""
+    import asyncio
+    import emails
+    enviados = []
+
+    async def falso(subject, html_body):
+        enviados.append(subject)
+
+    original, emails.send_admin_notification = emails.send_admin_notification, falso
+    flag = os.environ.get('EMAIL_ENABLED')
+    os.environ['EMAIL_ENABLED'] = 'true'
+    try:
+        base = dict(_PEDIDO_AVISO)
+        e2e = dict(base, order_number='EX-E2E',
+                   customer={'full_name': 'E2E Tarjeta',
+                             'email': 'e2e-no-responder@example.com',
+                             'notes': 'E2E TARJETA — se borra sola'})
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(emails.send_purchase_alert(e2e, 'nuevo'))
+        loop.run_until_complete(emails.send_purchase_alert(e2e, 'pagado'))
+        loop.run_until_complete(emails.send_purchase_alert(base, 'nuevo'))
+    finally:
+        emails.send_admin_notification = original
+        if flag is None:
+            del os.environ['EMAIL_ENABLED']
+        else:
+            os.environ['EMAIL_ENABLED'] = flag
+
+    assert len(enviados) == 1, f'el pedido de prueba mandó correo: {enviados}'
+    assert enviados[0].startswith('Nuevo pedido EX-20260730-9999'), enviados
