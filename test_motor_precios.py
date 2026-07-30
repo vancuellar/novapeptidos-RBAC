@@ -554,3 +554,160 @@ def test_la_foto_sale_siempre_con_su_frescura():
     assert "foto['frescura'] = _frescura_de_la_foto(" in cuerpo
     assert "return doc.get('valor') or {}" not in cuerpo, \
         'volvió a devolverse la foto sin decir de cuándo es'
+
+
+# ---------- El contador sembrado prometía más piezas de las que hay ----------
+#
+# Hallazgo de Codex (2026-07-30). Hay DOS inventarios: `db.products.stock`, un contador
+# que nace sembrado al dar de alta el producto (casi todo el catálogo en 40), y `db.stock`,
+# las piezas reales que el Panel captura y que la ficha del sitio pinta como "en mano".
+# El checkout validaba y apartaba contra el SEMBRADO, y al real solo le restaba DESPUÉS de
+# grabar el pedido: si no alcanzaba, lo dejaba en 0 con una advertencia en la bitácora y la
+# venta salía igual. En vivo, 191 de 193 productos anunciaban 40 con 20 piezas de verdad
+# —Orexin A 10 mg entre ellos—, así que un pedido de 21 pasaba entero.
+
+_DOC_OREXIN = {'id': 'orexin-uuid', 'sku': 'OREXINA-10MG', 'name': 'Orexin A 10 mg',
+               'slug': 'orexin-a-10-mg', 'presentation': '10 mg', 'stock': 40}
+
+
+class _StockLeible(_Stock):
+    """`_Stock` más el `find_one` que necesita la revisión del checkout."""
+
+    async def find_one(self, query, *a, **k):
+        for doc in self.filas:
+            if self._casa(doc, query):
+                return dict(doc)
+        return None
+
+
+def _con_inventarios(filas, productos, corutina):
+    """Corre `corutina` con los DOS inventarios de mentiras: catálogo y piezas reales."""
+    import asyncio
+    import server as _srv
+    stock, prods = _StockLeible(filas), _Productos(productos)
+    original = _srv.db
+    _srv.db = type('DB', (), {'stock': stock, 'products': prods})()
+    try:
+        res = asyncio.new_event_loop().run_until_complete(corutina(_srv))
+    finally:
+        _srv.db = original
+    return res, stock
+
+
+def test_lo_disponible_es_lo_MENOR_entre_el_contador_y_las_piezas_reales():
+    """Orexin A 10 mg: el catálogo decía 40, en la bodega había 20. Mandan las 20."""
+    filas = [{'key': 'fallback-orexin-a::10 mg', 'qty': 20, 'in_hand': False}]
+    hay, _ = _con_inventarios(filas, [dict(_DOC_OREXIN)],
+                              lambda s: s._disponible_de('orexin-uuid', _DOC_OREXIN))
+    assert hay == 20, f'el checkout sigue creyéndole al contador sembrado: {hay}'
+
+
+def test_sin_renglon_de_inventario_real_manda_el_contador_del_catalogo():
+    """"No sé cuántas hay" no es "no hay": un producto al que nadie le capturó inventario
+    no puede quedarse sin venderse. Se avisa en la bitácora y sigue el contador."""
+    hay, _ = _con_inventarios([], [dict(_DOC_OREXIN)],
+                              lambda s: s._disponible_de('orexin-uuid', _DOC_OREXIN))
+    assert hay == 40
+
+
+def test_pedir_21_con_20_piezas_reales_se_RECHAZA():
+    """EL CASO DE CODEX, exacto: Orexin A 10 mg, contador 40, bodega 20, pedido de 21.
+
+    Antes pasaba la validación, se cobraba, y el inventario real quedaba en 0 con una
+    advertencia que nadie lee. Ahora no se aparta ni una pieza."""
+    filas = [{'key': 'fallback-orexin-a::10 mg', 'qty': 20, 'in_hand': False}]
+    doc = dict(_DOC_OREXIN)
+    pedido = {'orexin-uuid': {'total': 21, 'nombre': 'Orexin A 10 mg', 'doc': doc}}
+
+    (hay, (reservado, agotados)), stock = _con_inventarios(
+        filas, [doc],
+        lambda s: _revisar_y_apartar(s, 'orexin-uuid', doc, pedido))
+
+    assert hay == 20, f'la revisión sigue viendo {hay}'
+    assert 21 > hay, 'el pedido de 21 tiene que quedar por encima de lo disponible'
+    assert agotados == ['Orexin A 10 mg'], f'la reserva lo dejó pasar: {agotados}'
+    assert reservado == [], 'apartó piezas de un pedido que no salió'
+    assert stock.filas[0]['qty'] == 20, f'se llevó piezas reales: {stock.filas}'
+
+
+async def _revisar_y_apartar(s, clave, doc, pedido):
+    return await s._disponible_de(clave, doc), await s._reservar_inventario_vivo(pedido)
+
+
+def test_pedir_20_con_20_piezas_reales_SI_pasa_y_baja_el_inventario():
+    """El arreglo no puede volverse un candado que no deja vender lo que sí hay."""
+    filas = [{'key': 'fallback-orexin-a::10 mg', 'qty': 20, 'in_hand': False}]
+    doc = dict(_DOC_OREXIN)
+    pedido = {'orexin-uuid': {'total': 20, 'nombre': 'Orexin A 10 mg', 'doc': doc}}
+
+    (reservado, agotados), stock = _con_inventarios(
+        filas, [doc], lambda s: s._reservar_inventario_vivo(pedido))
+
+    assert not agotados and reservado == [('fallback-orexin-a::10 mg', 20)]
+    assert stock.filas[0]['qty'] == 0, stock.filas
+
+
+def test_dos_pedidos_a_la_vez_no_se_llevan_las_MISMAS_piezas_reales():
+    """El mismo candado de `_reservar_inventario`, ahora sobre el inventario que cuenta:
+    comparar y restar en el mismo paso. Si no, dos clientes ven las mismas 20 piezas."""
+    filas = [{'key': 'fallback-orexin-a::10 mg', 'qty': 20}]
+    doc = dict(_DOC_OREXIN)
+    pedido = {'orexin-uuid': {'total': 20, 'nombre': 'Orexin A 10 mg', 'doc': doc}}
+
+    async def dos(s):
+        return await s._reservar_inventario_vivo(pedido), await s._reservar_inventario_vivo(pedido)
+
+    ((r1, a1), (r2, a2)), stock = _con_inventarios(filas, [doc], dos)
+    assert not a1 and r1, 'el primero debería llevarse las piezas'
+    assert a2 == ['Orexin A 10 mg'], 'el segundo vendió piezas que ya no existían'
+    assert stock.filas[0]['qty'] == 0, stock.filas
+
+
+def test_un_pedido_que_no_sale_devuelve_las_piezas_reales_apartadas():
+    """Piezas apartadas por un pedido que nunca existió son piezas invisibles para todos
+    los demás clientes hasta que alguien las cuente a mano."""
+    filas = [{'key': 'fallback-orexin-a::10 mg', 'qty': 20},
+             {'key': 'fallback-bpc-157::10 mg', 'qty': 1}]
+    a = dict(_DOC_OREXIN)
+    b = {'id': 'bpc-uuid', 'sku': 'BPC-10MG', 'name': 'BPC-157 10 mg',
+         'slug': 'bpc-157-10-mg', 'presentation': '10 mg', 'stock': 40}
+    pedido = {'orexin-uuid': {'total': 5, 'nombre': 'Orexin A 10 mg', 'doc': a},
+              'bpc-uuid': {'total': 4, 'nombre': 'BPC-157 10 mg', 'doc': b}}
+
+    (reservado, agotados), stock = _con_inventarios(
+        filas, [a, b], lambda s: s._reservar_inventario_vivo(pedido))
+
+    assert agotados == ['BPC-157 10 mg'] and reservado == []
+    assert stock.filas[0]['qty'] == 20, f'se quedó con 5 piezas secuestradas: {stock.filas}'
+    assert stock.filas[1]['qty'] == 1
+
+
+def test_el_checkout_valida_y_aparta_contra_el_inventario_REAL():
+    """Candado sobre el código, no sobre un caso: la revisión del checkout no puede
+    volver a leer `d['stock']` a secas, y las piezas reales tienen que apartarse ANTES de
+    grabar el pedido —no restarse después, que es lo que dejaba vender de más."""
+    src = _fuente()
+    ini = src.index('async def create_order(')
+    cuerpo = src[ini:src.index('\nasync def', ini + 10)]
+
+    assert '_disponible_de(' in cuerpo, \
+        'la revisión del checkout volvió al contador sembrado del catálogo'
+    assert "hay = int(d.get('stock') or 0)" not in cuerpo, \
+        'sigue comparando contra el número sembrado, que no cuenta piezas físicas'
+
+    pos_apartar = cuerpo.index('_reservar_inventario_vivo(')
+    pos_grabar = cuerpo.index('db.orders.insert_one(')
+    assert pos_apartar < pos_grabar, \
+        'las piezas reales se tocan DESPUÉS de grabar el pedido: si no alcanzan, ya se vendió'
+    assert '_devolver_reserva_viva(' in cuerpo, \
+        'un pedido que no llega a existir deja piezas reales secuestradas'
+
+
+def test_el_inventario_real_ya_no_se_resta_dos_veces():
+    """Se aparta en la reserva; si además se restara renglón por renglón después de
+    grabar, cada pedido se llevaría el doble de piezas reales."""
+    src = _fuente()
+    ini = src.index('async def create_order(')
+    cuerpo = src[ini:src.index('\nasync def', ini + 10)]
+    assert '_descontar_inventario_vivo(' not in cuerpo, \
+        'el checkout aparta Y descuenta: el inventario real baja al doble'
