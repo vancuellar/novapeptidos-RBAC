@@ -1063,7 +1063,8 @@ async def list_products(
         products.sort(key=lambda p: _texto_ordenable(p.get('name', '')))
         products.sort(key=lambda p: _texto_ordenable(p.get('category', '')),
                       reverse=(sort == 'category_desc'))
-    return products
+    # ⛔ Sin sesión no salen los campos de margen. Ver `vista_publica_de_producto`.
+    return [vista_publica_de_producto(p) for p in products]
 
 
 @api_router.get('/products/{slug}')
@@ -1071,7 +1072,7 @@ async def get_product(slug: str):
     product = await db.products.find_one({'slug': slug}, {'_id': 0})
     if not product or product.get('hidden'):
         raise HTTPException(status_code=404, detail='Producto no encontrado')
-    return product
+    return vista_publica_de_producto(product)
 
 
 # ----------------- Admin: Products -----------------
@@ -1166,6 +1167,50 @@ def tope_de_descuento(doc):
     except (TypeError, ValueError):
         cap = COMMISSION_CAP
     return max(0.0, min(COMMISSION_CAP, cap))
+
+
+# ⛔ LO QUE NUNCA SALE DEL CATÁLOGO PÚBLICO (Christián, 2026-07-30).
+#
+# `commission_cap` y `distributor_eligible` viajaban en /api/products SIN sesión y
+# en el catálogo de respaldo que baja cualquier visitante. No son el costo, pero
+# dicen cuánto margen aguanta cada producto y cuáles no dejan 5x — información de
+# la casa, publicada a cualquiera que abriera la consola del navegador.
+#
+# Se quedan en la base y en /admin/products. El cotizador del distribuidor los
+# recibe recortados por su ruta autenticada; el checkout los calcula en el
+# servidor y sigue siendo la verdad final.
+CAMPOS_PRIVADOS_DE_PRODUCTO = {'commission_cap', 'distributor_eligible'}
+
+# Techo del descuento que puede recibir un CLIENTE por la promo de la casa (15% por
+# volumen). Lo que el catálogo público publica se recorta aquí: si un producto
+# aguanta 25% o 40%, afuera se ve "15%" y nadie se entera de la diferencia.
+TECHO_DESCUENTO_CLIENTE = 0.15
+
+
+def vista_publica_de_producto(doc):
+    """El producto tal como lo ve alguien SIN sesión.
+
+    Dos cosas a la vez:
+      · quita los campos de margen (`CAMPOS_PRIVADOS_DE_PRODUCTO`);
+      · pone en su lugar lo ÚNICO que el carrito anónimo necesita para no mentirle
+        al cliente sobre su total:
+          - `descuentable: False` en lo que no lleva descuento (insumos, HGH neto,
+            lo que no participa del canal). Eso el cliente lo ve igual en su
+            carrito, así que no revela nada que no supiera;
+          - `max_descuento_cliente` SÓLO cuando el tope real es menor que el techo
+            de cliente. Va recortado a ese techo, así que jamás delata cuánto
+            aguanta de verdad un producto — sólo que ahí el descuento llega hasta
+            cierto punto.
+
+    Con el catálogo de hoy ningún producto descuentable cae debajo del 15%, así
+    que en la práctica sólo sale la bandera. El campo existe para el día que uno sí
+    caiga: sin él, el carrito prometería un descuento que la caja no da."""
+    fuera = {k: v for k, v in (doc or {}).items() if k not in CAMPOS_PRIVADOS_DE_PRODUCTO}
+    tope = tope_de_descuento(doc)
+    fuera['descuentable'] = tope > 0
+    if 0 < tope < TECHO_DESCUENTO_CLIENTE:
+        fuera['max_descuento_cliente'] = round(tope, 4)
+    return fuera
 
 
 # ENVIO (Christian, 2026-07-26). Mandar un paquete dentro de Mexico cuesta ~$250.
@@ -4456,6 +4501,11 @@ async def distributor_sales(dist=Depends(get_current_distributor)):
         'pagado': esta_pagado(o),
         'customer_name': ((o.get('customer') or {}).get('full_name') or '').split(' ')[0],
         'client_id': _id_de_cliente(o),
+        # El envío viaja también aquí: desde Ventas se pone la guía sin cambiarse de
+        # pestaña, y el botón necesita saber si dice "poner" o "cambiar".
+        'carrier': o.get('carrier', ''),
+        'tracking_number': o.get('tracking_number', ''),
+        'tracking_url': o.get('tracking_url', ''),
         'total': o.get('total', 0),
         'commission': _my_amount(o, dist['id']),
         'items_count': sum(int(it.get('quantity', 0) or 0) for it in o.get('items', [])),
@@ -4518,6 +4568,12 @@ def _detalle_de_pedido(o, dist_id=None):
     c = o.get('customer') or {}
     envio = float(o.get('shipping', 0) or 0)
     return {
+        # El id va porque la hoja de "poner guía" del ADMIN guarda por id
+        # (/admin/orders/{id}/shipping) y esa hoja se abre desde dentro de esta ficha.
+        # Sin el id habría que ir a buscar el pedido a la lista para poder capturarla,
+        # que es justo lo que se quitó. Al distribuidor no le sirve —él guarda por número
+        # de pedido— pero tampoco le dice nada que no sepa: es la llave de un pedido suyo.
+        'id': o.get('id'),
         'order_number': o.get('order_number'),
         'created_at': o.get('created_at'),
         'status': o.get('status', 'pendiente'),
@@ -6814,6 +6870,11 @@ def _fila_de_pedido_de_ficha(o, dist_id=None):
         'pagado': esta_pagado(o),
         'payment_method': o.get('payment_method'),
         'items_count': sum(int(it.get('quantity', 0) or 0) for it in (o.get('items') or [])),
+        # El envío viaja en el renglón para que la hoja de "poner guía" se abra YA LLENA
+        # con lo que hubiera, y para que el botón sepa si dice "poner" o "cambiar".
+        'carrier': o.get('carrier', ''),
+        'tracking_number': o.get('tracking_number', ''),
+        'tracking_url': o.get('tracking_url', ''),
     }
     if dist_id:
         fila['my_commission'] = _my_amount(o, dist_id)
