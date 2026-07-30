@@ -413,6 +413,18 @@ class OrderShippingUpdate(BaseModel):
     status: Optional[str] = None
 
 
+class DistributorShippingUpdate(BaseModel):
+    """Lo ÚNICO que un distribuidor puede capturar de un pedido suyo: la guía.
+
+    ⛔ NO HEREDA de OrderShippingUpdate a propósito. Aquí no existen `status` ni
+    ningún campo de dinero, así que aunque alguien mande `status` o `total` en el
+    cuerpo, el modelo ni siquiera los tiene dónde recibir: se caen solos.
+    """
+    carrier: Optional[str] = None
+    tracking_number: Optional[str] = None
+    tracking_url: Optional[str] = None
+
+
 # ---------- Distributors ----------
 class DistributorCreate(BaseModel):
     name: str

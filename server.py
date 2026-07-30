@@ -19,6 +19,7 @@ from models import (
     ProfileUpdate, ChangePasswordInput,
     ProductCreate, ProductUpdate, Product, Category,
     OrderCreate, Order, OrderItem, CustomerInfo, OrderStatusUpdate, OrderShippingUpdate,
+    DistributorShippingUpdate,
     ShippingQuoteRequest, TrackEvent, RemitenteUpdate, CajasUpdate, ComprarGuiaRequest,
     ProtocolInput, ProtocolUpdate, PerfilSalud, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput,
@@ -3186,12 +3187,20 @@ def build_tracking_url(carrier: str, number: str) -> str:
     return tpl.format(n=number.strip()) if tpl and number else ''
 
 
-@api_router.put('/admin/orders/{order_id}/shipping')
-async def update_order_shipping(order_id: str, payload: OrderShippingUpdate, admin=Depends(get_current_admin)):
-    """Captura guía y transportista. Si no dan URL, la armamos con la del transportista."""
-    order = await db.orders.find_one({'id': order_id}, {'_id': 0})
-    if not order:
-        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+async def _guardar_envio(order: dict, payload: OrderShippingUpdate, *,
+                         permitir_status: bool = True) -> dict:
+    """Escribe guía/paquetería en un pedido y avisa al cliente si la guía es nueva.
+
+    ⛔ ES EL ÚNICO LUGAR QUE ESCRIBE ENVÍO. Lo comparten el admin y el distribuidor
+    a propósito: el candado de QUIÉN puede tocar CUÁL pedido vive en cada endpoint,
+    pero lo que se guarda y el correo que sale son exactamente lo mismo. Si un día
+    se arregla algo aquí, queda arreglado para los dos.
+
+    `permitir_status=False` (el distribuidor) ignora el `status` que venga en el
+    cuerpo: él captura la guía que ya tiene, no mueve el pedido a mano. El paso
+    automático a 'enviado' sí ocurre, porque capturar una guía ES que ya salió.
+    """
+    order_id = order['id']
     update = {}
     for field in ('carrier', 'tracking_number', 'tracking_url', 'eta'):
         value = getattr(payload, field)
@@ -3203,14 +3212,15 @@ async def update_order_shipping(order_id: str, payload: OrderShippingUpdate, adm
         auto = build_tracking_url(carrier, number)
         if auto:
             update['tracking_url'] = auto
-    if payload.status:
-        update['status'] = payload.status
-        if payload.status == 'enviado' and not order.get('shipped_at'):
+    status_pedido = payload.status if permitir_status else None
+    if status_pedido:
+        update['status'] = status_pedido
+        if status_pedido == 'enviado' and not order.get('shipped_at'):
             update['shipped_at'] = now_iso()
-        elif payload.status == 'entregado' and not order.get('delivered_at'):
+        elif status_pedido == 'entregado' and not order.get('delivered_at'):
             update['delivered_at'] = now_iso()
     # Capturar una guía implica que ya salió: si seguía pendiente, pasa a enviado.
-    if number and not payload.status and order.get('status') in ('pendiente', 'confirmado'):
+    if number and not status_pedido and order.get('status') in ('pendiente', 'confirmado'):
         update['status'] = 'enviado'
         update.setdefault('shipped_at', now_iso())
     if update:
@@ -3221,9 +3231,20 @@ async def update_order_shipping(order_id: str, payload: OrderShippingUpdate, adm
     if number and not (order.get('tracking_number') or ''):
         await avisar_del_envio(result)
     if result.get('status') in loyalty.PAID_STATUSES:
+        # Los puntos tienen su propio candado de cobro dentro (`award_order_points`):
+        # mover la mercancía no los libera si el pedido sigue sin pagarse.
         await award_order_points(result)
         result = await db.orders.find_one({'id': order_id}, {'_id': 0})
     return result
+
+
+@api_router.put('/admin/orders/{order_id}/shipping')
+async def update_order_shipping(order_id: str, payload: OrderShippingUpdate, admin=Depends(get_current_admin)):
+    """Captura guía y transportista. Si no dan URL, la armamos con la del transportista."""
+    order = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    return await _guardar_envio(order, payload)
 
 
 @api_router.get('/admin/stats')
@@ -4369,6 +4390,13 @@ async def distributor_orders(dist=Depends(get_current_distributor)):
             'discount_rate': o.get('discount_rate', 0),
             'commission': o.get('commission', 0),
             'carrier': o.get('carrier', ''),
+            # ⛔ LA GUÍA VIAJA EN LA LISTA. Iba sólo la paquetería, así que la columna
+            # "Envío" del panel leía un `tracking_number` que nunca llegaba: TODOS los
+            # pedidos se veían "Sin guía todavía", aun los que ya iban en camino con su
+            # número guardado. Y sin este dato el botón no sabe si toca "Poner Guía" o
+            # "Cambiar Guía" (Christián, 2026-07-30).
+            'tracking_number': o.get('tracking_number', ''),
+            'tracking_url': o.get('tracking_url', ''),
             'shipped_at': o.get('shipped_at'),
             'delivered_at': o.get('delivered_at'),
             'eta': o.get('eta', ''),
@@ -4445,6 +4473,42 @@ async def distributor_order_detail(order_number: str, dist=Depends(get_current_d
     if o.get('referred_by') != dist['id']:
         raise HTTPException(status_code=403, detail='Ese pedido no es tuyo')
     return _detalle_de_pedido(o, dist['id'])
+
+
+@api_router.put('/distributor/orders/{order_number}/shipping')
+async def distributor_order_shipping(order_number: str, payload: DistributorShippingUpdate,
+                                     dist=Depends(get_current_distributor)):
+    """El distribuidor captura la guía de un pedido SUYO. De otro, 403.
+
+    Hasta hoy sólo el admin podía teclear el número de guía, así que cada paquete que
+    despachaba un distribuidor tenía que pasar por Christián para que el cliente se
+    enterara. María atiende a sus clientes: que capture ella la guía que ya tiene en
+    la mano (Christián, 2026-07-30).
+
+    ⛔ TRES CANDADOS, TODOS EN EL SERVIDOR:
+      1. `get_current_distributor` — un cliente normal no entra (403).
+      2. `referred_by == dist['id']` — el pedido de otro distribuidor NO existe para
+         él. Esconder el formulario en la pantalla no sirve de nada: el número de
+         pedido ajeno se teclea en la barra de direcciones.
+      3. `deny_view_as` — el "ver como" del admin es SOLO LECTURA; espiar el panel de
+         alguien no puede convertirse en escribirle en sus pedidos.
+
+    Y sólo envío: el modelo `DistributorShippingUpdate` no tiene `status`, ni precios,
+    ni pagos, ni forma de borrar nada. La cotización y COMPRA de guías por Skydropx
+    —dinero de la casa— se queda en el admin: aquí sólo se captura la guía que ya existe.
+    """
+    deny_view_as(dist)
+    o = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
+    if not o:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    if o.get('referred_by') != dist['id']:
+        raise HTTPException(status_code=403, detail='Ese pedido no es tuyo')
+    envio = OrderShippingUpdate(carrier=payload.carrier,
+                                tracking_number=payload.tracking_number,
+                                tracking_url=payload.tracking_url)
+    # El mismo camino del admin (mismo correo de rastreo al cliente), pero sin `status`.
+    resultado = await _guardar_envio(o, envio, permitir_status=False)
+    return _detalle_de_pedido(resultado, dist['id'])
 
 
 @api_router.get('/admin/orders/{order_number}/detalle')
