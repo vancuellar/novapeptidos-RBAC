@@ -116,28 +116,29 @@ def test_solo_acepta_tres_decisiones():
 
 # ---------- El pedido: renglones repetidos del mismo producto ----------
 
-def test_el_inventario_se_valida_SUMANDO_los_renglones_del_mismo_producto():
+def test_el_inventario_se_reparte_SUMANDO_los_renglones_del_mismo_producto():
     """Pedir 40 dos veces son 80, no 40 y 40.
 
-    El carrito puede mandar el MISMO producto en varios renglones. Revisando renglón por
-    renglón cada uno pasa por su cuenta y el pedido se lleva el doble —o el triple— de lo
-    que hay: el inventario queda en negativo y la pérdida no tiene tope, porque siempre se
-    puede añadir otro renglón. Lo encontró el barrido adversarial del 28-jul, y es el
-    MISMO hueco que se creyó cerrado el 25-jul: entonces se tapó el "pediste 99,999", no
-    el "pediste 40 dos veces"."""
+    El carrito puede mandar el MISMO producto en varios renglones. Sin agrupar, cada uno
+    se reparte por su cuenta contra el MISMO inventario: el desglose de "cuántas salen ya
+    y cuántas hay que mandar pedir" sale mal por partida doble, y el Panel manda pedir de
+    menos. (Cuando el inventario todavía rechazaba pedidos, este mismo hueco dejaba salir
+    el doble de piezas de las que había — barrido adversarial del 28-jul.)"""
     import server as _srv
     pflags = _catalogo(stock=40)
     agrupado = _srv._agrupar_por_producto(
         [_Item('OREXINA-10MG', 'Orexin A 10 mg', 40),
          _Item('OREXINA-10MG', 'Orexin A 10 mg', 40)], pflags)
     assert len(agrupado) == 1 and list(agrupado.values())[0]['total'] == 80, agrupado
-    # y el checkout compara contra ESE total agrupado, no renglón por renglón
+    # y el checkout reparte contra ESE total agrupado, no renglón por renglón
     src = _fuente()
-    m = re.search(r"faltantes = \[\].*?status_code=409", src, re.S)
-    assert m, 'no encontré la validación de inventario del checkout'
-    assert '_agrupar_por_producto(' in m.group(0), (
-        'el checkout volvió a validar renglón por renglón: dos renglones del mismo '
-        'producto se llevan el doble del inventario')
+    ini = src.index('async def create_order(')
+    cuerpo = src[ini:src.index('\nasync def', ini + 10)]
+    pos_agrupa = cuerpo.index('_agrupar_por_producto(')
+    pos_aparta = cuerpo.index('_reservar_inventario(')
+    assert pos_agrupa < pos_aparta, (
+        'el checkout aparta ANTES de agrupar: dos renglones del mismo producto se '
+        'reparten cada uno contra el inventario completo')
 
 
 def test_el_descuento_de_inventario_avisa_cuando_no_encuentra_el_renglon():
@@ -244,6 +245,12 @@ class _Productos:
                 return False
         return True
 
+    async def find_one(self, query, *a, **k):
+        for doc in self.docs:
+            if self._casa(doc, query):
+                return dict(doc)
+        return None
+
     async def update_one(self, query, cambio):
         for doc in self.docs:
             if self._casa(doc, query):
@@ -259,20 +266,25 @@ def _con_db_falsa(docs, corutina):
     import server as _srv
     productos = _Productos(docs)
     original = _srv.db
-    _srv.db = type('DB', (), {'products': productos})()
+    # La reserva mira los DOS inventarios. Sin renglón de inventario vivo manda el
+    # contador del catálogo, que es justo lo que estas pruebas ejercitan.
+    _srv.db = type('DB', (), {'products': productos, 'stock': _StockLeible([])})()
     try:
         return asyncio.new_event_loop().run_until_complete(corutina(_srv))
     finally:
         _srv.db = original
 
 
-def test_dos_pedidos_a_la_vez_no_se_llevan_la_misma_ultima_pieza():
-    """La carrera entre revisar y descontar.
+def test_dos_pedidos_a_la_vez_no_dejan_el_inventario_en_NEGATIVO():
+    """La carrera entre mirar y descontar.
 
-    El stock se miraba arriba y se restaba mucho después, y entre las dos cosas cabía
-    otro pedido entero: dos clientes veían la última pieza, los dos pasaban la revisión y
-    el inventario terminaba en −1. No hace falta mala fe, basta con dos personas
-    comprando a la vez — que es justo lo que pasa cuando un anuncio pega."""
+    El stock se miraba arriba y se restaba mucho después, y entre las dos cosas cabía otro
+    pedido entero: dos clientes veían la última pieza, los dos la tomaban y el inventario
+    terminaba en −1. No hace falta mala fe, basta con dos personas comprando a la vez.
+
+    Con el envío partido el segundo cliente YA NO SE RECHAZA —ninguna venta se bloquea por
+    inventario— pero su pieza sale como POR SURTIR, no de una bodega que no la tiene. Un
+    inventario en negativo no es un dato: es una mentira con signo."""
     doc = {'id': 'uuid-1', 'sku': 'SKU-1', 'name': 'Orexin A', 'stock': 1}
 
     async def dos_pedidos(_srv):
@@ -281,43 +293,50 @@ def test_dos_pedidos_a_la_vez_no_se_llevan_la_misma_ultima_pieza():
         segundo = await _srv._reservar_inventario(pedido)
         return primero, segundo
 
-    (res1, ago1), (res2, ago2) = _con_db_falsa([doc], dos_pedidos)
-    assert not ago1 and res1 == [('uuid-1', 1)], 'el primero debería llevarse la pieza'
-    assert ago2 == ['Orexin A'], 'el segundo se llevó una pieza que ya no existía'
+    (res1, _v1, falta1), (res2, _v2, falta2) = _con_db_falsa([doc], dos_pedidos)
+    assert res1 == [('uuid-1', 1)] and not falta1, 'el primero debería llevarse la pieza'
+    assert res2 == [], 'el segundo se llevó una pieza que ya no existía'
+    assert falta2 == [{'product_id': 'uuid-1', 'name': 'Orexin A', 'pedidas': 1,
+                       'en_mano': 0, 'por_surtir': 1}], falta2
     assert doc['stock'] == 0, f'el inventario quedó en {doc["stock"]}'
 
 
-def test_si_un_renglon_no_alcanza_se_devuelve_lo_ya_apartado():
-    """Un pedido que no salió no puede dejar piezas secuestradas: quedarían invisibles
-    para todos los demás clientes hasta que alguien contara a mano."""
-    a = {'id': 'uuid-A', 'sku': 'A', 'name': 'Sí hay', 'stock': 10}
-    b = {'id': 'uuid-B', 'sku': 'B', 'name': 'No hay', 'stock': 1}
+def test_lo_que_NO_alcanza_se_manda_pedir_y_lo_demas_sale_igual():
+    """⛔ LA REGLA MADRE (Christián, 2026-07-30): ninguna venta se bloquea por inventario.
+    «Si piden 40 y solo tengo 20, se mandan los 20 y se mandan pedir los otros 20.»
 
-    async def pedido_imposible(_srv):
+    Aquí llegó a haber un rechazo: si UN renglón no alcanzaba, se devolvía todo lo ya
+    apartado y el pedido moría. Eso tiraba la venta entera por una pieza. Ahora el renglón
+    que sí hay sale completo, el que no alcanza sale partido, y nada se secuestra."""
+    a = {'id': 'uuid-A', 'sku': 'A', 'name': 'Sí hay', 'stock': 10}
+    b = {'id': 'uuid-B', 'sku': 'B', 'name': 'Solo hay una', 'stock': 1}
+
+    async def pedido(_srv):
         return await _srv._reservar_inventario({
             'uuid-A': {'total': 5, 'nombre': 'Sí hay', 'doc': a},
-            'uuid-B': {'total': 4, 'nombre': 'No hay', 'doc': b},
+            'uuid-B': {'total': 4, 'nombre': 'Solo hay una', 'doc': b},
         })
 
-    reservado, agotados = _con_db_falsa([a, b], pedido_imposible)
-    assert agotados == ['No hay']
-    assert reservado == [], 'dice que apartó algo de un pedido que no salió'
-    assert a['stock'] == 10, f'se quedó con 5 piezas apartadas: {a["stock"]}'
-    assert b['stock'] == 1
+    reservado, _vivo, por_surtir = _con_db_falsa([a, b], pedido)
+    assert ('uuid-A', 5) in reservado, 'el renglón completo se cayó por culpa del otro'
+    assert ('uuid-B', 1) in reservado, 'no se llevó la única pieza que sí había'
+    assert a['stock'] == 5 and b['stock'] == 0, (a['stock'], b['stock'])
+    assert por_surtir == [{'product_id': 'uuid-B', 'name': 'Solo hay una', 'pedidas': 4,
+                           'en_mano': 1, 'por_surtir': 3}], por_surtir
 
 
 def test_la_reserva_encuentra_el_producto_tanto_por_id_como_por_sku():
     """La llave con la que se agrupa es el `id`, pero el catálogo de respaldo guarda los
-    productos por SKU. Si la reserva sólo buscara por una, no restaría nada y devolvería
-    "no hay" en un producto que sí hay."""
+    productos por SKU. Si la reserva sólo buscara por una, no restaría nada y el pedido
+    saldría entero "por surtir" con la bodega llena."""
     doc = {'sku': 'SOLO-SKU', 'name': 'Sin UUID', 'stock': 3}
 
     async def reservar(_srv):
         return await _srv._reservar_inventario(
             {'SOLO-SKU': {'total': 2, 'nombre': 'Sin UUID', 'doc': doc}})
 
-    reservado, agotados = _con_db_falsa([doc], reservar)
-    assert not agotados and reservado == [('SOLO-SKU', 2)]
+    reservado, _vivo, por_surtir = _con_db_falsa([doc], reservar)
+    assert reservado == [('SOLO-SKU', 2)] and not por_surtir
     assert doc['stock'] == 1
 
 
@@ -610,97 +629,157 @@ def test_sin_renglon_de_inventario_real_manda_el_contador_del_catalogo():
     assert hay == 40
 
 
-def test_pedir_21_con_20_piezas_reales_se_RECHAZA():
-    """EL CASO DE CODEX, exacto: Orexin A 10 mg, contador 40, bodega 20, pedido de 21.
+def test_pedir_21_con_20_piezas_reales_se_ACEPTA_PARTIDO():
+    """EL CASO DE CODEX, ahora con la regla de la casa: Orexin A 10 mg, contador 40,
+    bodega 20, pedido de 21.
 
-    Antes pasaba la validación, se cobraba, y el inventario real quedaba en 0 con una
-    advertencia que nadie lee. Ahora no se aparta ni una pieza."""
+    Este caso ya vivió los dos extremos. Primero pasaba entero y se cobraban 21 piezas de
+    las 20 que hay, sin decírselo a nadie. Después se puso un rechazo duro — y eso tiraba
+    la venta, que es peor. Christián (2026-07-30): «se mandan los 20 y se mandan pedir los
+    otros 20; aquí lo principal es vender». Salen 20 YA y 1 queda por surtir."""
     filas = [{'key': 'fallback-orexin-a::10 mg', 'qty': 20, 'in_hand': False}]
     doc = dict(_DOC_OREXIN)
     pedido = {'orexin-uuid': {'total': 21, 'nombre': 'Orexin A 10 mg', 'doc': doc}}
 
-    (hay, (reservado, agotados)), stock = _con_inventarios(
-        filas, [doc],
-        lambda s: _revisar_y_apartar(s, 'orexin-uuid', doc, pedido))
+    (hay, (reservado, vivo, por_surtir)), stock = _con_inventarios(
+        filas, [doc], lambda s: _mirar_y_apartar(s, 'orexin-uuid', doc, pedido))
 
-    assert hay == 20, f'la revisión sigue viendo {hay}'
-    assert 21 > hay, 'el pedido de 21 tiene que quedar por encima de lo disponible'
-    assert agotados == ['Orexin A 10 mg'], f'la reserva lo dejó pasar: {agotados}'
-    assert reservado == [], 'apartó piezas de un pedido que no salió'
-    assert stock.filas[0]['qty'] == 20, f'se llevó piezas reales: {stock.filas}'
-
-
-async def _revisar_y_apartar(s, clave, doc, pedido):
-    return await s._disponible_de(clave, doc), await s._reservar_inventario_vivo(pedido)
+    assert hay == 20, f'lo que hay en mano se leyó como {hay}'
+    assert reservado == [('orexin-uuid', 20)], f'no apartó las 20 que sí hay: {reservado}'
+    assert vivo == [('fallback-orexin-a::10 mg', 20)], vivo
+    assert por_surtir == [{'product_id': 'orexin-uuid', 'name': 'Orexin A 10 mg',
+                           'pedidas': 21, 'en_mano': 20, 'por_surtir': 1}], por_surtir
+    assert stock.filas[0]['qty'] == 0, f'la bodega no quedó en cero: {stock.filas}'
+    assert doc['stock'] == 20, f'el contador bajó por otro número: {doc["stock"]}'
 
 
-def test_pedir_20_con_20_piezas_reales_SI_pasa_y_baja_el_inventario():
-    """El arreglo no puede volverse un candado que no deja vender lo que sí hay."""
+async def _mirar_y_apartar(s, clave, doc, pedido):
+    return await s._disponible_de(clave, doc), await s._reservar_inventario(pedido)
+
+
+def test_pedir_20_con_20_piezas_reales_sale_COMPLETO_y_sin_por_surtir():
+    """Cuando alcanza, no hay nada que mandar pedir y el cliente no ve ningún aviso."""
     filas = [{'key': 'fallback-orexin-a::10 mg', 'qty': 20, 'in_hand': False}]
     doc = dict(_DOC_OREXIN)
     pedido = {'orexin-uuid': {'total': 20, 'nombre': 'Orexin A 10 mg', 'doc': doc}}
 
-    (reservado, agotados), stock = _con_inventarios(
-        filas, [doc], lambda s: s._reservar_inventario_vivo(pedido))
+    (reservado, vivo, por_surtir), stock = _con_inventarios(
+        filas, [doc], lambda s: s._reservar_inventario(pedido))
 
-    assert not agotados and reservado == [('fallback-orexin-a::10 mg', 20)]
+    assert not por_surtir, por_surtir
+    assert reservado == [('orexin-uuid', 20)] and vivo == [('fallback-orexin-a::10 mg', 20)]
     assert stock.filas[0]['qty'] == 0, stock.filas
 
 
+def test_un_producto_en_CERO_se_vende_entero_sobre_pedido():
+    """Retatrutida 120 mg y Vitamina D3 estaban en 0 y no se podían comprar. Con la regla
+    madre eso no puede pasar: se vende completo, todo por surtir, y el cliente lo sabe
+    antes de pagar."""
+    filas = [{'key': 'fallback-orexin-a::10 mg', 'qty': 0, 'in_hand': False}]
+    doc = dict(_DOC_OREXIN, stock=0)
+    pedido = {'orexin-uuid': {'total': 3, 'nombre': 'Orexin A 10 mg', 'doc': doc}}
+
+    (reservado, vivo, por_surtir), stock = _con_inventarios(
+        filas, [doc], lambda s: s._reservar_inventario(pedido))
+
+    assert reservado == [] and vivo == []
+    assert por_surtir == [{'product_id': 'orexin-uuid', 'name': 'Orexin A 10 mg',
+                           'pedidas': 3, 'en_mano': 0, 'por_surtir': 3}], por_surtir
+    assert stock.filas[0]['qty'] == 0, 'dejó la bodega en negativo'
+    assert doc['stock'] == 0
+
+
+def test_los_dos_inventarios_bajan_SIEMPRE_por_el_MISMO_numero():
+    """Si el contador del catálogo tiene menos que la bodega, manda el chico y a la bodega
+    se le devuelve la diferencia. Cuando cada lado bajaba por su cuenta, cada ciclo de
+    pedido y cancelación los desbalanceaba — Orexin A quedó en 43 con 40 (2026-07-27)."""
+    filas = [{'key': 'fallback-orexin-a::10 mg', 'qty': 20, 'in_hand': False}]
+    doc = dict(_DOC_OREXIN, stock=5)          # el catálogo dice 5 y la bodega 20
+    pedido = {'orexin-uuid': {'total': 10, 'nombre': 'Orexin A 10 mg', 'doc': doc}}
+
+    (reservado, vivo, por_surtir), stock = _con_inventarios(
+        filas, [doc], lambda s: s._reservar_inventario(pedido))
+
+    assert reservado == [('orexin-uuid', 5)] and vivo == [('fallback-orexin-a::10 mg', 5)]
+    assert doc['stock'] == 0
+    assert stock.filas[0]['qty'] == 15, f'los dos no bajaron por el mismo número: {stock.filas}'
+    assert por_surtir[0]['en_mano'] == 5 and por_surtir[0]['por_surtir'] == 5
+
+
 def test_dos_pedidos_a_la_vez_no_se_llevan_las_MISMAS_piezas_reales():
-    """El mismo candado de `_reservar_inventario`, ahora sobre el inventario que cuenta:
-    comparar y restar en el mismo paso. Si no, dos clientes ven las mismas 20 piezas."""
+    """Mirar y restar en el mismo paso. Si no, dos clientes se llevan las mismas 20 piezas
+    y la bodega termina en negativo. El segundo vende igual: lo suyo va por surtir."""
     filas = [{'key': 'fallback-orexin-a::10 mg', 'qty': 20}]
     doc = dict(_DOC_OREXIN)
     pedido = {'orexin-uuid': {'total': 20, 'nombre': 'Orexin A 10 mg', 'doc': doc}}
 
     async def dos(s):
-        return await s._reservar_inventario_vivo(pedido), await s._reservar_inventario_vivo(pedido)
+        return await s._reservar_inventario(pedido), await s._reservar_inventario(pedido)
 
-    ((r1, a1), (r2, a2)), stock = _con_inventarios(filas, [doc], dos)
-    assert not a1 and r1, 'el primero debería llevarse las piezas'
-    assert a2 == ['Orexin A 10 mg'], 'el segundo vendió piezas que ya no existían'
+    ((r1, v1, f1), (r2, v2, f2)), stock = _con_inventarios(filas, [doc], dos)
+    assert r1 and v1 and not f1, 'el primero debería llevarse las piezas'
+    assert r2 == [] and v2 == [], 'el segundo se llevó piezas que ya no existían'
+    assert f2 == [{'product_id': 'orexin-uuid', 'name': 'Orexin A 10 mg', 'pedidas': 20,
+                   'en_mano': 0, 'por_surtir': 20}], f2
     assert stock.filas[0]['qty'] == 0, stock.filas
 
 
-def test_un_pedido_que_no_sale_devuelve_las_piezas_reales_apartadas():
-    """Piezas apartadas por un pedido que nunca existió son piezas invisibles para todos
-    los demás clientes hasta que alguien las cuente a mano."""
-    filas = [{'key': 'fallback-orexin-a::10 mg', 'qty': 20},
-             {'key': 'fallback-bpc-157::10 mg', 'qty': 1}]
-    a = dict(_DOC_OREXIN)
-    b = {'id': 'bpc-uuid', 'sku': 'BPC-10MG', 'name': 'BPC-157 10 mg',
-         'slug': 'bpc-157-10-mg', 'presentation': '10 mg', 'stock': 40}
-    pedido = {'orexin-uuid': {'total': 5, 'nombre': 'Orexin A 10 mg', 'doc': a},
-              'bpc-uuid': {'total': 4, 'nombre': 'BPC-157 10 mg', 'doc': b}}
-
-    (reservado, agotados), stock = _con_inventarios(
-        filas, [a, b], lambda s: s._reservar_inventario_vivo(pedido))
-
-    assert agotados == ['BPC-157 10 mg'] and reservado == []
-    assert stock.filas[0]['qty'] == 20, f'se quedó con 5 piezas secuestradas: {stock.filas}'
-    assert stock.filas[1]['qty'] == 1
+def test_cancelar_devuelve_LO_APARTADO_y_no_lo_pedido():
+    """⛔ Con el envío partido, pedido y apartado dejaron de ser lo mismo. Un pedido de 40
+    con 20 en bodega solo se llevó 20; devolver 40 al cancelar le REGALA 20 piezas al
+    inventario. Es la misma asimetría que dejó Orexin A en 43 cuando tenía 40."""
+    import server as _srv
+    orden = {'id': 'o-1', 'stock_taken': {'orexin-uuid': 20},
+             'items': [{'product_id': 'orexin-uuid', 'quantity': 40}]}
+    assert _srv._piezas_a_devolver(orden) == {'orexin-uuid': 20}
 
 
-def test_el_checkout_valida_y_aparta_contra_el_inventario_REAL():
-    """Candado sobre el código, no sobre un caso: la revisión del checkout no puede
-    volver a leer `d['stock']` a secas, y las piezas reales tienen que apartarse ANTES de
-    grabar el pedido —no restarse después, que es lo que dejaba vender de más."""
+def test_un_pedido_viejo_sin_stock_taken_se_devuelve_por_cantidad():
+    """Los pedidos anteriores al envío partido se llevaban justo lo que pedían: devolverlos
+    por cantidad es exactamente lo que hacían, y no puede romperse al leerlos hoy."""
+    import server as _srv
+    orden = {'id': 'o-viejo',
+             'items': [{'product_id': 'orexin-uuid', 'quantity': 3},
+                       {'product_id': 'orexin-uuid', 'quantity': 2}]}
+    assert _srv._piezas_a_devolver(orden) == {'orexin-uuid': 5}
+
+
+def test_el_checkout_no_rechaza_por_inventario_y_marca_lo_que_falta():
+    """Candado sobre el código: la regla madre no puede volver a invertirse sin que esta
+    prueba truene. El checkout no puede tener un 409 por inventario, tiene que apartar
+    ANTES de grabar, y tiene que dejar el desglose en el pedido para el cliente y el
+    Panel."""
     src = _fuente()
     ini = src.index('async def create_order(')
     cuerpo = src[ini:src.index('\nasync def', ini + 10)]
 
-    assert '_disponible_de(' in cuerpo, \
-        'la revisión del checkout volvió al contador sembrado del catálogo'
+    for prohibido in ('No tenemos suficiente de', 'Se agotó mientras comprabas'):
+        assert prohibido not in cuerpo, (
+            f'volvió el rechazo por inventario ({prohibido!r}): ninguna venta se bloquea '
+            f'por falta de piezas — se parte y se manda pedir')
     assert "hay = int(d.get('stock') or 0)" not in cuerpo, \
-        'sigue comparando contra el número sembrado, que no cuenta piezas físicas'
+        'volvió a leer el contador sembrado a secas'
 
-    pos_apartar = cuerpo.index('_reservar_inventario_vivo(')
+    pos_apartar = cuerpo.index('_reservar_inventario(')
     pos_grabar = cuerpo.index('db.orders.insert_one(')
     assert pos_apartar < pos_grabar, \
-        'las piezas reales se tocan DESPUÉS de grabar el pedido: si no alcanzan, ya se vendió'
-    assert '_devolver_reserva_viva(' in cuerpo, \
-        'un pedido que no llega a existir deja piezas reales secuestradas'
+        'aparta DESPUÉS de grabar: un fallo en medio deja el pedido sin piezas apartadas'
+    for campo in ('order.backorder =', 'order.backorder_items =', 'order.stock_taken ='):
+        assert campo in cuerpo, f'el pedido no guarda {campo!r}'
+
+
+def test_el_aviso_de_sobre_pedido_viaja_en_la_respuesta():
+    """El sitio pinta el aviso con lo que devuelve el checkout. Si estos campos no salen
+    del modelo, el cliente paga sin enterarse de que su pedido llega en dos entregas."""
+    from models import Order
+    campos = Order.model_fields
+    assert 'backorder' in campos and 'backorder_items' in campos, sorted(campos)
+    assert campos['backorder'].default is False
+    src = _fuente()
+    ini = src.index('async def create_order(')
+    cuerpo = src[ini:src.index('\nasync def', ini + 10)]
+    assert 'result = clean(order.model_dump())' in cuerpo, (
+        'la respuesta ya no sale del pedido completo: el aviso no llegaría al navegador')
 
 
 def test_el_inventario_real_ya_no_se_resta_dos_veces():
@@ -711,3 +790,45 @@ def test_el_inventario_real_ya_no_se_resta_dos_veces():
     cuerpo = src[ini:src.index('\nasync def', ini + 10)]
     assert '_descontar_inventario_vivo(' not in cuerpo, \
         'el checkout aparta Y descuenta: el inventario real baja al doble'
+
+
+# ---------- El aviso de envío partido en el correo ----------
+
+_PEDIDO_PARTIDO = {
+    'order_number': 'EX-TEST', 'subtotal': 1000, 'discount': 0, 'shipping': 0,
+    'total': 1000, 'payment_method': 'spei',
+    'items': [{'name': 'Orexin A 10 mg', 'price': 9359, 'quantity': 21}],
+    'customer': {'full_name': 'Prueba', 'email': 'x@y.com', 'address': 'Calle 1'},
+    'backorder': True,
+    'backorder_items': [
+        {'product_id': 'p1', 'name': 'Orexin A 10 mg', 'pedidas': 21,
+         'en_mano': 20, 'por_surtir': 1},
+        {'product_id': 'p2', 'name': 'Vitamina D3 10 mL', 'pedidas': 2,
+         'en_mano': 0, 'por_surtir': 2},
+    ],
+}
+
+
+@pytest.mark.parametrize('lang,frases', [
+    ('es', ['DOS entregas', '20 de 21 salen ya, 1 sobre pedido', 'las 2 sobre pedido',
+            '2 a 5 dias habiles', 'alrededor de una semana despues']),
+    ('en', ['TWO deliveries', '20 of 21 ship now, 1 on backorder', 'all 2 on backorder',
+            '2 to 5 business days', 'about a week later']),
+    ('pt', ['DUAS entregas', '20 de 21 saem agora, 1 sob encomenda', 'as 2 sob encomenda',
+            '2 a 5 dias uteis', 'cerca de uma semana depois']),
+])
+def test_el_correo_del_pedido_avisa_del_envio_partido_en_los_tres_idiomas(lang, frases):
+    """El correo es el papel que le queda al cliente. Una entrega en dos partes que solo
+    se anunció en una pantalla es una sorpresa una semana después."""
+    import emails
+    h = emails._order_email_html(_PEDIDO_PARTIDO, emails.ORDER_COPY[lang], 'https://x/y')
+    for f in frases:
+        assert f in h, f'falta {f!r} en el correo en {lang}'
+
+
+def test_un_pedido_completo_no_lleva_aviso_de_sobre_pedido():
+    """Si todo sale ya, el aviso no aparece: asustar sin motivo también cuesta ventas."""
+    import emails
+    completo = dict(_PEDIDO_PARTIDO, backorder=False, backorder_items=[])
+    h = emails._order_email_html(completo, emails.ORDER_COPY['es'], 'https://x/y')
+    assert 'DOS entregas' not in h and 'sobre pedido' not in h

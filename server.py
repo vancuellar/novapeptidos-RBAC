@@ -1620,15 +1620,17 @@ async def _existencia_viva(product_id, doc):
 
 
 async def _disponible_de(clave, doc):
-    """Lo que se puede vender de un producto: lo MENOR entre el contador del catálogo y
-    el inventario vivo.
+    """Lo que HAY EN MANO de un producto: lo MENOR entre el contador del catálogo y el
+    inventario vivo.
 
-    ⛔ EL CONTADOR SEMBRADO NO MANDA. El checkout validaba contra `db.products.stock` —el
-    40 de fábrica— y al inventario real lo tocaba DESPUÉS: si no alcanzaba, lo dejaba en
-    cero con una advertencia en la bitácora y el pedido salía igual. El 30-jul había 191
-    de 193 productos anunciando 40 con 20 piezas en la bodega (Orexin A 10 mg entre
-    ellos), así que un pedido de 21 pasaba entero y se cobraba mercancía que no existe.
-    Se compara contra el MISMO inventario que luego se descuenta."""
+    ⚠️ ESTO NO ES UN LÍMITE DE VENTA. Es lo que sale HOY. Lo que se pida de más se vende
+    igual y se manda pedir al proveedor (ver `_reservar_inventario`). Sirve para partir el
+    pedido en dos entregas y para avisarle al cliente ANTES de pagar, no para rechazarlo.
+
+    ⛔ EL CONTADOR SEMBRADO NO MANDA sobre lo que hay. `db.products.stock` es un número de
+    fábrica (casi todo el catálogo nació en 40) y no cuenta piezas físicas; `db.stock` sí.
+    El 30-jul había 191 de 193 productos anunciando 40 con 20 piezas reales, así que sin
+    esto el pedido se partía contra un número inventado."""
     sembrado = int((doc or {}).get('stock') or 0)
     vivo = await _existencia_viva(clave, doc)
     return sembrado if vivo is None else min(sembrado, vivo)
@@ -1686,36 +1688,39 @@ def _agrupar_por_producto(items, pflags):
     return agrupado
 
 
-async def _reservar_inventario(pedido_por_producto):
-    """Aparta las piezas de UN pedido. Devuelve (lo apartado, los que ya no alcanzan).
+# Cuántas veces se reintenta apartar cuando otro pedido se movió en medio. No es un
+# número mágico: cada vuelta solo ocurre si OTRO checkout ganó la carrera en ese instante,
+# y con cinco ya se agotó cualquier escenario real de dos o tres clientes a la vez.
+REINTENTOS_RESERVA = 5
 
-    ⛔ COMPARAR Y RESTAR TIENEN QUE SER EL MISMO PASO. Antes se miraba el stock arriba
-    (`hay = d['stock']`) y se restaba mucho después, y entre las dos cosas cabía otro
-    pedido entero: dos clientes miraban la última pieza, los dos pasaban la revisión, y
-    el inventario terminaba en −1 — el segundo compró algo que ya no existía. No hace
-    falta mala fe: basta con dos personas comprando a la vez, que es justo lo que pasa
+
+async def _apartar_del_catalogo(clave, n):
+    """Aparta HASTA `n` piezas del contador del catálogo. Devuelve cuántas apartó.
+
+    ⛔ MIRAR Y RESTAR TIENEN QUE SER EL MISMO PASO, y nunca por debajo de cero. Antes se
+    leía el stock arriba y se restaba mucho después, y entre las dos cosas cabía otro
+    pedido entero: dos clientes veían la última pieza, los dos pasaban, y el inventario
+    terminaba en −1. Basta con dos personas comprando a la vez, que es justo lo que pasa
     cuando un anuncio pega.
 
-    Aquí la condición viaja DENTRO del update (`stock >= lo que pides`): si otro pedido
-    se llevó las piezas mientras tanto, Mongo no encuentra el documento, no resta nada y
-    lo decimos. Y si un renglón del pedido falla, se devuelve lo que ya se había apartado
-    de los otros: un pedido que no salió no puede dejar piezas secuestradas."""
-    reservado, agotados = [], []
-    for clave, acum in pedido_por_producto.items():
-        if not acum.get('doc'):
-            continue          # producto que no resolvimos: no inventamos un limite
-        n = int(acum['total'])
+    Aquí la condición viaja DENTRO del update (`stock >= lo que voy a tomar`). Si otro
+    pedido se llevó piezas mientras tanto, Mongo no encuentra el documento, no resta nada
+    y se vuelve a leer para tomar lo que quedó — no se rechaza al cliente, se toma menos y
+    el resto se manda pedir."""
+    for _ in range(REINTENTOS_RESERVA):
+        d = await db.products.find_one({'$or': [{'id': clave}, {'sku': clave}]},
+                                       {'_id': 0, 'stock': 1})
+        if d is None:
+            return 0
+        tomar = min(int(n), max(0, int(d.get('stock') or 0)))
+        if tomar <= 0:
+            return 0
         r = await db.products.update_one(
-            {'$or': [{'id': clave}, {'sku': clave}], 'stock': {'$gte': n}},
-            {'$inc': {'stock': -n}})
+            {'$or': [{'id': clave}, {'sku': clave}], 'stock': {'$gte': tomar}},
+            {'$inc': {'stock': -tomar}})
         if r.matched_count:
-            reservado.append((clave, n))
-        else:
-            agotados.append(acum['nombre'])
-    if agotados:
-        await _devolver_reserva(reservado)
-        reservado = []
-    return reservado, agotados
+            return tomar
+    return 0
 
 
 async def _devolver_reserva(reservado):
@@ -1725,60 +1730,88 @@ async def _devolver_reserva(reservado):
                                      {'$inc': {'stock': n}})
 
 
-async def _reservar_inventario_vivo(pedido_por_producto):
-    """Aparta las piezas del inventario REAL (`db.stock`). Devuelve (lo apartado, los
-    que ya no alcanzan).
+async def _apartar_del_inventario_real(clave, doc, n):
+    """Aparta HASTA `n` piezas del inventario REAL. Devuelve (apartadas, llave).
 
-    ⛔ ES ESTE EL INVENTARIO QUE MANDA, no el contador del catálogo. `db.products.stock`
-    nace sembrado (casi todo el catálogo en 40) y no cuenta piezas físicas; `db.stock` sí
-    —es lo que el Panel captura y lo que la ficha pinta como "en mano"—. El checkout
-    validaba y apartaba contra el sembrado y a este otro lo tocaba DESPUÉS de grabar el
-    pedido: cuando no alcanzaba, lo dejaba en 0 con una advertencia en la bitácora y la
-    venta salía igual. El 30-jul, 191 de los 193 productos prometían 40 con 20 piezas
-    reales —Orexin A 10 mg entre ellos—, así que un pedido de 21 pasaba entero.
-
-    Compara y resta EN EL MISMO PASO, por la misma razón que `_reservar_inventario`: si
-    otro pedido se llevó las piezas mientras este cliente llenaba sus datos, Mongo no
-    encuentra el renglón y aquí se dice "ya no hay" en vez de vender aire.
-
-    Una presentación SIN renglón en `db.stock` no bloquea la venta: no sabemos cuántas
-    hay, y "no sé" no es "no hay". Manda el contador del catálogo, como antes, pero se
-    GRITA en la bitácora — un inventario que nadie capturó se ve igual que uno que sí, y
-    esa confusión es exactamente la que dejó vender de más."""
-    reservado, agotados = [], []
-    for clave, acum in pedido_por_producto.items():
-        doc = acum.get('doc')
-        if not doc:
-            continue          # producto que no resolvimos: no inventamos un limite
-        n = int(acum['total'])
-        candidatas = llaves_de_inventario_vivo(clave, doc)
-        apartado, existe = False, False
-        for llave in candidatas:
-            r = await db.stock.update_one({'key': llave, 'qty': {'$gte': n}},
-                                          {'$inc': {'qty': -n}})
+    `db.stock` es lo que hay de verdad: lo que el Panel captura y lo que la ficha pinta
+    como "en mano". Si la presentación no lleva renglón devuelve `(None, None)` — "no sé"
+    no es "no hay", y ahí manda el contador del catálogo."""
+    for llave in llaves_de_inventario_vivo(clave, doc):
+        row = await db.stock.find_one({'key': llave}, {'_id': 0, 'qty': 1})
+        if row is None:
+            continue
+        for _ in range(REINTENTOS_RESERVA):
+            tomar = min(int(n), max(0, int((row or {}).get('qty') or 0)))
+            if tomar <= 0:
+                return 0, llave
+            r = await db.stock.update_one({'key': llave, 'qty': {'$gte': tomar}},
+                                          {'$inc': {'qty': -tomar}})
             if r.matched_count:
-                reservado.append((llave, n))
-                apartado = True
-                break
-            if await db.stock.find_one({'key': llave}, {'_id': 0, 'qty': 1}) is not None:
-                existe = True          # el renglón está y NO alcanza
-        if not apartado and existe:
-            agotados.append(acum['nombre'])
-        elif not apartado:
-            logger.warning('INVENTARIO REAL SIN CAPTURAR: no hay renglón en db.stock '
-                           'para %s (probé %s). El pedido sale contra el contador '
-                           'sembrado del catálogo, que no cuenta piezas físicas.',
-                           clave, candidatas)
-    if agotados:
-        await _devolver_reserva_viva(reservado)
-        reservado = []
-    return reservado, agotados
+                return tomar, llave
+            row = await db.stock.find_one({'key': llave}, {'_id': 0, 'qty': 1})
+        return 0, llave
+    return None, None
 
 
 async def _devolver_reserva_viva(reservado):
     """Regresa al inventario real lo apartado por un pedido que no llegó a existir."""
     for llave, n in reservado:
         await db.stock.update_one({'key': llave}, {'$inc': {'qty': n}})
+
+
+async def _reservar_inventario(pedido_por_producto):
+    """Aparta LO QUE HAYA y deja el resto POR SURTIR. Nunca rechaza.
+
+    ⛔ LA REGLA MADRE (Christián, 2026-07-30): NINGUNA venta se bloquea por inventario,
+    jamás. «Si piden 40 y solo tengo 20 de un producto, se mandan los 20 y se mandan pedir
+    los otros 20.» El pedido se parte en dos entregas: lo que hay sale ya por el flujo
+    normal (2 a 5 días) y el excedente llega alrededor de una semana después. Lo único que
+    sigue sin venderse son los productos OCULTOS y los vetados, que es otra cosa: eso no es
+    falta de inventario, es que no están a la venta.
+
+    Aquí estuvo el péndulo entero. Primero el checkout no miraba nada y se cobraba lo que
+    no existía sin decírselo a nadie. Después se puso un bloqueo duro que rechazaba el
+    pedido — y eso tiraba ventas, que era peor. Lo que hacía falta no era decidir entre
+    vender a ciegas o no vender: era CONTAR bien y AVISAR.
+
+    Devuelve `(del_catálogo, del_inventario_real, por_surtir)`, donde `por_surtir` trae,
+    renglón por renglón, cuántas piezas salen ya y cuántas hay que mandar pedir. Ese
+    desglose es lo que ve el cliente antes de pagar y lo que ve el equipo en el Panel.
+
+    Los dos inventarios se mueven SIEMPRE por el mismo número: manda el real, y si el
+    contador del catálogo tenía menos, se le devuelve la diferencia al real. Cuando cada
+    lado bajaba por su cuenta, cada ciclo de pedido y cancelación los desbalanceaba —
+    Orexin A quedó en 43 cuando tenía 40 (2026-07-27)."""
+    reservado, vivo_reservado, por_surtir = [], [], []
+    for clave, acum in pedido_por_producto.items():
+        doc = acum.get('doc')
+        if not doc:
+            continue          # producto que no resolvimos: no se toca su inventario
+        n = int(acum['total'])
+        vivas, llave = await _apartar_del_inventario_real(clave, doc, n)
+        if vivas is None:
+            logger.warning('INVENTARIO REAL SIN CAPTURAR: no hay renglón en db.stock '
+                           'para %s. El pedido se parte contra el contador sembrado del '
+                           'catálogo, que no cuenta piezas físicas.', clave)
+        del_catalogo = await _apartar_del_catalogo(clave, n if vivas is None else vivas)
+        if vivas is not None and del_catalogo < vivas:
+            # El contador tenía menos que la bodega: los dos bajan por el número chico o
+            # se desbalancean para siempre.
+            await db.stock.update_one({'key': llave}, {'$inc': {'qty': vivas - del_catalogo}})
+            vivas = del_catalogo
+        if del_catalogo:
+            reservado.append((clave, del_catalogo))
+        if vivas:
+            vivo_reservado.append((llave, vivas))
+        if del_catalogo < n:
+            por_surtir.append({
+                'product_id': clave,
+                'name': acum['nombre'],
+                'pedidas': n,
+                'en_mano': int(del_catalogo),
+                'por_surtir': int(n - del_catalogo),
+            })
+    return reservado, vivo_reservado, por_surtir
 
 
 async def _apartar_puntos(user_id, puntos) -> bool:
@@ -1811,16 +1844,34 @@ async def _devolver_puntos(user_id, puntos):
         await db.users.update_one({'id': user_id}, {'$inc': {'points_balance': puntos}})
 
 
+def _piezas_a_devolver(order):
+    """Cuántas piezas devolverle al inventario por producto, al cancelar o borrar.
+
+    ⛔ SE DEVUELVE LO QUE SE APARTÓ, NO LO QUE SE PIDIÓ. Con el envío partido las dos
+    cosas dejaron de ser lo mismo: un pedido de 40 con 20 en bodega solo se llevó 20, y
+    devolver 40 le regala 20 piezas al inventario en cada cancelación. Es exactamente la
+    asimetría que dejó Orexin A en 43 cuando tenía 40 (2026-07-27), servida en bandeja.
+
+    Los pedidos anteriores al envío partido no traen `stock_taken`: ésos se llevaron
+    justo lo que pedían, así que se devuelven por cantidad — que es lo que hacían."""
+    tomado = order.get('stock_taken') or {}
+    if tomado:
+        return {pid: int(n) for pid, n in tomado.items() if pid and int(n or 0) > 0}
+    piezas = {}
+    for item in order.get('items', []):
+        pid, qty = item.get('product_id'), int(item.get('quantity') or 0)
+        if pid and qty > 0:
+            piezas[pid] = piezas.get(pid, 0) + qty
+    return piezas
+
+
 async def restore_order_stock(order):
     """Devuelve al inventario lo que la orden se habia llevado. Se llama al
     CANCELAR y al BORRAR: antes el stock se descontaba y nunca regresaba, asi que
     cada cancelacion perdia piezas para siempre (auditoria del 2026-07-25)."""
     if order.get('stock_restored'):
         return                      # ya se devolvio: no lo hagamos dos veces
-    for item in order.get('items', []):
-        pid, qty = item.get('product_id'), int(item.get('quantity') or 0)
-        if not pid or qty <= 0:
-            continue
+    for pid, qty in _piezas_a_devolver(order).items():
         await db.products.update_one({'$or': [{'id': pid}, {'sku': pid}]},
                                      {'$inc': {'stock': qty}})
         # La devolución usa el MISMO resolvedor de llaves que el descuento. Si cada lado
@@ -2014,51 +2065,31 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
             return 0.0
         return min(float(rate or 0), _cap_of(item))
 
-    # NO se vende lo que no hay. El servidor descontaba el stock sin revisarlo, asi
-    # que un pedido de 99,999 piezas pasaba y dejaba el inventario en negativo
-    # (encontrado en la auditoria del 2026-07-25). Se valida contra el catalogo real.
+    # ⛔ EL INVENTARIO NO BLOQUEA NINGUNA VENTA. Regla de Christián (2026-07-30): «si
+    # piden 40 y solo tengo 20, se mandan los 20 y se mandan pedir los otros 20». El
+    # pedido se PARTE: lo que hay sale ya (2 a 5 días) y el resto llega alrededor de una
+    # semana después. Lo único que sigue sin venderse son los OCULTOS y los vetados —
+    # eso se revisa arriba y no es falta de inventario, es que no están a la venta.
     #
-    # ⚠️ SE SUMAN LOS RENGLONES DEL MISMO PRODUCTO ANTES DE COMPARAR. Revisar renglón
-    # por renglón no sirve de nada: el carrito puede mandar el MISMO producto dos veces,
-    # cada renglón pasa por su cuenta (40 ≤ 40, y otra vez 40 ≤ 40) y salen 80 piezas de
-    # las 40 que hay. Repitiendo renglones no hay tope: el pedido crece sin límite y el
-    # inventario queda en negativo. Lo encontró el barrido adversarial del 28-jul, y es
-    # el mismo agujero que se creyó cerrado el 25-jul — entonces se tapó el "pediste
-    # 99,999", no el "pediste 40 dos veces".
+    # Aquí llegó a haber un rechazo duro (409 "no tenemos suficiente"). Estaba mal: tiraba
+    # ventas. Y antes de eso no había NADA y se cobraba lo que no existe sin avisar. Lo
+    # que hacía falta no era elegir entre vender a ciegas o no vender: era CONTAR bien y
+    # AVISAR. El conteo vive en `_reservar_inventario` (aparta lo que hay y devuelve el
+    # desglose) y el aviso viaja en la respuesta para que el sitio lo pinte.
     #
-    # ⚠️ Y SE AGRUPA POR EL PRODUCTO RESUELTO, NO POR EL TEXTO QUE MANDÓ EL CARRITO.
-    # Sumar por `it.product_id` seguía dejando el agujero abierto: el MISMO producto
-    # viaja a veces con su UUID y a veces con su SKU (`_pflags` acepta los dos justo
-    # porque el carrito manda cualquiera de ellos). Dos renglones, uno con cada nombre,
-    # se contaban como dos productos distintos, cada uno pasaba la prueba contra el
-    # MISMO inventario (40 ≤ 40 y otra vez 40 ≤ 40)... y el descuento sí los juntaba,
-    # porque busca por `id` O por `sku`. Ochenta piezas de las cuarenta que hay, otra
-    # vez. Lo encontró el segundo barrido adversarial del 28-jul.
+    # ⚠️ SE SUMAN LOS RENGLONES DEL MISMO PRODUCTO. El carrito puede mandar el MISMO
+    # producto dos veces y, sin agrupar, cada renglón se parte por su cuenta: el desglose
+    # de "cuántas salen ya" sale mal y el Panel manda pedir de más.
     #
-    # ⛔ Y SE COMPARA CONTRA EL INVENTARIO REAL, NO CONTRA EL CONTADOR SEMBRADO. Esta
-    # revisión miraba `d['stock']` —el 40 de fábrica de `db.products`— mientras que las
-    # piezas de verdad viven en `db.stock` (lo que el Panel captura y la ficha pinta como
-    # "en mano"), y a ése solo se le restaba DESPUÉS de grabar el pedido: si no alcanzaba,
-    # quedaba en 0 con una advertencia en la bitácora y la venta salía igual. El 30-jul
-    # eran 191 de 193 productos prometiendo 40 con 20 en bodega —Orexin A 10 mg entre
-    # ellos—, o sea que un pedido de 21 pasaba entero y se cobraba lo que no existe.
-    # Ahora manda lo MENOR de los dos (`_disponible_de`), que es el mismo inventario que
-    # después se aparta y se descuenta.
-    faltantes = []
+    # ⚠️ Y SE AGRUPA POR EL PRODUCTO RESUELTO, NO POR EL TEXTO QUE MANDÓ EL CARRITO. El
+    # MISMO producto viaja a veces con su UUID y a veces con su SKU (`_pflags` acepta los
+    # dos justo porque el carrito manda cualquiera). Agrupando por el texto son dos
+    # productos distintos, y el inventario sí los junta: el reparto entre "en mano" y "por
+    # surtir" queda mal por partida doble.
     for it in payload.items:
         if it.quantity is None or it.quantity < 1:
             raise HTTPException(status_code=400, detail=f'Cantidad invalida en {it.name}')
     pedido_por_producto = _agrupar_por_producto(payload.items, _pflags)
-    for clave, acum in pedido_por_producto.items():
-        d = acum['doc']
-        if not d:
-            continue          # producto que no resolvimos: no inventamos un limite
-        hay = await _disponible_de(clave, d)
-        if acum['total'] > hay:
-            faltantes.append(f"{acum['nombre']}: pediste {acum['total']} y hay {hay}")
-    if faltantes:
-        raise HTTPException(status_code=409,
-                            detail='No tenemos suficiente de: ' + '; '.join(faltantes))
 
     # Ya con los precios del catálogo (ver arriba): el navegador no decide nada.
     subtotal = sum(item.price * item.quantity for item in payload.items)
@@ -2226,26 +2257,18 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         # vacía: una constancia fabricada por el servidor no prueba nada.
         terms_accepted_at=(payload.terms_accepted_at or '').strip()[:40],
     )
-    # ⛔ LAS PIEZAS SE APARTAN JUSTO ANTES DE GRABAR EL PEDIDO, y comparando y restando en
-    # el MISMO paso (ver `_reservar_inventario`). Aquí y no antes: entre la revisión de
-    # arriba y esta línea no queda nada que pueda fallar y dejar piezas apartadas de un
-    # pedido que nunca existió.
-    reservado, agotados = await _reservar_inventario(pedido_por_producto)
-    if agotados:
-        # Alguien se los llevó mientras este cliente llenaba sus datos. Es la respuesta
-        # honesta: mejor un "ya no hay" que cobrar algo que no se puede mandar.
-        raise HTTPException(status_code=409,
-                            detail='Se agotó mientras comprabas: ' + '; '.join(agotados))
-    # ⛔ Y LAS PIEZAS DE VERDAD SE APARTAN AQUÍ, no se restan después de grabar. El
-    # inventario real es `db.stock`; al contador del catálogo se le apartó arriba, pero
-    # ése nace sembrado en 40 y no cuenta piezas físicas. Antes este descuento vivía
-    # DESPUÉS del `insert_one` y, cuando no alcanzaba, dejaba el renglón en 0 con una
-    # advertencia y el pedido salía igual (ver `_reservar_inventario_vivo`).
-    reservado_vivo, agotados_vivo = await _reservar_inventario_vivo(pedido_por_producto)
-    if agotados_vivo:
-        await _devolver_reserva(reservado)
-        raise HTTPException(status_code=409,
-                            detail='Se agotó mientras comprabas: ' + '; '.join(agotados_vivo))
+    # ⛔ LAS PIEZAS SE APARTAN JUSTO ANTES DE GRABAR EL PEDIDO, mirando y restando en el
+    # MISMO paso (ver `_reservar_inventario`). Aquí y no antes: entre esta línea y el
+    # `insert_one` no queda nada que pueda fallar y dejar piezas apartadas de un pedido
+    # que nunca existió.
+    #
+    # Y NO RECHAZA NUNCA: aparta lo que hay y devuelve el desglose de lo que falta. Los
+    # dos inventarios —el contador del catálogo y las piezas reales— bajan por el mismo
+    # número, siempre.
+    reservado, reservado_vivo, por_surtir = await _reservar_inventario(pedido_por_producto)
+    order.backorder = bool(por_surtir)
+    order.backorder_items = por_surtir
+    order.stock_taken = {clave: n for clave, n in reservado}
     # ⛔ Y LOS PUNTOS SE APARTAN AQUÍ MISMO, igual que las piezas y por lo mismo: el saldo
     # se leyó arriba y se restaba hasta después de grabar, así que dos pedidos a la vez
     # gastaban los MISMOS puntos (ver `_apartar_puntos`).
@@ -2282,17 +2305,15 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         # también aquí, con un `$inc` a secas y sin condición: ése era el canje que dos
         # pedidos simultáneos podían hacer dos veces con los mismos puntos.
         await _points_entry(user['id'], order.model_dump(), 'redeem', -points_used)
-    # LOS DOS INVENTARIOS YA BAJARON, arriba y antes de grabar: el contador del catálogo
-    # en `_reservar_inventario` y las piezas reales en `_reservar_inventario_vivo`, cada
-    # uno agrupado por producto y comparando y restando en el MISMO paso. Aquí no se
-    # vuelve a restar nada:
+    # LOS DOS INVENTARIOS YA BAJARON, arriba y antes de grabar, por el MISMO número y
+    # agrupados por producto (`_reservar_inventario`). Aquí no se vuelve a restar nada:
     #   · el catálogo se restaba renglón por renglón buscando por `id` O `sku`, que junta
     #     lo que la revisión separaba — las mismas piezas descontadas dos veces;
     #   · el inventario vivo se restaba AQUÍ, ya grabado el pedido, y si no alcanzaba lo
-    #     dejaba en 0 con una advertencia: la venta de lo que no existe salía igual.
-    # La devolución (`restore_order_stock`) mueve los dos y busca igual, para que cobrar y
-    # cancelar se lleven la misma cantidad: cuando cada lado buscaba distinto, cada ciclo
-    # INFLABA el inventario (Orexin A en 43 cuando tenía 40, el 2026-07-27).
+    #     dejaba en 0 con una advertencia: se cobraba lo que no existe y nadie se enteraba.
+    # La devolución (`restore_order_stock`) mueve los dos, busca igual y devuelve lo que
+    # de verdad se apartó (`stock_taken`): cuando cada lado hacía lo suyo, cada ciclo de
+    # pedido y cancelación INFLABA el inventario (Orexin A en 43 con 40, el 2026-07-27).
     # Confirmacion por correo, en segundo plano: la compra no debe quedarse
     # esperando al proveedor de correo ni fallar si esta caido.
     email_order = order.model_dump()

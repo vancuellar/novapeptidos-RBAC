@@ -317,6 +317,21 @@ class Order(BaseModel):
     # Constancia de la aceptación 18+/RUO (ver OrderCreate). Los pedidos anteriores
     # a esto no la traen y se leen igual de bien: por eso tiene default.
     terms_accepted_at: str = ''
+    # ⛔ ENVÍO PARTIDO (Christián, 2026-07-30): «si piden 40 y solo tengo 20, se mandan
+    # los 20 y se mandan pedir los otros 20». NINGUNA venta se bloquea por inventario.
+    # `backorder` prende cuando algo de este pedido no salía de la bodega ese día, y
+    # `backorder_items` dice exactamente qué: cuántas se pidieron, cuántas van en la
+    # primera entrega y cuántas hay que mandar pedir al proveedor. Es lo que el cliente
+    # ve ANTES de pagar y lo que el equipo ve en el Panel para salir a comprar.
+    backorder: bool = False
+    backorder_items: List[dict] = Field(default_factory=list)
+    # Cuántas piezas se APARTARON de verdad, por producto ({clave: piezas}). No es lo
+    # mismo que lo pedido: en un pedido partido se aparta menos. Cancelar tiene que
+    # devolver EXACTAMENTE esto y no la cantidad pedida, o cada cancelación le regala
+    # al inventario piezas que nunca salieron — así quedó Orexin A en 43 cuando tenía
+    # 40 (2026-07-27). Los pedidos viejos no lo traen y se devuelven por cantidad,
+    # que es lo que hacían.
+    stock_taken: dict = Field(default_factory=dict)
     created_at: str = Field(default_factory=now_iso)
 
 

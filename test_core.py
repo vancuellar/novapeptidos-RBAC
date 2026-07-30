@@ -1636,8 +1636,9 @@ def test_descontar_y_devolver_inventario_buscan_igual():
     sí las sumaba: cada ciclo INFLABA el inventario. Se descubrió el 2026-07-27 al
     borrar tres pedidos de prueba y ver Orexin A en 43 cuando tenía 40.
 
-    Hoy el descuento vive en `_reservar_inventario` (aparta y compara en un solo paso),
-    pero la regla es la misma: los dos lados tienen que buscar el producto IGUAL."""
+    Hoy el descuento vive en `_apartar_del_catalogo` (mira y resta en un solo paso, y con
+    el envío partido toma lo que haya), pero la regla es la misma: los dos lados tienen
+    que buscar el producto IGUAL."""
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'server.py'),
                encoding='utf-8').read()
 
@@ -1645,7 +1646,7 @@ def test_descontar_y_devolver_inventario_buscan_igual():
         ini = src.index(f'async def {nombre}(')
         return src[ini:src.index('async def', ini + 10)]
 
-    for quien in ('_reservar_inventario', '_devolver_reserva', 'restore_order_stock'):
+    for quien in ('_apartar_del_catalogo', '_devolver_reserva', 'restore_order_stock'):
         c = cuerpo(quien)
         assert "'$inc': {'stock'" in c, f'{quien} ya no mueve el inventario del catálogo'
         assert "{'sku':" in c and "{'id':" in c, \
