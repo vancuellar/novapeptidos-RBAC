@@ -42,12 +42,12 @@ API = os.environ.get('SKYDROPX_API_URL', 'https://pro.skydropx.com/api/v1').rstr
 TIMEOUT = 20                       # por cada petición HTTP suelta
 
 
-# ⛔ SOLO SE LE ENSEÑAN ESTAS PAQUETERÍAS AL CLIENTE (Christian, 2026-07-28: empezó
-# siendo solo Estafeta y ese mismo día sumó Paquetexpress y FedEx). La API devuelve
-# más de veinte; el cliente ve tres. Ampliar es agregar un renglón aquí.
-# Van EN MINÚSCULAS y sin acentos, que es como las manda la API PRO en
-# `provider_name` y como se comparan aquí.
-PAQUETERIAS_PERMITIDAS = ('estafeta', 'paquetexpress', 'fedex')
+# ⛔ TODAS LAS PAQUETERÍAS COMPITEN (Christian, 2026-07-30: "FedEx, UPS, DHL y
+# cualquier otra pueden cotizar, que le den el mejor precio disponible"). La tupla
+# VACÍA significa "todas pasan"; volver a restringir es poner nombres aquí, EN
+# MINÚSCULAS y sin acentos, como los manda la API PRO en `provider_name`.
+# El plazo de entrega sigue siendo filtro aparte: barato pero tarde no sirve.
+PAQUETERIAS_PERMITIDAS = ()
 
 # ⛔ EL PLAZO TAMBIÉN ES UN FILTRO, NO SOLO EL PRECIO (Christian, 2026-07-28).
 # Comprobado en vivo: Paquetexpress "Nacional" sale a $51.25 pero tarda 7 días, y
@@ -312,6 +312,9 @@ def _normaliza(nombre: str) -> str:
 
 
 def permitida(proveedor: str) -> bool:
+    # Lista vacía = todas las paqueterías compiten (orden de Christian 2026-07-30).
+    if not PAQUETERIAS_PERMITIDAS:
+        return True
     n = _normaliza(proveedor)
     return any(p in n for p in PAQUETERIAS_PERMITIDAS)
 

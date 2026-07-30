@@ -333,12 +333,13 @@ BULTO = {'peso_kg': 1, 'alto_cm': 15, 'ancho_cm': 20, 'largo_cm': 30}
 
 
 def test_solo_se_le_enseñan_las_paqueterias_permitidas(monkeypatch, con_llave):
-    """DHL y Afimex salen en la respuesta real de la API. El cliente no las ve."""
+    """TODAS las paqueterías compiten (Christian, 2026-07-30) — el único cedazo que
+    queda es el plazo. Afimex se cae por venir sin precio, no por su nombre."""
     _falsear_skydropx(monkeypatch)
     opciones = skydropx.cotizar('64000', BULTO)
-    assert {o['paqueteria'] for o in opciones} == {'Estafeta', 'Paquetexpress', 'FedEx'}
+    assert {o['paqueteria'] for o in opciones} == {'Estafeta', 'Paquetexpress', 'FedEx', 'DHL'}
     # de barato a caro, y ninguna de las que se pasan del plazo
-    assert [o['precio'] for o in opciones] == [52.45, 165.27, 168.33, 179.2, 186.9]
+    assert [o['precio'] for o in opciones] == [52.45, 165.27, 168.33, 179.2, 186.9, 222.64]
 
 
 def test_la_mas_barata_de_7_dias_NO_se_le_ofrece_al_cliente(monkeypatch, con_llave):
@@ -372,13 +373,15 @@ def test_un_plazo_desconocido_no_se_castiga():
 
 
 def test_la_lista_de_permitidas_se_amplia_con_un_renglon(monkeypatch):
-    """Y viene EN MINÚSCULAS, que es como manda `provider_name` la API PRO."""
-    assert skydropx.PAQUETERIAS_PERMITIDAS == ('estafeta', 'paquetexpress', 'fedex')
+    """VACÍA = todas compiten (Christian, 2026-07-30). Poner nombres vuelve a
+    restringir, EN MINÚSCULAS, como manda `provider_name` la API PRO."""
+    assert skydropx.PAQUETERIAS_PERMITIDAS == ()
     assert skydropx.permitida('paquetexpress') is True
-    assert skydropx.permitida('Estafeta') is True            # el nombre bonito también
-    assert skydropx.permitida('dhl') is False
+    assert skydropx.permitida('DHL') is True
+    assert skydropx.permitida('UPS') is True                 # cualquiera pasa
     monkeypatch.setattr(skydropx, 'PAQUETERIAS_PERMITIDAS', ('estafeta', 'dhl'))
     assert skydropx.permitida('DHL') is True
+    assert skydropx.permitida('Estafeta') is True            # el nombre bonito también
     assert skydropx.permitida('paquetexpress') is False
 
 
@@ -389,9 +392,13 @@ def test_el_filtro_se_aplica_a_lo_que_devuelve_la_api(monkeypatch, con_llave):
     opciones = skydropx.cotizar('64000', BULTO)
     pedido = _peticiones(api, '/quotations')[0]['cuerpo']['quotation']
     assert pedido['address_to']['postal_code'] == '64000'
-    fuera = {'dhl', 'afimex'}
-    assert fuera & {t['provider_name'] for t in TARIFAS_V2}       # sí venían
-    assert not fuera & {o['paqueteria_id'] for o in opciones}     # y no salieron
+    # DHL ya compite (2026-07-30); Afimex sigue fuera pero por venir SIN precio,
+    # y Paquetexpress Nacional por pasarse del plazo. El candado sigue siendo
+    # nuestro al recibir, porque la API ignora el `carriers` que se le manda.
+    salieron = {o['paqueteria_id'] for o in opciones}
+    assert 'dhl' in salieron
+    assert 'afimex' not in salieron
+    assert 'nacional' not in {o['servicio_codigo'] for o in opciones}
 
 
 def test_una_tarifa_sin_precio_no_es_una_opcion(monkeypatch, con_llave):
@@ -410,7 +417,7 @@ def test_la_cotizacion_se_espera_hasta_que_este_completa(monkeypatch, con_llave)
     preguntar, el checkout enseñaría una lista sin precios."""
     api = _falsear_skydropx(monkeypatch, consultas_para_completar=3)
     opciones = skydropx.cotizar('64000', BULTO)
-    assert len(opciones) == 5
+    assert len(opciones) == 6
     assert len(_peticiones(api, '/quotations/q-1')) == 3       # preguntó tres veces
 
 
@@ -566,8 +573,10 @@ def test_una_cotizacion_vencida_no_sirve(db, con_llave):
         quote['opciones'][0]['opcion_id'], '64000', 1.0)) is None
 
 
-def test_una_cotizacion_de_paqueteria_no_permitida_no_se_cobra(db, con_llave):
-    """Aunque alguien la meta a mano en la base, DHL no se cobra ni se compra."""
+def test_una_cotizacion_de_paqueteria_no_permitida_no_se_cobra(db, con_llave, monkeypatch):
+    """Si un día se vuelve a restringir la lista, el candado del cobro sigue vivo:
+    aunque alguien meta la tarifa a mano en la base, no se cobra ni se compra."""
+    monkeypatch.setattr(skydropx, 'PAQUETERIAS_PERMITIDAS', ('estafeta',))
     quote = asyncio.run(server._guardar_cotizacion(
         '64000', {'peso_kg': 1.0}, [{'paqueteria': 'DHL', 'servicio': 'x',
                                      'servicio_codigo': 'x', 'dias': 1, 'precio': 900.0}]))
@@ -620,7 +629,7 @@ def test_la_ruta_de_cotizacion_no_devuelve_precios_de_otras_paqueterias(db, con_
     r = asyncio.run(server.shipping_quote(ShippingQuoteRequest(
         postal_code='64000', items=[OrderItem(product_id='a', name='BPC-157', price=1, quantity=1)])))
     assert r['enabled'] is True
-    assert {o['carrier'].lower() for o in r['options']} == {'estafeta', 'paquetexpress', 'fedex'}
+    assert {o['carrier'].lower() for o in r['options']} == {'estafeta', 'paquetexpress', 'fedex', 'dhl'}
     assert all(o['days'] <= skydropx.DIAS_MAXIMOS_ENTREGA for o in r['options'])
     # y el precio NO viaja de vuelta como algo cobrable: cada opción es un ID opaco
     assert all(o['id'] and len(o['id']) > 20 for o in r['options'])
@@ -1255,3 +1264,183 @@ def test_el_aviso_interno_dice_lo_que_costo_la_guia():
     assert 'Costo de la guía' in html_aviso
     assert '168' in html_aviso
     assert 'la casa pone' in html_aviso        # los $168 que nadie pagó
+
+
+# ==========================================================================
+#  13. El DISTRIBUIDOR captura la guía de SUS pedidos
+#
+#  Christián, 2026-07-30: María atiende a sus clientes y despacha sus paquetes.
+#  Hasta hoy el número de guía sólo lo podía teclear el admin, así que cada
+#  envío suyo tenía que pasar por Christián para que el cliente se enterara.
+#
+#  ⛔ LO CARO NO ES QUE ELLA CAPTURE: es que capture en el pedido de OTRO. Todo
+#  lo que sigue prueba el candado EN EL SERVIDOR, no en la pantalla.
+# ==========================================================================
+import auth as _auth
+from models import DistributorShippingUpdate
+
+MARIA = {'id': 'maria', 'role': 'distributor', 'name': 'María'}
+OTRA = {'id': 'otra', 'role': 'distributor', 'name': 'Otra Distribuidora'}
+
+
+def _pedido_de(dist_id, **extra):
+    return _orden('spei', referred_by=dist_id, **extra)
+
+
+def _capturar(order_number, dist, **campos):
+    return asyncio.run(server.distributor_order_shipping(
+        order_number, DistributorShippingUpdate(**campos), dist=dist))
+
+
+def test_la_distribuidora_captura_la_guia_de_SU_pedido(db, monkeypatch):
+    """Lo que María necesita: paquetería y número. La URL de rastreo se arma sola."""
+    monkeypatch.setattr(server, 'avisar_del_envio', _async_nada)
+    asyncio.run(db.orders.insert_one(_pedido_de('maria')))
+    ficha = _capturar('EX-20260728-0001', MARIA,
+                      carrier='Estafeta', tracking_number='ABC123')
+    assert ficha['carrier'] == 'Estafeta'
+    assert ficha['tracking_number'] == 'ABC123'
+    assert 'ABC123' in ficha['tracking_url']        # armada por el servidor
+    # Capturar una guía ES que ya salió: el pedido pasa solo a 'enviado'.
+    assert ficha['status'] == 'enviado' and ficha['shipped_at']
+    # Y sigue viendo SU comisión, no el margen de la casa.
+    assert 'my_commission' in ficha
+
+
+def test_la_distribuidora_puede_pegar_su_propia_url_de_rastreo(db, monkeypatch):
+    monkeypatch.setattr(server, 'avisar_del_envio', _async_nada)
+    asyncio.run(db.orders.insert_one(_pedido_de('maria')))
+    ficha = _capturar('EX-20260728-0001', MARIA, carrier='Mensajería Local',
+                      tracking_number='XY-9', tracking_url='https://mensajeria.test/XY-9')
+    assert ficha['tracking_url'] == 'https://mensajeria.test/XY-9'
+
+
+def test_el_pedido_de_OTRA_distribuidora_da_403(db, monkeypatch):
+    """⛔ EL CANDADO. Esconder el formulario en la pantalla no sirve: el número de
+    pedido ajeno se teclea en la barra de direcciones."""
+    monkeypatch.setattr(server, 'avisar_del_envio', _async_nada)
+    asyncio.run(db.orders.insert_one(_pedido_de('otra')))
+    with pytest.raises(server.HTTPException) as e:
+        _capturar('EX-20260728-0001', MARIA, carrier='Estafeta', tracking_number='ROBADA')
+    assert e.value.status_code == 403
+    # Y el pedido ajeno quedó INTACTO: ni guía, ni estatus movido.
+    quedo = asyncio.run(db.orders.find_one({'order_number': 'EX-20260728-0001'}))
+    assert not quedo.get('tracking_number')
+    assert quedo['status'] == 'pendiente'
+
+
+def test_un_pedido_SIN_codigo_de_nadie_tampoco_es_suyo(db, monkeypatch):
+    """Un pedido que entró sin código de distribuidor no le pertenece a ninguno."""
+    monkeypatch.setattr(server, 'avisar_del_envio', _async_nada)
+    asyncio.run(db.orders.insert_one(_orden('spei')))       # sin referred_by
+    with pytest.raises(server.HTTPException) as e:
+        _capturar('EX-20260728-0001', MARIA, tracking_number='X')
+    assert e.value.status_code == 403
+
+
+def test_un_pedido_que_no_existe_da_404(db):
+    with pytest.raises(server.HTTPException) as e:
+        _capturar('EX-NO-EXISTE', MARIA, tracking_number='X')
+    assert e.value.status_code == 404
+
+
+def test_un_cliente_normal_NO_captura_guias():
+    """El candado del rol vive en la dependencia, antes de tocar el pedido."""
+    for rol in ('user', 'marketing'):
+        with pytest.raises(server.HTTPException) as e:
+            asyncio.run(_auth.get_current_distributor(user={'id': 'x', 'role': rol}))
+        assert e.value.status_code == 403
+
+
+def test_el_VER_COMO_del_admin_NO_escribe_guias(db, monkeypatch):
+    """Espiar el panel de María es SOLO LECTURA. Si el 'ver como' pudiera capturar,
+    dejaría de ser una mirada y sería una firma con la mano de otro."""
+    monkeypatch.setattr(server, 'avisar_del_envio', _async_nada)
+    asyncio.run(db.orders.insert_one(_pedido_de('maria')))
+    espiando = dict(MARIA, view_as=True, view_as_admin='admin')
+    with pytest.raises(server.HTTPException) as e:
+        _capturar('EX-20260728-0001', espiando, carrier='Estafeta', tracking_number='NO')
+    assert e.value.status_code == 403
+    quedo = asyncio.run(db.orders.find_one({'order_number': 'EX-20260728-0001'}))
+    assert not quedo.get('tracking_number')
+
+
+def test_la_distribuidora_NO_puede_mover_el_estatus_ni_el_dinero():
+    """El modelo del distribuidor no tiene dónde recibir `status`, `total`, `paid`
+    ni `shipping_cost`: aunque los mande, se caen antes de llegar al pedido."""
+    campos = set(DistributorShippingUpdate.model_fields)
+    assert campos == {'carrier', 'tracking_number', 'tracking_url'}
+    entrada = DistributorShippingUpdate(**{'carrier': 'Estafeta', 'tracking_number': '1',
+                                           'status': 'entregado', 'total': 1,
+                                           'paid': True, 'shipping_cost': 0})
+    assert not hasattr(entrada, 'status') and not hasattr(entrada, 'total')
+
+
+def test_capturar_no_marca_el_pedido_como_pagado(db, monkeypatch):
+    """Mover la mercancía NO cobra: un pedido puede ir en camino y seguir debiendo."""
+    monkeypatch.setattr(server, 'avisar_del_envio', _async_nada)
+    asyncio.run(db.orders.insert_one(_pedido_de('maria', paid=False)))
+    _capturar('EX-20260728-0001', MARIA, carrier='Estafeta', tracking_number='ABC123')
+    quedo = asyncio.run(db.orders.find_one({'order_number': 'EX-20260728-0001'}))
+    assert quedo.get('paid') is False and not quedo.get('paid_at')
+
+
+def test_al_capturar_la_distribuidora_le_sale_el_correo_al_cliente(db, monkeypatch):
+    """El punto de todo esto: que el cliente reciba su rastreo sin esperar al admin."""
+    avisados = []
+    monkeypatch.setattr(server, 'avisar_del_envio',
+                        lambda o: avisados.append(o.get('tracking_number')) or _async_nada())
+    asyncio.run(db.orders.insert_one(_pedido_de('maria')))
+    _capturar('EX-20260728-0001', MARIA, carrier='Estafeta', tracking_number='ABC123')
+    assert avisados == ['ABC123']
+
+
+def test_corregir_la_guia_no_manda_un_SEGUNDO_correo(db, monkeypatch):
+    """Se equivocó de dígito y la corrige: el cliente no recibe dos "ya salió"."""
+    avisados = []
+    monkeypatch.setattr(server, 'avisar_del_envio',
+                        lambda o: avisados.append(o.get('tracking_number')) or _async_nada())
+    asyncio.run(db.orders.insert_one(_pedido_de('maria')))
+    _capturar('EX-20260728-0001', MARIA, carrier='Estafeta', tracking_number='ABC123')
+    _capturar('EX-20260728-0001', MARIA, carrier='Estafeta', tracking_number='ABC124')
+    assert avisados == ['ABC123']
+
+
+def test_el_correo_del_cliente_es_EL_MISMO_venga_del_admin_o_del_distribuidor():
+    """Los dos caminos escriben por la MISMA función. Si un día se arregla el correo,
+    queda arreglado para los dos; y nadie puede añadirle un campo a uno solo."""
+    import inspect
+    for fn in (server.update_order_shipping, server.distributor_order_shipping):
+        assert '_guardar_envio' in inspect.getsource(fn)
+    cuerpo = inspect.getsource(server.distributor_order_shipping)
+    assert 'permitir_status=False' in cuerpo, 'el distribuidor no mueve el estatus a mano'
+    assert 'deny_view_as' in cuerpo
+    assert "o.get('referred_by') != dist['id']" in cuerpo
+
+
+def test_COTIZAR_Y_COMPRAR_guias_sigue_siendo_SOLO_del_admin():
+    """⛔ Comprar guía es DINERO DE LA CASA. El distribuidor captura la guía que ya
+    tiene; no le abre la chequera a nadie."""
+    import inspect
+    for fn in (server.admin_cotizar_envio, server.admin_comprar_guia):
+        assert 'get_current_admin' in str(inspect.signature(fn))
+    rutas = [r.path for r in server.app.routes
+             if getattr(r, 'path', '').startswith('/api/distributor')]
+    assert not any('guia' in p or 'cotizar' in p for p in rutas), \
+        f'se coló una ruta de compra de guías en el panel del distribuidor: {rutas}'
+
+
+def test_la_lista_de_pedidos_del_distribuidor_LLEVA_la_guia(db, monkeypatch):
+    """⛔ REGRESIÓN. Iba sólo la paquetería, no el número: la columna "Envío" del
+    panel leía un `tracking_number` que nunca llegaba, así que TODOS los pedidos se
+    veían "Sin guía todavía" —incluso los que ya iban en camino."""
+    monkeypatch.setattr(server, 'avisar_del_envio', _async_nada)
+    asyncio.run(db.orders.insert_one(_pedido_de('maria')))
+    _capturar('EX-20260728-0001', MARIA, carrier='Estafeta', tracking_number='ABC123')
+    fila = asyncio.run(server.distributor_orders(dist=MARIA))[0]
+    assert fila['tracking_number'] == 'ABC123'
+    assert 'ABC123' in fila['tracking_url']
+    assert fila['carrier'] == 'Estafeta'
+    # Y la privacidad del cliente sigue en pie: ni correo, ni teléfono, ni domicilio.
+    for prohibido in ('customer_email', 'customer_phone', 'address', 'items'):
+        assert prohibido not in fila
