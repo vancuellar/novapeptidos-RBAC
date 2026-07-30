@@ -1469,6 +1469,35 @@ def test_el_catalogo_publico_filtra_los_ocultos():
         _srv.db = original
 
 
+def test_la_lista_admin_si_incluye_los_ocultos():
+    """GET /admin/products devuelve TODO, ocultos incluidos: es la única forma de
+    volver a encontrar por SKU un producto oculto para re-mostrarlo (el bug del
+    2026-07-29: --mostrar buscaba en el catálogo público y nunca lo hallaba)."""
+    guardadas = []
+
+    class _Cursor:
+        async def to_list(self, _n):
+            return [{'sku': 'DYSPORT-500U', 'hidden': True}]
+
+    class _Products:
+        def find(self, query, _proj):
+            guardadas.append(query)
+            return _Cursor()
+
+    class _DB:
+        products = _Products()
+
+    original = _srv.db
+    _srv.db = _DB()
+    try:
+        rows = asyncio.new_event_loop().run_until_complete(
+            _srv.admin_list_products(admin={'email': 'admin@exygenlabs.com'}))
+        assert guardadas[-1] == {}, 'la lista admin NO debe filtrar ocultos'
+        assert rows[0]['hidden'] is True
+    finally:
+        _srv.db = original
+
+
 # ---------- El precio lo pone el SERVIDOR, nunca el navegador ----------
 # Hasta el 2026-07-27 `/orders` sumaba `item.price` tal como venía en la petición: se podía
 # mandar precio 0 y llevarse un vial de $9,359 pagando los $250 del envío. Lo cazó una

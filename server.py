@@ -988,6 +988,14 @@ async def get_product(slug: str):
 
 
 # ----------------- Admin: Products -----------------
+@api_router.get('/admin/products')
+async def admin_list_products(admin=Depends(get_current_admin)):
+    # Catálogo COMPLETO, ocultos incluidos. La lista pública filtra `hidden`,
+    # así que sin esta ruta un producto oculto no se puede volver a encontrar
+    # por SKU para re-mostrarlo (ocultar_productos.js --mostrar).
+    return await db.products.find({}, {'_id': 0}).to_list(1000)
+
+
 @api_router.post('/admin/products')
 async def create_product(payload: ProductCreate, admin=Depends(get_current_admin)):
     existing = await db.products.find_one({'slug': payload.slug})
