@@ -257,11 +257,23 @@ class Order(BaseModel):
     payment_method: str
     subtotal: float
     discount: float = 0         # descuento automatico por volumen (10/15/20%)
+    # La MAYOR tasa concedida a algún renglón de este pedido. Con un carrito parejo
+    # —todo lo que existía antes de la REGLA DE 5— es la tasa de siempre. Lo leen los
+    # puntos (el 40% no genera), las comisiones viejas y los reportes.
     discount_rate: float = 0
     # Renglones que NO recibieron el descuento completo porque su tope de producto
     # no lo aguanta (o porque son insumos, que nunca entran). Solo para explicarle
     # al cliente por que su codigo dio menos en esos productos.
     discount_capped: List[dict] = []
+    # DESGLOSE FINO: qué tasa pidió y qué tasa recibió CADA renglón. Existe desde la
+    # REGLA DE 5 (Christián, 2026-07-30), donde dos renglones del mismo pedido pueden
+    # llevar descuentos distintos y `discount_rate` sola ya no cuenta la historia
+    # completa. [{product_id, name, quantity, asked_rate, applied_rate}]
+    discount_lines: List[dict] = []
+    # Los productos de una COMPRA PROPIA de distribuidor que se quedaron en 1-4 piezas
+    # y por eso pagaron precio de cliente. Es el empujón del carrito: «llevas 3 de 5».
+    # [{product_id, name, quantity, faltan, minimo}]
+    regla_de_5: List[dict] = []
     shipping: float
     total: float
     status: str = 'pendiente'   # pendiente | confirmado | enviado | entregado | cancelado

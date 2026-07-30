@@ -3,8 +3,11 @@
 Diseño cerrado con Christian (2026-07-22/23). Reglas:
 
   Niveles y tasa (la tasa ES la comisión Y el descuento MÁXIMO que puede dar el
-  distribuidor a su cliente, de 0 hasta ese %):
-    junior0 20% · junior1 25% · senior 30% · master 35% · elite 40% · diamond 45%
+  distribuidor a su cliente, de 0 hasta ese %). Desde el 2026-07-30 la entrada
+  es 30% para todos (BASE_RATE) y de ahí se sube:
+    junior0 30% · junior1 30% · senior 30% · master 35% · elite 40% · diamond 43%
+  (la tabla TIER_RATES guarda la escalera original —junior0 20%, junior1 25%— y
+  el piso se aplica en `tier_rate`: así se ve de un vistazo qué se movió.)
 
   Override DIFERENCIAL: en una venta, cada distribuidor por ENCIMA del vendedor
   gana la DIFERENCIA entre su tasa y la más alta ya pagada debajo de él. Así el
@@ -38,6 +41,21 @@ DEFAULT_TIER = 'junior0'
 HARD_CAP = 0.45   # ningún reparto individual ni total pasa de aquí
 MANUAL_CAP = 0.50  # tope de la tasa que el admin puede poner A MANO (= COMMISSION_CAP)
 
+# ⛔ TASA BASE DEL CANAL — 30%. Decisión de Christián, 2026-07-30:
+# «Todos los distribuidores van a empezar a partir de ahora a recibir un 30% de
+# comisión (menos el % que hayan otorgado de descuento) y de ahí irán subiendo».
+#
+# Es un PISO, no un techo ni una tasa nueva: la escalera de arriba (master 35%,
+# elite 40%, diamond 43%) queda intacta y los ascensos siguen igual. Lo único que
+# cambia es de dónde se arranca: los escalones que valían menos de 30 (junior0 20%
+# y junior1 25%) se reanclan en 30. Vive en UNA constante justo para que mover la
+# base mañana sea un número, no una cirugía.
+#
+# ⚠️ Los dos escalones de abajo quedan empatados en 30: subir de junior0 a junior1
+# ya no sube la comisión (sí el nivel y lo que se ve en el panel). Es la
+# consecuencia directa de «todos empiezan en 30» sin tocar los niveles altos.
+BASE_RATE = 0.30
+
 # Alias de niveles viejos guardados en la base antes de la pirámide de 6 niveles.
 TIER_ALIASES = {'junior': 'junior0'}
 
@@ -52,10 +70,14 @@ def effective_rate(dist):
     """Tasa REAL de un distribuidor: la MAYOR entre la de su nivel y la que el
     admin le puso a mano (`commission_rate`).
 
-    Christian puede subirle la comisión a alguien sin moverlo de nivel (así fue
-    con Alanís: nivel junior, comisión 40%). Esa tasa manual manda: es su
-    comisión Y su descuento máximo, y de ahí salen sus códigos automáticos.
-    Tope: MANUAL_CAP (el mismo que valida el panel de admin)."""
+    Christian puede subirle la comisión a alguien sin moverlo de nivel. Esa tasa
+    manual manda: es su comisión Y su descuento máximo, y de ahí salen sus códigos
+    automáticos. Tope: MANUAL_CAP (el mismo que valida el panel de admin).
+
+    El piso de 30% (BASE_RATE) entra por `tier_rate`, así que una manual por
+    DEBAJO de 30 ya no baja a nadie: el 2026-07-30 las manuales viejas de María,
+    Alanís y Javier se reanclaron en 30 (ver `reanclar_comisiones_en_la_base` en
+    server.py, que guarda los valores anteriores para poder revertir)."""
     tier_r = tier_rate(normalize_tier((dist or {}).get('tier')))
     manual = float((dist or {}).get('commission_rate') or 0)
     return min(MANUAL_CAP, max(tier_r, manual))
@@ -86,8 +108,13 @@ CASHBACK_RATE = 0.04   # ventaja del canal, la paga Christian, FUERA de la bolsa
 
 
 def tier_rate(tier):
-    """Tasa (comisión = descuento máximo) de un nivel. junior0 por defecto."""
-    return TIER_RATES.get(TIER_ALIASES.get(tier, tier) or DEFAULT_TIER, TIER_RATES[DEFAULT_TIER])
+    """Tasa (comisión = descuento máximo) de un nivel. junior0 por defecto.
+
+    Nunca por debajo de BASE_RATE: desde el 2026-07-30 todo distribuidor arranca
+    en 30% y de ahí sube. Los niveles por encima de la base salen tal cual de la
+    tabla."""
+    tabla = TIER_RATES.get(TIER_ALIASES.get(tier, tier) or DEFAULT_TIER, TIER_RATES[DEFAULT_TIER])
+    return max(BASE_RATE, tabla)
 
 
 def max_discount(tier):

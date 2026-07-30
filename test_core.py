@@ -641,49 +641,76 @@ import pyramid
 
 
 def test_pyramid_tier_rates_are_the_six_levels():
-    assert pyramid.tier_rate('junior0') == 0.20
-    assert pyramid.tier_rate('junior1') == 0.25
+    # TODOS ARRANCAN EN 30% (Christián, 2026-07-30): los dos escalones de abajo
+    # quedan reanclados en la base y los de arriba siguen igual.
+    assert pyramid.BASE_RATE == 0.30
+    assert pyramid.tier_rate('junior0') == 0.30
+    assert pyramid.tier_rate('junior1') == 0.30
     assert pyramid.tier_rate('senior') == 0.30
     assert pyramid.tier_rate('master') == 0.35
     assert pyramid.tier_rate('elite') == 0.40
     assert pyramid.tier_rate('diamond') == 0.43   # secreto
 
 
+def test_ningun_nivel_paga_menos_que_la_base():
+    """El piso de 30% cubre TODA la escalera, incluido un nivel inventado."""
+    for nivel in list(pyramid.TIER_RATES) + ['junior', 'lo-que-sea', None]:
+        assert pyramid.tier_rate(nivel) >= pyramid.BASE_RATE
+
+
+def test_la_escalera_sigue_subiendo_desde_la_base():
+    """De 30 se sube: master 35, elite 40, diamond 43. La base no aplanó lo de arriba."""
+    escalera = [pyramid.tier_rate(t) for t in pyramid.TIER_ORDER]
+    assert escalera == sorted(escalera)                  # nunca baja al ascender
+    assert escalera[-1] > pyramid.BASE_RATE              # y sí llega más arriba
+    assert pyramid.tier_rate('master') > pyramid.tier_rate('senior')
+
+
 def test_pyramid_differential_total_equals_top_tier():
-    # Vende junior0 (20). Senior arriba (30) y Elite (40): diferenciales 10 y 10.
+    # Vende junior0 (30, la base). Master arriba (35) y Elite (40): diferenciales 5 y 5.
     j = {'id': 'j', 'tier': 'junior0'}
-    s = {'id': 's', 'tier': 'senior'}
+    s = {'id': 's', 'tier': 'master'}
     e = {'id': 'e', 'tier': 'elite'}
     b = pyramid.compute_commission_breakdown(10000, j, [s, e])
     amounts = {r['distributor_id']: r['amount'] for r in b}
-    assert amounts == {'j': 2000, 's': 1000, 'e': 1000}   # 20 + 10 + 10
+    assert amounts == {'j': 3000, 's': 500, 'e': 500}    # 30 + 5 + 5
     assert pyramid.total_amount(b) == 4000                 # 40% total = tasa del más alto
 
 
 def test_pyramid_adjacent_levels_split_by_the_gap():
-    j1 = {'id': 'j1', 'tier': 'junior1'}      # 25
-    se = {'id': 'se', 'tier': 'senior'}        # 30
+    se = {'id': 'se', 'tier': 'senior'}        # 30 (la base)
     ma = {'id': 'ma', 'tier': 'master'}        # 35
-    b = pyramid.compute_commission_breakdown(10000, j1, [se, ma])
+    el = {'id': 'el', 'tier': 'elite'}         # 40
+    b = pyramid.compute_commission_breakdown(10000, se, [ma, el])
     amounts = {r['distributor_id']: r['amount'] for r in b}
-    assert amounts == {'j1': 2500, 'se': 500, 'ma': 500}   # 25 + 5 + 5 = 35
+    assert amounts == {'se': 3000, 'ma': 500, 'el': 500}   # 30 + 5 + 5 = 40
+
+
+def test_un_upline_de_la_misma_base_no_cobra_dos_veces():
+    """junior0 y senior valen los dos 30 desde la reancla: el de arriba no cobra
+    un diferencial que no existe. Antes eran 20 y 30 y sí había hueco."""
+    j = {'id': 'j', 'tier': 'junior0'}
+    se = {'id': 'se', 'tier': 'senior'}
+    b = pyramid.compute_commission_breakdown(10000, j, [se])
+    assert [r['distributor_id'] for r in b] == ['j']
+    assert pyramid.total_amount(b) == 3000
 
 
 def test_pyramid_skipped_level_is_absorbed_by_the_one_above():
-    # junior0 (20) con un Master (35) directo arriba, sin nadie en medio:
-    # el Master absorbe todo el hueco → 15%. Total 35.
+    # junior0 (30, la base) con un Elite (40) directo arriba, sin nadie en medio:
+    # el Elite absorbe todo el hueco → 10%. Total 40.
     j = {'id': 'j', 'tier': 'junior0'}
-    ma = {'id': 'ma', 'tier': 'master'}
-    b = pyramid.compute_commission_breakdown(10000, j, [ma])
+    el = {'id': 'el', 'tier': 'elite'}
+    b = pyramid.compute_commission_breakdown(10000, j, [el])
     amounts = {r['distributor_id']: r['amount'] for r in b}
-    assert amounts == {'j': 2000, 'ma': 1500}              # 20 + 15 = 35
-    assert pyramid.total_amount(b) == 3500
+    assert amounts == {'j': 3000, 'el': 1000}              # 30 + 10 = 40
+    assert pyramid.total_amount(b) == 4000
 
 
 def test_pyramid_lower_upline_earns_nothing():
     # Un upline de MENOR nivel que alguien debajo no cobra (diferencial negativo).
     ma = {'id': 'ma', 'tier': 'master'}        # vende Master 35
-    j = {'id': 'j', 'tier': 'junior0'}          # arriba un junior0 20 (raro pero posible)
+    j = {'id': 'j', 'tier': 'junior0'}          # arriba un junior0 (30, la base)
     b = pyramid.compute_commission_breakdown(10000, ma, [j])
     assert [r['distributor_id'] for r in b] == ['ma']       # el junior0 no cobra
     assert pyramid.total_amount(b) == 3500
@@ -701,19 +728,29 @@ def test_pyramid_discount_comes_out_of_seller_slice_only():
 
 
 def test_pyramid_discount_capped_at_sellers_rate():
-    j = {'id': 'j', 'tier': 'junior0'}         # 20
+    j = {'id': 'j', 'tier': 'junior0'}         # 30 (la base)
     b = pyramid.compute_commission_breakdown(10000, j, [], discount_rate=0.50)
-    assert b[0]['discount'] == 0.20 and b[0]['amount'] == 0   # no puede dar más de su 20
+    assert b[0]['discount'] == 0.30 and b[0]['amount'] == 0   # no puede dar más de su 30
+
+
+def test_la_comision_es_la_base_menos_el_descuento_que_dio():
+    """La regla nueva en una línea: 30% menos lo que regaló (Christián, 2026-07-30).
+    Vende $10,000 con 15% de descuento → se queda 15% = $1,500."""
+    d = {'id': 'd', 'tier': 'junior0'}
+    b = pyramid.compute_commission_breakdown(10000, d, [], discount_rate=0.15)
+    assert b[0]['amount'] == 1500
+    # Sin descuento se queda la base completa.
+    assert pyramid.compute_commission_breakdown(10000, d, [])[0]['amount'] == 3000
 
 
 def test_pyramid_max_discount_equals_commission():
     assert pyramid.max_discount('elite') == 0.40
-    assert pyramid.max_discount('junior0') == 0.20
+    assert pyramid.max_discount('junior0') == 0.30
 
 
 def test_pyramid_never_pays_the_same_distributor_twice():
     j = {'id': 'j', 'tier': 'junior0'}
-    b = pyramid.compute_commission_breakdown(10000, j, [j, {'id': 's', 'tier': 'senior'}])
+    b = pyramid.compute_commission_breakdown(10000, j, [j, {'id': 's', 'tier': 'master'}])
     assert [r['distributor_id'] for r in b] == ['j', 's']
 
 
@@ -831,17 +868,24 @@ def test_discount_tiers_diamond_ends_at_38():
 
 # ---------- Comisión puesta A MANO por el admin (manda sobre el nivel) ----------
 def test_effective_rate_prefers_manual_commission_over_tier():
-    # El caso de Alanís: nivel junior (20%) pero Christian le puso 40% a mano.
-    alanis = {'tier': 'junior', 'commission_rate': 0.40}
-    assert pyramid.effective_rate(alanis) == 0.40
+    # Christián todavía puede subirle la comisión a alguien sin moverlo de nivel.
+    subido = {'tier': 'junior', 'commission_rate': 0.40}
+    assert pyramid.effective_rate(subido) == 0.40
     # Y por eso puede dar hasta 35% de descuento.
-    assert pyramid.discount_tiers_for(pyramid.effective_rate(alanis)) == [0.15, 0.20, 0.25, 0.30, 0.35]
+    assert pyramid.discount_tiers_for(pyramid.effective_rate(subido)) == [0.15, 0.20, 0.25, 0.30, 0.35]
 
 
 def test_effective_rate_keeps_tier_when_manual_is_lower():
     assert pyramid.effective_rate({'tier': 'elite', 'commission_rate': 0.25}) == 0.40
     assert pyramid.effective_rate({'tier': 'senior'}) == 0.30
-    assert pyramid.effective_rate({}) == pyramid.TIER_RATES['junior0']
+    assert pyramid.effective_rate({}) == pyramid.BASE_RATE
+
+
+def test_una_manual_por_debajo_de_la_base_ya_no_baja_a_nadie():
+    """Reancla del 2026-07-30: la base de 30% es un PISO. Una manual vieja de 20%
+    guardada en la base de datos no puede dejar a nadie por debajo del canal."""
+    assert pyramid.effective_rate({'tier': 'junior0', 'commission_rate': 0.20}) == 0.30
+    assert pyramid.effective_rate({'tier': 'junior1', 'commission_rate': 0.0}) == 0.30
 
 
 def test_effective_rate_never_passes_the_manual_cap():

@@ -42,6 +42,9 @@ from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
 from microsoft_auth import verify_microsoft_token, microsoft_enabled, MICROSOFT_CLIENT_ID
 import loyalty
 import pyramid
+# LA REGLA DE 5 (consumo propio de distribuidores) y el cierre de la puerta
+# anónima. Módulo puro para poder probarlo de verdad; ver descuentos.py.
+import descuentos
 # ⛔ QUÉ CUENTA COMO INGRESO. Una sola regla para todo el backend: ver cobrado.py.
 # Los nombres se re-exportan aquí porque medio server.py (y los tests) ya los usaban
 # cuando la regla vivía dentro de este archivo.
@@ -2410,26 +2413,66 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     else:
         discount_rate = 0.15 if discountable >= 35000 else 0.10
     # COMPRA PROPIA de un distribuidor (regla de Christian, 2026-07-25): compra para
-    # sí mismo con SU comisión máxima como descuento (Alanís al 40% paga 60%). Ese
-    # descuento ES su comisión, cobrada por adelantado: NO gana comisión encima, y la
-    # orden no se atribuye a nadie. Sigue acotado al tope de cada producto (el ROI
-    # manda) y los insumos siguen fuera.
+    # sí mismo con SU comisión máxima como descuento. Ese descuento ES su comisión,
+    # cobrada por adelantado: NO gana comisión encima, y la orden no se atribuye a
+    # nadie. Sigue acotado al tope de cada producto (el ROI manda) y los insumos
+    # siguen fuera.
+    #
+    # `tasa_base` es el precio de CLIENTE de esta compra: cupón, código, o la promo
+    # automática. Se guarda aparte porque la REGLA DE 5 lo necesita: los renglones que
+    # no llegan a cinco piezas pagan eso, no el precio de distribuidor.
+    tasa_base = discount_rate
     own_rate = buyer_own_rate(user)
-    if own_rate > 0:
-        discount_rate = max(discount_rate, own_rate)
-        if user.get('role') == 'distributor':
-            referrer = None   # su propia compra no se le atribuye ni le paga comision
+    # ⛔ LA PUERTA ANÓNIMA (Christián, 2026-07-30). Hasta hoy, un distribuidor que
+    # cerraba su sesión y compraba con SU PROPIO código se llevaba las tres cosas:
+    # el descuento del código, la comisión encima, y el crédito de venta de nivel —
+    # `buyer_own_rate` veía a un invitado (0) y `referrer` no se anulaba. Salía más
+    # barato comprar deslogueado que entrando a su cuenta. Si el correo del comprador
+    # es el del dueño del código, es compra propia y se trata como tal.
+    # Sólo empareja por correo EXACTO: adivinar de más le quitaría su comisión a
+    # alguien que sí vendió (ver descuentos.motivo_de_compra_propia).
+    motivo_propio = descuentos.motivo_de_compra_propia(user, referrer, payload.customer.email)
+    compra_propia = bool(motivo_propio)
+    if motivo_propio == 'correo':
+        own_rate = max(own_rate, pyramid.effective_rate(referrer))
+        logger.info('Compra propia detectada por correo (%s): sin comisión ni crédito de nivel.',
+                    referrer.get('email'))
+    if compra_propia:
+        referrer = None   # su propia compra no se le atribuye ni le paga comision
+    elif own_rate > 0:
+        # Cliente con trato especial (`personal_discount_rate`): sigue siendo un
+        # descuento PAREJO para todo el carrito. La regla de 5 es del canal de
+        # distribuidores, no de un trato negociado con un cliente.
+        tasa_base = max(tasa_base, own_rate)
+    # LA REGLA DE 5, por PRODUCTO ya resuelto contra el catálogo (no por el texto que
+    # mandó el carrito): el precio de distribuidor sólo baja en los renglones que
+    # juntan 5 o más piezas del mismo producto; los de 1 a 4 pagan precio de cliente.
+    tasas_pedidas = descuentos.tasas_por_producto(
+        {clave: g['total'] for clave, g in pedido_por_producto.items()},
+        tasa_base, own_rate, compra_propia)
+    regla_de_5 = (descuentos.faltantes_para_precio_distribuidor(pedido_por_producto)
+                  if compra_propia and own_rate > tasa_base + 1e-9 else [])
+
+    def _clave_de(item):
+        d = _pflags.get(item.product_id)
+        return d['id'] if d else item.product_id
+
+    def _pedida_de(item):
+        return tasas_pedidas.get(_clave_de(item), tasa_base)
+
     # Descuento RENGLÓN POR RENGLÓN: cada producto recibe el menor entre el descuento
     # pedido y su propio tope. Los que reciben menos se listan para poder avisarle al
     # cliente ("producto no participante, se aplicó un descuento alterno").
-    discount = 0
-    discount_capped = []
-    for it in payload.items:
-        r = _disc_of(it, discount_rate)
-        discount += round(it.price * it.quantity * r)
-        if r < discount_rate - 1e-9:
-            discount_capped.append({'name': it.name, 'product_id': it.product_id,
-                                    'applied_rate': round(r, 4), 'asked_rate': round(discount_rate, 4)})
+    #
+    # `discount_rate` de la orden = la MAYOR tasa pedida del carrito. Lo leen los
+    # puntos (el 40% no genera), los reportes y las fichas de pedido, y con un carrito
+    # parejo —que es todo lo que existía hasta hoy— vale exactamente lo mismo que
+    # antes. El promedio efectivo no sirve aquí: pintaría "34.7%" en los reportes y
+    # aflojaría el candado del 40% sin que nadie lo decidiera. El desglose fino, el
+    # que sí explica qué pagó cada renglón, va en `discount_lines`.
+    discount, discount_rate, discount_capped, discount_lines = descuentos.repartir(
+        payload.items, _clave_de, lambda it: _cap_of(it) if _eligible(it) else 0.0,
+        tasas_pedidas, tasa_base)
     after_discount = subtotal - discount
     # Lealtad: el canje se limita al saldo real y a la mercancia (el envio va en dinero).
     points_used = 0
@@ -2489,7 +2532,10 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
             if not _eligible(it):
                 continue
             cap = _cap_of(it)
-            disc = _disc_of(it, discount_rate)   # el descuento que de verdad se dio
+            # El descuento que de verdad se dio EN ESE RENGLÓN. Con la regla de 5 dos
+            # renglones del mismo pedido pueden llevar tasas distintas, y el tope
+            # (descuento + comisión) se calcula contra la de cada uno.
+            disc = _disc_of(it, _pedida_de(it))
             amt = it.price * it.quantity
             # Lo que queda del tope después del descuento es lo máximo que puede
             # repartirse en comisiones. Si el descuento se comió el tope, es 0.
@@ -2522,6 +2568,8 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         discount=discount,
         discount_rate=discount_rate,
         discount_capped=discount_capped,
+        discount_lines=discount_lines,
+        regla_de_5=regla_de_5,
         shipping=shipping,
         shipping_quote=shipping_quote,
         shipping_cost=costo_guia,
@@ -4927,6 +4975,65 @@ async def arrancar_recuperacion():
             except Exception:
                 logger.exception('Fallo el barrido de carritos abandonados')
     asyncio.create_task(bucle())
+
+
+@app.on_event('startup')
+async def reanclar_comisiones_en_la_base():
+    """TODOS LOS DISTRIBUIDORES ARRANCAN EN 30% — Christián, 2026-07-30.
+
+    «Todos los distribuidores van a empezar a partir de ahora a recibir un 30% de
+    comisión (menos el % que hayan otorgado de descuento) y de ahí irán subiendo».
+
+    El piso lo pone `pyramid.BASE_RATE` y cubre a los niveles bajos. Pero hay tres
+    tasas puestas A MANO por encima (María 40%, Alanís 40%, Javier 35%) y esas viven
+    en la base, no en el código: sin esto seguirían cobrando 40 y 35 mientras el resto
+    entra en 30. Aquí se bajan a la base.
+
+    ⚠️ SE GUARDA EL ANTES. Cada tasa anterior queda en el propio usuario
+    (`commission_rate_previo`) y la foto completa en `db.migraciones`, para poder
+    revertir de un jalón si Christián cambia de opinión.
+
+    Corre sola al arrancar y UNA sola vez: la marca se toma con un upsert atómico,
+    así que si dos procesos arrancan a la vez sólo uno la aplica.
+    """
+    MARCA = 'reancla-comision-30-2026-07-30'
+    try:
+        tomada = await db.migraciones.update_one(
+            {'id': MARCA}, {'$setOnInsert': {'id': MARCA, 'empezada_en': now_iso()}}, upsert=True)
+        if tomada.upserted_id is None:
+            return   # ya se aplicó (o la está aplicando otro proceso)
+        antes = await db.users.find(
+            {'role': 'distributor'},
+            {'_id': 0, 'id': 1, 'name': 1, 'email': 1, 'tier': 1,
+             'commission_rate': 1, 'customer_discount_rate': 1}).to_list(1000)
+        cambiados = []
+        for u in antes:
+            previo = float(u.get('commission_rate') or 0)
+            if previo <= pyramid.BASE_RATE + 1e-9:
+                continue
+            await db.users.update_one({'id': u['id']}, {'$set': {
+                'commission_rate': pyramid.BASE_RATE,
+                'commission_rate_previo': previo,
+                'commission_reanclada_en': now_iso(),
+            }})
+            fresco = await db.users.find_one({'id': u['id']}, {'_id': 0, 'password_hash': 0})
+            # Sus códigos AUTO se rehacen con la tasa nueva: los de 30% y 35% que ya no
+            # le corresponden se desactivan solos (ver `_ensure_distributor_codes`).
+            await _ensure_distributor_codes(fresco)
+            cambiados.append({'id': u['id'], 'name': u.get('name'), 'email': u.get('email'),
+                              'antes': previo, 'despues': pyramid.BASE_RATE})
+            logger.warning('COMISIÓN REANCLADA: %s (%s) %.0f%% → %.0f%%',
+                           u.get('name'), u.get('email'), previo * 100,
+                           pyramid.BASE_RATE * 100)
+        await db.migraciones.update_one({'id': MARCA}, {'$set': {
+            'aplicada_en': now_iso(), 'base': pyramid.BASE_RATE,
+            'antes': antes, 'cambiados': cambiados,
+        }})
+        logger.info('Reancla de comisiones al %.0f%%: %d distribuidores revisados, %d cambiados.',
+                    pyramid.BASE_RATE * 100, len(antes), len(cambiados))
+    except Exception:
+        # Que no tumbe el arranque: el piso de 30% ya lo da el código aunque esto falle.
+        logger.exception('No se pudo reanclar las comisiones en la base del canal')
 
 
 @app.on_event('startup')
