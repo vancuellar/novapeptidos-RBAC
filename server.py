@@ -34,6 +34,7 @@ import coa_store
 import ficha_store
 import secretos
 import meta_ads
+import meta_capi
 import marketing
 import director
 import recovery
@@ -75,6 +76,7 @@ from emails import (
     send_welcome_email, send_reset_email, send_verification_email,
     send_invitation_email, send_order_email, send_payment_confirmed_email, normalize_language, email_enabled,
     send_admin_notification, send_distributor_welcome_email, send_news_email,
+    send_purchase_alert,
 )
 from datetime import timedelta
 import asyncio
@@ -2320,6 +2322,10 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     if payload.payment_method == 'spei':
         email_order['spei'] = spei_details()   # la CLABE también va en el correo
     asyncio.create_task(send_order_email(email_order, user.get('language') if user else None))
+    # Y el aviso interno: Christián necesita saber QUÉ PREPARAR, sobre todo si el pedido
+    # trae piezas que hay que mandar pedir. En segundo plano como el del cliente: el
+    # checkout no se cae porque el correo no salga.
+    asyncio.create_task(send_purchase_alert(email_order, 'nuevo'))
     result = clean(order.model_dump())
     # Cripto: creamos la factura del proveedor encendido y devolvemos su enlace.
     # El pedido queda 'pendiente' hasta que su webhook confirme que llegó el
@@ -2388,10 +2394,19 @@ async def _confirm_paid_order(order_number: str):
         fresh = await db.orders.find_one({'id': order['id']}, {'_id': 0})
         await award_order_points(fresh)
         asyncio.create_task(send_payment_confirmed_email(fresh))
+        # Segundo aviso a Christián: el primero dice qué se va a necesitar, éste dice que
+        # ya se puede mandar. Con uno solo, o se prepara mercancía que nadie pagó o se
+        # entera tarde de que ya puede salir.
+        asyncio.create_task(send_purchase_alert(fresh, 'pagado'))
         # La guía se compra sola en cuanto entra el dinero (tarjeta, OXXO, cripto).
         # En segundo plano: el webhook de la pasarela no debe quedarse esperando a
         # la paquetería — si tarda o falla, el pago ya quedó confirmado igual.
         asyncio.create_task(comprar_guia_del_pedido(fresh))
+        # Y se le avisa a Meta que ENTRÓ EL DINERO (Conversions API). Sin esto,
+        # las compras que llegan sin cookie —las de WhatsApp— Meta no las ve, y
+        # una campaña que no ve compras no puede optimizar a Compras. En segundo
+        # plano y a prueba de fallos: medir nunca debe tumbar un webhook de pago.
+        asyncio.create_task(meta_capi.enviar_compra(fresh))
 
 
 @api_router.get('/payments/config')

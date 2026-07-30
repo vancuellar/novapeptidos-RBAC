@@ -832,3 +832,107 @@ def test_un_pedido_completo_no_lleva_aviso_de_sobre_pedido():
     completo = dict(_PEDIDO_PARTIDO, backorder=False, backorder_items=[])
     h = emails._order_email_html(completo, emails.ORDER_COPY['es'], 'https://x/y')
     assert 'DOS entregas' not in h and 'sobre pedido' not in h
+
+
+# ---------- El aviso interno de compra ----------
+#
+# Christián (2026-07-30): un correo por cada pedido para saber qué preparar y qué mandar
+# pedir. No es el correo del cliente con otro membrete: es una ORDEN DE TRABAJO.
+
+_PEDIDO_AVISO = {
+    'order_number': 'EX-20260730-9999', 'total': 167058.0, 'paid': False,
+    'payment_method': 'spei', 'status': 'pendiente', 'shipping': 0,
+    'items': [{'name': 'Orexin A 10 mg', 'presentation': '10 mg', 'quantity': 21,
+               'price': 9359}],
+    'customer': {'full_name': 'Aidee Liliana García', 'phone': '5555555555',
+                 'email': 'cliente@example.com', 'address': 'Calle 1', 'city': 'CDMX',
+                 'state': 'CDMX', 'postal_code': '01000', 'country': 'MX'},
+    'backorder': True,
+    'backorder_items': [{'product_id': 'p1', 'name': 'Orexin A 10 mg', 'pedidas': 21,
+                         'en_mano': 20, 'por_surtir': 1}],
+}
+
+
+def test_el_aviso_de_compra_dice_QUE_MANDAR_PEDIR_y_va_primero():
+    """Si el desglose va hasta abajo, quien prepara manda el paquete incompleto sin
+    saberlo y nadie sale a comprarle al proveedor lo que falta."""
+    import emails
+    h = emails._aviso_compra_html(_PEDIDO_AVISO, 'https://exygenlabs.com/admin')
+    assert 'HAY QUE MANDAR PEDIR' in h
+    assert 'salen ya: <b>20</b>' in h and 'mandar pedir: <b>1</b>' in h
+    assert h.index('HAY QUE MANDAR PEDIR') < h.index('QUÉ VA EN LA CAJA'), (
+        'el desglose de lo que falta quedó debajo de la lista de empaque')
+
+
+def test_el_aviso_de_compra_trae_todo_lo_que_hace_falta_para_actuar():
+    import emails
+    h = emails._aviso_compra_html(_PEDIDO_AVISO, 'https://exygenlabs.com/admin')
+    for dato in ('EX-20260730-9999', 'Orexin A 10 mg', '×21', 'Aidee Liliana García',
+                 '5555555555', 'cliente@example.com', 'Calle 1', 'CDMX', '01000',
+                 'spei', 'pendiente', 'https://exygenlabs.com/admin'):
+        assert dato in h, f'falta {dato!r} en el aviso'
+    assert 'TODAVÍA NO' in h, 'no dice si ya pagó — es lo que decide si se manda o no'
+
+
+def test_un_pedido_completo_no_lleva_el_bloque_de_mandar_pedir():
+    import emails
+    completo = dict(_PEDIDO_AVISO, backorder=False, backorder_items=[])
+    h = emails._aviso_compra_html(completo, 'https://x/admin')
+    assert 'HAY QUE MANDAR PEDIR' not in h
+
+
+def test_el_aviso_va_al_correo_que_Christian_lee_y_es_configurable():
+    """Estaba clavado en hola@exygenlabs.com, el buzón de la tienda: ahí un aviso que
+    exige moverse se pierde entre los correos de clientes."""
+    import importlib, os
+    import emails
+    assert emails.admin_notify_address() == 'exygenlabs@gmail.com'
+    os.environ['ADMIN_NOTIFY_EMAIL'] = 'otro@exygenlabs.com'
+    try:
+        assert emails.admin_notify_address() == 'otro@exygenlabs.com'
+    finally:
+        del os.environ['ADMIN_NOTIFY_EMAIL']
+    importlib.reload  # (no hace falta recargar: la función lee el entorno cada vez)
+
+
+def test_el_asunto_avisa_del_sobre_pedido_y_distingue_pagado():
+    import asyncio
+    import emails
+    vistos = []
+
+    async def falso(subject, html_body):
+        vistos.append(subject)
+
+    original, emails.send_admin_notification = emails.send_admin_notification, falso
+    os_flag = os.environ.get('EMAIL_ENABLED')
+    os.environ['EMAIL_ENABLED'] = 'true'
+    try:
+        asyncio.new_event_loop().run_until_complete(
+            emails.send_purchase_alert(_PEDIDO_AVISO, 'nuevo'))
+        asyncio.new_event_loop().run_until_complete(
+            emails.send_purchase_alert(dict(_PEDIDO_AVISO, paid=True), 'pagado'))
+    finally:
+        emails.send_admin_notification = original
+        if os_flag is None:
+            del os.environ['EMAIL_ENABLED']
+        else:
+            os.environ['EMAIL_ENABLED'] = os_flag
+
+    assert vistos[0].startswith('Nuevo pedido EX-20260730-9999'), vistos
+    assert vistos[1].startswith('PAGADO: pedido EX-20260730-9999'), vistos
+    for s in vistos:
+        assert 'CON PIEZAS SOBRE PEDIDO' in s, s
+
+
+def test_el_checkout_y_el_webhook_disparan_el_aviso_sin_poder_tumbarlos():
+    """En segundo plano y en los dos momentos: al entrar el pedido y al confirmarse el
+    pago. Un aviso que puede tumbar un checkout no es un aviso, es un riesgo."""
+    src = _fuente()
+    ini = src.index('async def create_order(')
+    cuerpo = src[ini:src.index('\nasync def', ini + 10)]
+    assert "asyncio.create_task(send_purchase_alert(" in cuerpo, (
+        'el checkout no avisa, o avisa esperando al proveedor de correo')
+    ini = src.index('async def _confirm_paid_order(')
+    cuerpo = src[ini:src.index('\nasync def', ini + 10)]
+    assert "send_purchase_alert(fresh, 'pagado')" in cuerpo, (
+        'no avisa cuando entra el dinero: se prepara mercancía que nadie pagó')

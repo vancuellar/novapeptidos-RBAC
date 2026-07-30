@@ -172,13 +172,22 @@ async def _send_action_email(name, email, link, language, subjects, bodies, kind
         logger.exception('Failed to send %s email to %s', kind, email)
 
 
+def admin_notify_address():
+    """A dónde van los avisos internos. Configurable, con el correo que Christián lee.
+
+    Estaba clavado en `hola@exygenlabs.com`, que es el buzón de la tienda: los avisos que
+    tienen que hacer que ALGUIEN SE MUEVA se perdían entre los correos de clientes.
+    Christián los quiere en su cuenta (2026-07-30)."""
+    return (os.environ.get('ADMIN_NOTIFY_EMAIL') or 'exygenlabs@gmail.com').strip()
+
+
 async def send_admin_notification(subject, html_body):
-    """Aviso interno para Christian (hola@). Nunca lanza y calla si el correo
-    saliente está apagado — el flujo que avisa no debe fallar por esto."""
+    """Aviso interno para Christian. Nunca lanza y calla si el correo saliente está
+    apagado — el flujo que avisa no debe fallar por esto."""
     if os.environ.get('EMAIL_ENABLED', 'false').lower() != 'true':
         return
     try:
-        await asyncio.to_thread(_send_email_sync, 'hola@exygenlabs.com', subject, html_body)
+        await asyncio.to_thread(_send_email_sync, admin_notify_address(), subject, html_body)
     except Exception:
         logger.exception('Failed to send admin notification: %s', subject)
 
@@ -851,3 +860,130 @@ async def send_order_email(order, language=None):
         logger.info('Order email sent to %s (order=%s, lang=%s)', to_address, order.get('order_number'), lang)
     except Exception:
         logger.exception('Failed to send order email for %s', order.get('order_number'))
+
+
+# ---------- Aviso interno de compra: qué hay que preparar y mandar ----------
+#
+# Christián (2026-07-30): quiere un correo por cada pedido para saber qué preparar. No es
+# el correo del cliente con otro membrete: es una ORDEN DE TRABAJO. Va en español llano,
+# con lo que hace falta para actuar y nada más — qué empacar, qué HAY QUE MANDAR PEDIR,
+# a dónde va, si ya pagó, y el enlace para abrir la ficha en el Panel.
+#
+# Sale por el mismo camino que los demás correos (Resend, dominio exygenlabs.com) y en
+# segundo plano: si el proveedor de correo está caído, la compra sale igual. Un aviso que
+# puede tumbar un checkout no es un aviso, es un riesgo.
+
+def _aviso_compra_html(order, link_admin):
+    esc = html.escape
+    INK, BODY, MUTED, LINE, BG = '#132763', '#3D4657', '#8A93A8', '#E4E8F0', '#FBFCFE'
+    FONT = 'Helvetica,Arial,sans-serif'
+    c = order.get('customer', {}) or {}
+
+    def fila(k, v):
+        return (f'<tr><td style="padding:3px 0;font-family:{FONT};font-size:13px;color:{MUTED};'
+                f'white-space:nowrap;padding-right:12px;">{k}</td>'
+                f'<td style="padding:3px 0;font-family:{FONT};font-size:13px;color:{BODY};">{v}</td></tr>')
+
+    articulos = ''.join(
+        f'<tr><td style="padding:6px 0;border-bottom:1px solid {LINE};font-family:{FONT};'
+        f'font-size:14px;color:{BODY};">{esc(str(it.get("name", "")))}'
+        f'<span style="color:{MUTED};"> {esc(str(it.get("presentation") or ""))}</span></td>'
+        f'<td align="right" style="padding:6px 0;border-bottom:1px solid {LINE};font-family:{FONT};'
+        f'font-size:15px;font-weight:bold;color:{INK};white-space:nowrap;">×{int(it.get("quantity", 1) or 1)}</td></tr>'
+        for it in order.get('items', []))
+
+    # ⛔ LO PRIMERO DEL CORREO SI EXISTE: lo que hay que comprarle al proveedor. Si va
+    # hasta abajo, se manda el paquete incompleto y nadie sale a comprar lo que falta.
+    pedir = ''
+    if order.get('backorder_items'):
+        renglones = ''.join(
+            f'<tr><td style="padding:3px 0;font-family:{FONT};font-size:13px;color:{BODY};">'
+            f'{esc(str(b.get("name", "")))}</td>'
+            f'<td align="right" style="padding:3px 0;font-family:{FONT};font-size:13px;color:{BODY};'
+            f'white-space:nowrap;">salen ya: <b>{int(b.get("en_mano", 0) or 0)}</b> · '
+            f'mandar pedir: <b>{int(b.get("por_surtir", 0) or 0)}</b></td></tr>'
+            for b in order['backorder_items'])
+        pedir = (
+            f'<div style="background:#FFF6E5;border:2px solid #E0A800;border-radius:10px;'
+            f'padding:14px 16px;margin-bottom:16px;">'
+            f'<div style="font-family:{FONT};font-size:14px;font-weight:bold;color:#7A5A00;'
+            f'padding-bottom:6px;">HAY QUE MANDAR PEDIR</div>'
+            f'<table width="100%" cellpadding="0" cellspacing="0">{renglones}</table>'
+            f'<div style="font-family:{FONT};font-size:12px;color:#7A5A00;padding-top:8px;">'
+            f'Este pedido no sale completo de la bodega. Al cliente ya se le avisó que llega '
+            f'en dos entregas: lo que hay en 2 a 5 días y el resto alrededor de una semana '
+            f'después.</div></div>')
+
+    pagado = ('<span style="color:#1B7F4B;font-weight:bold;">SÍ — ya entró el dinero</span>'
+              if order.get('paid') else
+              '<span style="color:#B54708;font-weight:bold;">TODAVÍA NO — está por cobrarse</span>')
+    envio = order.get('shipping', 0) or 0
+    direccion = '<br>'.join(esc(x) for x in [
+        c.get('address', ''), c.get('address_2', ''),
+        ', '.join(b for b in [c.get('city', ''), c.get('state', ''), c.get('postal_code', '')] if b),
+        c.get('country', ''),
+    ] if x)
+
+    return f"""<!DOCTYPE html>
+<html lang="es-MX">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{DARK_EMAIL_STYLE}</head>
+<body style="margin:0;padding:0;background:{BG};">
+  <div style="max-width:600px;margin:0 auto;padding:24px 20px;font-family:{FONT};">
+    <div style="font-size:12px;letter-spacing:2px;color:{MUTED};">EXYGEN LABS · AVISO INTERNO</div>
+    <h1 style="margin:6px 0 2px 0;font-size:22px;color:{INK};">Entró un pedido</h1>
+    <div style="font-family:{FONT};font-size:18px;font-weight:bold;color:{INK};letter-spacing:1px;
+                padding-bottom:16px;">{esc(str(order.get('order_number', '')))}</div>
+    {pedir}
+    <div style="font-size:13px;font-weight:bold;color:{INK};padding-bottom:4px;">QUÉ VA EN LA CAJA</div>
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;">{articulos}</table>
+
+    <div style="font-size:13px;font-weight:bold;color:{INK};padding-bottom:4px;">EL DINERO</div>
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;">
+      {fila('Total', f'<b style="font-size:15px;color:{INK};">{_money(order.get("total", 0))}</b>')}
+      {fila('¿Ya pagó?', pagado)}
+      {fila('Cómo paga', esc(str(order.get('payment_method', ''))))}
+      {fila('Estado', esc(str(order.get('status', ''))))}
+      {fila('Envío', 'Gratis (lo absorbe la casa)' if not envio else _money(envio))}
+    </table>
+
+    <div style="font-size:13px;font-weight:bold;color:{INK};padding-bottom:4px;">A QUIÉN Y A DÓNDE</div>
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;">
+      {fila('Cliente', esc(str(c.get('full_name', ''))))}
+      {fila('Teléfono', esc(str(c.get('phone', ''))))}
+      {fila('Correo', esc(str(c.get('email', ''))))}
+      {fila('Dirección', direccion)}
+      {fila('Notas', esc(str(c.get('notes', '') or '—')))}
+    </table>
+
+    <a href="{link_admin}" style="display:inline-block;background:{INK};color:#FFFFFF;font-size:14px;
+       font-weight:bold;text-decoration:none;padding:12px 28px;border-radius:999px;">Abrir en el Panel</a>
+  </div>
+</body>
+</html>"""
+
+
+async def send_purchase_alert(order, momento='nuevo'):
+    """Le avisa a Christián que entró un pedido (o que ya se pagó).
+
+    `momento`: 'nuevo' al crearse, 'pagado' cuando el webhook confirma el dinero. Son dos
+    avisos a propósito: uno dice qué se va a necesitar y el otro dice que ya se puede
+    mandar. Con uno solo, o se prepara mercancía que nadie pagó o se entera tarde.
+
+    Nunca lanza: se llama en segundo plano y una compra no puede fallar porque el correo
+    no salga."""
+    if not email_enabled():
+        logger.info('EMAIL_ENABLED != true, skipping purchase alert for %s',
+                    order.get('order_number'))
+        return
+    numero = order.get('order_number', '')
+    site = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+    marca = ' · CON PIEZAS SOBRE PEDIDO' if order.get('backorder_items') else ''
+    asunto = (f'PAGADO: pedido {numero} — {_money(order.get("total", 0))}{marca}'
+              if momento == 'pagado' else
+              f'Nuevo pedido {numero} — {_money(order.get("total", 0))}{marca}')
+    try:
+        await send_admin_notification(asunto, _aviso_compra_html(order, f'{site}/admin'))
+        logger.info('Purchase alert (%s) sent for %s to %s', momento, numero,
+                    admin_notify_address())
+    except Exception:
+        logger.exception('Failed to send purchase alert for %s', numero)
