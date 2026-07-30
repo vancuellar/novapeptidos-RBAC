@@ -11,11 +11,17 @@ checkout use estas funciones y no una copia — que es el error que se paga caro
 la regla vive en un lado y el dinero se calcula en otro.
 """
 import inspect
+import os
 from types import SimpleNamespace
 
-import descuentos
-import pyramid
-import server
+# database.py exige MONGO_URL al importar; el cliente de motor es perezoso, así que
+# nunca se conecta a nada. Va aquí y no prestado de otro archivo de pruebas: correr
+# ESTE solo tiene que funcionar.
+os.environ.setdefault('MONGO_URL', 'mongodb://localhost:27017')
+
+import descuentos    # noqa: E402
+import pyramid       # noqa: E402
+import server        # noqa: E402
 
 
 CLIENTE = 0.10          # precio de cliente: la promo automática de siempre
