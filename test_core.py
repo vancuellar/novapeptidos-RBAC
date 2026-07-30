@@ -1498,6 +1498,88 @@ def test_la_lista_admin_si_incluye_los_ocultos():
         _srv.db = original
 
 
+# ---------- Orden del catálogo: por nombre y por categoría ----------
+# Christián lo pidió (otra vez, 2026-07-30): ordenar productos por nombre en el
+# panel de Admin y en el catálogo público, y de paso también por categoría.
+
+def _productos_de_prueba():
+    return [
+        {'name': 'Retatrutida', 'category': 'metabolico'},
+        {'name': 'ácido Hialurónico', 'category': 'bienestar'},   # acento: prueba que no se vaya al final
+        {'name': 'BPC-157', 'category': 'recuperacion'},
+        {'name': 'Ñandú Peptide', 'category': 'bienestar'},        # ñ: no debe tronar el orden
+        {'name': 'GHK-Cu', 'category': 'recuperacion'},
+    ]
+
+
+def test_lista_publica_ordena_por_nombre_asc_y_desc():
+    class _Cursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        async def to_list(self, _n):
+            return list(self._rows)
+
+    class _Products:
+        def find(self, _query, _proj):
+            return _Cursor(_productos_de_prueba())
+
+    class _DB:
+        products = _Products()
+
+    original = _srv.db
+    _srv.db = _DB()
+    try:
+        asc = asyncio.new_event_loop().run_until_complete(_srv.list_products(sort='name_asc'))
+        nombres_asc = [p['name'] for p in asc]
+        assert nombres_asc == ['ácido Hialurónico', 'BPC-157', 'GHK-Cu', 'Ñandú Peptide', 'Retatrutida']
+
+        desc = asyncio.new_event_loop().run_until_complete(_srv.list_products(sort='name_desc'))
+        assert [p['name'] for p in desc] == list(reversed(nombres_asc))
+    finally:
+        _srv.db = original
+
+
+def test_lista_publica_ordena_por_categoria_y_desempata_por_nombre():
+    """Dentro de cada categoría, el nombre siempre queda A-Z, sin importar si
+    la categoría se pidió A-Z o Z-A: el resultado tiene que ser predecible."""
+    class _Cursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        async def to_list(self, _n):
+            return list(self._rows)
+
+    class _Products:
+        def find(self, _query, _proj):
+            return _Cursor(_productos_de_prueba())
+
+    class _DB:
+        products = _Products()
+
+    original = _srv.db
+    _srv.db = _DB()
+    try:
+        asc = asyncio.new_event_loop().run_until_complete(_srv.list_products(sort='category_asc'))
+        vistos = [(p['category'], p['name']) for p in asc]
+        assert vistos == [
+            ('bienestar', 'ácido Hialurónico'), ('bienestar', 'Ñandú Peptide'),
+            ('metabolico', 'Retatrutida'),
+            ('recuperacion', 'BPC-157'), ('recuperacion', 'GHK-Cu'),
+        ]
+
+        desc = asyncio.new_event_loop().run_until_complete(_srv.list_products(sort='category_desc'))
+        vistos_desc = [(p['category'], p['name']) for p in desc]
+        # Las categorías se invierten, pero BPC-157 sigue antes que GHK-Cu dentro de 'recuperacion'.
+        assert vistos_desc == [
+            ('recuperacion', 'BPC-157'), ('recuperacion', 'GHK-Cu'),
+            ('metabolico', 'Retatrutida'),
+            ('bienestar', 'ácido Hialurónico'), ('bienestar', 'Ñandú Peptide'),
+        ]
+    finally:
+        _srv.db = original
+
+
 # ---------- El precio lo pone el SERVIDOR, nunca el navegador ----------
 # Hasta el 2026-07-27 `/orders` sumaba `item.price` tal como venía en la petición: se podía
 # mandar precio 0 y llevarse un vial de $9,359 pagando los $250 del envío. Lo cazó una

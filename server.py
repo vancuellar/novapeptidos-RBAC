@@ -114,6 +114,15 @@ async def resolve_distributor(code):
 CODE_TTL_DAYS = 90   # rotación automática: los códigos se renuevan cada 90 días
 
 
+def _texto_ordenable(texto: str) -> str:
+    """Llave de orden para 'sort=name_*'/'category_*' del catalogo: minusculas
+    y sin acentos, para que "Nombre" y "nombre" (o "Péptido" y "Peptido")
+    queden juntos en vez de separados por mayusculas/acentos."""
+    import unicodedata
+    t = unicodedata.normalize('NFKD', str(texto or ''))
+    return ''.join(c for c in t if not unicodedata.combining(c)).lower()
+
+
 def gen_sku(name: str, presentation: str = '') -> str:
     """SKU legible y estable a partir del nombre: 'BPC-157 5 mg' -> 'BPC157-5MG'.
 
@@ -976,6 +985,17 @@ async def list_products(
         products.sort(key=lambda p: p.get('price', 0), reverse=True)
     elif sort == 'newest':
         products.sort(key=lambda p: p.get('created_at', ''), reverse=True)
+    elif sort == 'name_asc':
+        products.sort(key=lambda p: _texto_ordenable(p.get('name', '')))
+    elif sort == 'name_desc':
+        products.sort(key=lambda p: _texto_ordenable(p.get('name', '')), reverse=True)
+    elif sort in ('category_asc', 'category_desc'):
+        # Dos pasadas con sort estable: primero nombre (A-Z, siempre), luego
+        # categoría (en la dirección pedida). Así el resultado dentro de cada
+        # categoría queda predecible sin importar si la categoría va A-Z o Z-A.
+        products.sort(key=lambda p: _texto_ordenable(p.get('name', '')))
+        products.sort(key=lambda p: _texto_ordenable(p.get('category', '')),
+                      reverse=(sort == 'category_desc'))
     return products
 
 
