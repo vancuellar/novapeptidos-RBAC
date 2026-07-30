@@ -930,11 +930,13 @@ def test_el_checkout_y_el_webhook_disparan_el_aviso_sin_poder_tumbarlos():
     src = _fuente()
     ini = src.index('async def create_order(')
     cuerpo = src[ini:src.index('\nasync def', ini + 10)]
-    assert "asyncio.create_task(send_purchase_alert(" in cuerpo, (
+    # `_avisar_de_la_compra` es `send_purchase_alert` + A QUIÉN COMPRARLE pegado a los
+    # renglones sobre pedido (Christián, 2026-07-30). Sigue siendo en segundo plano.
+    assert "asyncio.create_task(_avisar_de_la_compra(" in cuerpo, (
         'el checkout no avisa, o avisa esperando al proveedor de correo')
     ini = src.index('async def _confirm_paid_order(')
     cuerpo = src[ini:src.index('\nasync def', ini + 10)]
-    assert "send_purchase_alert(fresh, 'pagado')" in cuerpo, (
+    assert "_avisar_de_la_compra(fresh, 'pagado')" in cuerpo, (
         'no avisa cuando entra el dinero: se prepara mercancía que nadie pagó')
 
 

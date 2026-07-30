@@ -45,6 +45,8 @@ import pyramid
 # LA REGLA DE 5 (consumo propio de distribuidores) y el cierre de la puerta
 # anónima. Módulo puro para poder probarlo de verdad; ver descuentos.py.
 import descuentos
+# Los TEXTOS de la campanita cuando entra una venta (en los tres idiomas).
+import avisos_de_venta
 # ⛔ QUÉ CUENTA COMO INGRESO. Una sola regla para todo el backend: ver cobrado.py.
 # Los nombres se re-exportan aquí porque medio server.py (y los tests) ya los usaban
 # cuando la regla vivía dentro de este archivo.
@@ -198,6 +200,48 @@ async def notify(user_id, ntype, title, body='', link=None, dedup=None):
     await db.notifications.insert_one({
         'id': str(uuid.uuid4()), 'kind': 'personal', 'user_id': user_id, 'type': ntype,
         'title': title, 'body': body, 'link': link, 'dedup': dedup, 'created_at': now_iso()})
+
+
+async def avisar_de_la_venta(order, commissions=None):
+    """LA CAMPANITA CUANDO ENTRA UNA VENTA. Al admin y a quien ganó comisión.
+
+    ⛔ POR QUÉ EXISTE. El sistema avisaba por correo y repartía comisiones, pero la
+    campanita —lo único que se ve al entrar— no decía una palabra de las ventas. El
+    2026-07-30 entraron dos pedidos con el código de María y ni Christián ni ella se
+    enteraron dentro de la app.
+
+    IDEMPOTENTE: `dedup` es el número de pedido, así que volver a llamarla (o el
+    barrido retroactivo) no llena la campanita de repetidos.
+
+    Cada quien en SU idioma: María abre la cuenta en pt-BR.
+    """
+    commissions = commissions if commissions is not None else (order.get('commissions') or [])
+    numero = order.get('order_number') or ''
+    vendedor = None
+    if order.get('referred_by'):
+        vendedor = await db.users.find_one({'id': order['referred_by']},
+                                           {'_id': 0, 'id': 1, 'name': 1, 'preferred_language': 1})
+    # 1) El admin. TODOS los admin, no un correo hardcodeado: si mañana hay dos, los dos
+    # se enteran. El aviso vive en su cuenta, no en un buzón.
+    admins = await db.users.find({'role': 'admin'},
+                                 {'_id': 0, 'id': 1, 'preferred_language': 1}).to_list(20)
+    for a in admins:
+        titulo, cuerpo = avisos_de_venta.aviso_para_el_admin(
+            order, (vendedor or {}).get('name', ''), a.get('preferred_language'))
+        await notify(a['id'], 'venta_admin', titulo, cuerpo,
+                     link=f'/admin?tab=orders', dedup=f'venta:{numero}')
+    # 2) Quien ganó comisión: el vendedor y los uplines, cada uno con SU tajada.
+    for row in (commissions or []):
+        if row.get('amount', 0) <= 0:
+            continue
+        quien = await db.users.find_one({'id': row['distributor_id']},
+                                        {'_id': 0, 'id': 1, 'preferred_language': 1})
+        if not quien:
+            continue
+        titulo, cuerpo = avisos_de_venta.aviso_para_el_vendedor(
+            order, row['amount'], row.get('role') != 'seller', quien.get('preferred_language'))
+        await notify(quien['id'], 'new_sale', titulo, cuerpo,
+                     link='/distribuidor', dedup=f'venta:{numero}')
 
 
 async def broadcast_notification(ntype, title, body='', audience='all', link=None):
@@ -2625,13 +2669,9 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     if coupon and coupon.get('single_use', True):
         await db.discount_codes.update_one({'id': coupon['id']},
                                            {'$set': {'used': True, 'active': False, 'used_order': order.order_number}})
-    # Notificar a quienes ganan comisión en esta venta (vendedor + uplines).
-    for row in commissions:
-        if row.get('amount', 0) > 0:
-            role = 'tu venta' if row['role'] == 'seller' else 'una venta de tu equipo'
-            await notify(row['distributor_id'], 'new_sale', 'Nueva venta',
-                         f"Ganaste ${row['amount']:,.0f} por {role} (pedido {order.order_number}).",
-                         link='/distribuidor')
+    # LA CAMPANITA: el admin y quien ganó comisión se enteran DENTRO de la app, no
+    # sólo por correo (Christián, 2026-07-30).
+    await avisar_de_la_venta(order.model_dump(), commissions)
     if points_used:
         # El saldo YA se restó arriba, apartado en un solo paso condicionado
         # (`_apartar_puntos`). Aquí solo queda el asiento en la bitácora. Se restaba
@@ -2655,8 +2695,9 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     asyncio.create_task(send_order_email(email_order, user.get('language') if user else None))
     # Y el aviso interno: Christián necesita saber QUÉ PREPARAR, sobre todo si el pedido
     # trae piezas que hay que mandar pedir. En segundo plano como el del cliente: el
-    # checkout no se cae porque el correo no salga.
-    asyncio.create_task(send_purchase_alert(email_order, 'nuevo'))
+    # checkout no se cae porque el correo no salga. Y va con A QUIÉN COMPRARLE pegado:
+    # el nombre y el teléfono del proveedor más barato de cada renglón sobre pedido.
+    asyncio.create_task(_avisar_de_la_compra(email_order, 'nuevo'))
     result = clean(order.model_dump())
     # Cripto: creamos la factura del proveedor encendido y devolvemos su enlace.
     # El pedido queda 'pendiente' hasta que su webhook confirme que llegó el
@@ -2728,7 +2769,7 @@ async def _confirm_paid_order(order_number: str):
         # Segundo aviso a Christián: el primero dice qué se va a necesitar, éste dice que
         # ya se puede mandar. Con uno solo, o se prepara mercancía que nadie pagó o se
         # entera tarde de que ya puede salir.
-        asyncio.create_task(send_purchase_alert(fresh, 'pagado'))
+        asyncio.create_task(_avisar_de_la_compra(fresh, 'pagado'))
         # La guía se compra sola en cuanto entra el dinero (tarjeta, OXXO, cripto).
         # En segundo plano: el webhook de la pasarela no debe quedarse esperando a
         # la paquetería — si tarda o falla, el pago ya quedó confirmado igual.
@@ -2968,11 +3009,18 @@ async def admin_orders(archivados: bool = False, admin=Depends(get_current_admin
     filtro = {'archived': True} if archivados else {'archived': {'$ne': True}}
     orders = await db.orders.find(filtro, {'_id': 0}).to_list(500)
     orders.sort(key=lambda o: o.get('created_at', ''), reverse=True)
+    # A QUIÉN COMPRARLE, resuelto por el servidor y no por el Panel: el mapa de
+    # proveedores es privado y no puede viajar entero al navegador. Se pide UNA vez y
+    # se reparte entre los pedidos que traen piezas sobre pedido.
+    mapa = await _mapa_de_proveedores()
     # `pagado` YA RESUELTO por el servidor. El campo `paid` no existe en los pedidos
     # viejos, y si el panel tuviera que adivinarlo tendríamos dos reglas de qué es un
     # ingreso —una aquí y otra en JavaScript— que tarde o temprano se separan. La
     # inferencia se hace en un solo lado (cobrado.py) y viaja resuelta.
-    return [{**o, 'pagado': esta_pagado(o)} for o in orders]
+    return [{**o, 'pagado': esta_pagado(o),
+             **({'backorder_items': _con_proveedor(o['backorder_items'], mapa)}
+                if o.get('backorder_items') else {})}
+            for o in orders]
 
 
 # `ESTADOS_PAGADOS` y `esta_pagado` viven en cobrado.py y se importan arriba: los
@@ -3183,13 +3231,28 @@ async def admin_stats(admin=Depends(get_current_admin)):
     total_products = await db.products.count_documents({})
     total_orders = await db.orders.count_documents({})
     total_users = await db.users.count_documents({'role': 'user'})
-    orders = await db.orders.find({}, {'_id': 0, 'total': 1, 'status': 1, 'paid': 1}).to_list(1000)
+    orders = await db.orders.find(
+        {}, {'_id': 0, 'total': 1, 'status': 1, 'paid': 1,
+             'backorder_items': 1, 'archived': 1}).to_list(1000)
     # El ingreso son los pedidos COBRADOS, no los entregados: ver `esta_pagado`.
     revenue = sum(o.get('total', 0) for o in orders if esta_pagado(o))
     por_cobrar = sum(o.get('total', 0) for o in orders
                      if o.get('status') != 'cancelado' and not esta_pagado(o))
     pending = sum(1 for o in orders if o.get('status') == 'pendiente')
+    # ⛔ LO QUE HAY QUE MANDAR PEDIR, EN LA PORTADA DEL PANEL. Vivía sólo en el correo
+    # y en la ficha de cada pedido: para enterarse había que ir abriendo pedidos uno por
+    # uno. Se cuentan los VIVOS (ni cancelados ni archivados): un pedido cancelado no
+    # necesita que se le compre nada.
+    vivos_con_backorder = [o for o in orders
+                           if o.get('backorder_items') and not o.get('archived')
+                           and o.get('status') != 'cancelado']
+    piezas_por_pedir = sum(int(b.get('por_surtir', 0) or 0)
+                           for o in vivos_con_backorder
+                           for b in (o.get('backorder_items') or []))
     return {
+        # Cuántos pedidos esperan mercancía y cuántas piezas hay que comprar.
+        'pedidos_por_surtir': len(vivos_con_backorder),
+        'piezas_por_pedir': piezas_por_pedir,
         'total_products': total_products,
         'total_orders': total_orders,
         'total_users': total_users,
@@ -3271,6 +3334,98 @@ async def admin_motor_precios_guardar(payload: dict, admin=Depends(get_current_a
                   'subido': datetime.now(timezone.utc).isoformat()}},
         upsert=True)
     return {'ok': True, 'generado': payload.get('generado')}
+
+
+# ---------- A QUIÉN LE COMPRO: el proveedor más barato de cada producto ----------
+#
+# ⛔ ESTO NO SE PUBLICA NUNCA. Nombres de proveedores, teléfonos y costos: los dos
+# extremos van detrás de sesión de admin, igual que la foto del motor de precios. La
+# carpeta `public/` del sitio se sirve entera en exygenlabs.com y ahí no entra nada de
+# esto. Lo genera `publicar_proveedores.py --subir` desde la Mac (la base del motor vive
+# ahí, no en el servidor), por el mismo canal privado que ya usa el tablero de precios.
+@api_router.get('/admin/proveedores')
+async def admin_proveedores(admin=Depends(get_current_admin)):
+    doc = await db.app_data.find_one({'clave': 'proveedores_por_producto'}, {'_id': 0})
+    if not doc:
+        raise HTTPException(
+            status_code=404,
+            detail='Todavía no se ha subido la lista de proveedores. '
+                   'Corre: python3 publicar_proveedores.py --subir')
+    foto = dict(doc.get('valor') or {})
+    foto['frescura'] = _frescura_de_la_foto(doc.get('subido') or '')
+    return foto
+
+
+@api_router.put('/admin/proveedores')
+async def admin_proveedores_guardar(payload: dict, admin=Depends(get_current_admin)):
+    """Recibe el mapa producto → proveedor más barato y lo guarda tal cual."""
+    if not isinstance(payload, dict) or not payload.get('generado'):
+        raise HTTPException(status_code=400,
+                            detail='La lista viene sin fecha de generación.')
+    await db.app_data.update_one(
+        {'clave': 'proveedores_por_producto'},
+        {'$set': {'clave': 'proveedores_por_producto', 'valor': payload,
+                  'subido': datetime.now(timezone.utc).isoformat()}},
+        upsert=True)
+    return {'ok': True, 'generado': payload.get('generado'),
+            'productos': len(payload.get('por_producto') or {})}
+
+
+async def _mapa_de_proveedores():
+    """{clave de producto: a quién comprarle}. Vacío si nunca se ha subido la lista."""
+    doc = await db.app_data.find_one({'clave': 'proveedores_por_producto'}, {'_id': 0})
+    return ((doc or {}).get('valor') or {}).get('por_producto') or {}
+
+
+def _con_proveedor(backorder_items, mapa):
+    """Le pega a cada renglón SOBRE PEDIDO el proveedor más barato y su teléfono.
+
+    ⛔ EL HUECO SE ANUNCIA, NO SE CALLA. Un producto sin proveedor con precio en la base
+    sale marcado (`sin_proveedor`) para que el aviso diga «sin proveedor registrado —
+    revisar motor de precios». Callarlo deja a alguien buscando en el peor momento: con
+    el pedido ya vendido y el cliente esperando.
+    """
+    out = []
+    for b in (backorder_items or []):
+        b = dict(b)
+        # `product_id` aquí ya es el producto RESUELTO contra el catálogo, y el mapa
+        # trae cada producto por su id Y por su SKU: cualquiera de los dos entra.
+        info = mapa.get(str(b.get('product_id') or '')) or mapa.get(str(b.get('sku') or ''))
+        if info and info.get('proveedor'):
+            b['proveedor'] = info.get('proveedor')
+            b['telefono'] = info.get('telefono') or ''
+            b['costo_vial_usd'] = info.get('costo_vial_usd')
+            b['whatsapp'] = info.get('whatsapp') or ''
+            b['proveedor_verificado'] = bool(info.get('verificado'))
+            b['sin_proveedor'] = False
+        else:
+            b['proveedor'] = None
+            b['telefono'] = ''
+            b['sin_proveedor'] = True
+        out.append(b)
+    return out
+
+
+async def _pedido_con_proveedores(order):
+    """El pedido con sus renglones sobre pedido ya resueltos a un proveedor."""
+    if not order.get('backorder_items'):
+        return order
+    return dict(order, backorder_items=_con_proveedor(order['backorder_items'],
+                                                      await _mapa_de_proveedores()))
+
+
+async def _avisar_de_la_compra(order, momento):
+    """El aviso interno, con A QUIÉN COMPRARLE ya pegado a cada renglón sobre pedido.
+
+    Nunca revienta: se llama en segundo plano y una venta no se puede caer porque la
+    lista de proveedores no esté subida. Sin lista, el correo sale como salía antes (y
+    diciendo que no hay proveedor registrado), no deja de salir."""
+    try:
+        order = await _pedido_con_proveedores(order)
+    except Exception:
+        logger.exception('No pude resolver los proveedores del pedido %s',
+                         order.get('order_number'))
+    await send_purchase_alert(order, momento)
 
 
 # Lo que Christian decide sobre los productos que le ofrecen y no vende.
@@ -4294,11 +4449,14 @@ async def distributor_order_detail(order_number: str, dist=Depends(get_current_d
 
 @api_router.get('/admin/orders/{order_number}/detalle')
 async def admin_order_detail(order_number: str, admin=Depends(get_current_admin)):
-    """El mismo detalle para el admin, que sí ve todos."""
+    """El mismo detalle para el admin, que sí ve todos — y con A QUIÉN COMPRARLE.
+
+    El proveedor SÓLO va por aquí, nunca por la ficha del distribuidor: nombres de
+    proveedores, teléfonos y costos son de la casa."""
     o = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
     if not o:
         raise HTTPException(status_code=404, detail='Pedido no encontrado')
-    return _detalle_de_pedido(o, o.get('referred_by'))
+    return _detalle_de_pedido(await _pedido_con_proveedores(o), o.get('referred_by'))
 
 
 # ----------------- Protocolos: consumo y recompra -----------------
@@ -5034,6 +5192,37 @@ async def reanclar_comisiones_en_la_base():
     except Exception:
         # Que no tumbe el arranque: el piso de 30% ya lo da el código aunque esto falle.
         logger.exception('No se pudo reanclar las comisiones en la base del canal')
+
+
+@app.on_event('startup')
+async def avisos_de_ventas_atrasados():
+    """LAS VENTAS QUE NUNCA SONARON LA CAMPANITA — Christián, 2026-07-30.
+
+    Las ventas de estos días se repartieron y se cobraron bien, pero la campanita no
+    existía: ni Christián ni el distribuidor se enteraron DENTRO de la app. Este barrido
+    las genera hacia atrás, una sola vez, sobre los pedidos VIVOS de la última semana.
+
+    No hace falta que sea perfecto ni que corra siempre: `avisar_de_la_venta` deduplica
+    por número de pedido, así que aunque se repitiera no ensucia nada.
+    """
+    MARCA = 'avisos-de-venta-atrasados-2026-07-30'
+    try:
+        tomada = await db.migraciones.update_one(
+            {'id': MARCA}, {'$setOnInsert': {'id': MARCA, 'empezada_en': now_iso()}}, upsert=True)
+        if tomada.upserted_id is None:
+            return
+        desde = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        pedidos = await db.orders.find(
+            {'created_at': {'$gte': desde}, 'status': {'$ne': 'cancelado'},
+             'archived': {'$ne': True}}, {'_id': 0}).to_list(200)
+        for o in pedidos:
+            await avisar_de_la_venta(o)
+        await db.migraciones.update_one({'id': MARCA}, {'$set': {
+            'aplicada_en': now_iso(),
+            'pedidos': [o.get('order_number') for o in pedidos]}})
+        logger.info('Campanita al día: %d ventas avisadas hacia atrás.', len(pedidos))
+    except Exception:
+        logger.exception('No pude generar los avisos de venta atrasados')
 
 
 @app.on_event('startup')

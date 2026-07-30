@@ -960,10 +960,33 @@ def _aviso_compra_html(order, link_admin):
     # hasta abajo, se manda el paquete incompleto y nadie sale a comprar lo que falta.
     pedir = ''
     if order.get('backorder_items'):
+        def _a_quien(b):
+            """A QUIÉN COMPRARLE. Sin esto el aviso decía QUÉ mandar pedir y dejaba a
+            Christián abriendo una terminal con el pedido ya vendido. El dato viaja
+            pegado al renglón (ver `_con_proveedor` en server.py); si el producto no
+            tiene proveedor con precio en la base, se DICE — un hueco callado es peor."""
+            if b.get('sin_proveedor') or not b.get('proveedor'):
+                return (f'<div style="font-family:{FONT};font-size:12px;color:#B54708;'
+                        f'padding-top:2px;">⚠️ Sin proveedor registrado — revisar el '
+                        f'motor de precios</div>')
+            tel = esc(str(b.get('telefono') or ''))
+            partes = [f'<b>COMPRAR A: {esc(str(b["proveedor"]))}</b>']
+            partes.append(f'tel {tel}' if tel else
+                          '<span style="color:#B54708;">⚠️ sin teléfono</span>')
+            costo = b.get('costo_vial_usd')
+            if costo:
+                partes.append(f'${float(costo):,.2f} USD/vial')
+            fila = ' · '.join(partes)
+            if b.get('whatsapp'):
+                fila += (f' · <a href="{esc(str(b["whatsapp"]))}" '
+                         f'style="color:#7A5A00;">escribirle por WhatsApp</a>')
+            return (f'<div style="font-family:{FONT};font-size:12px;color:#7A5A00;'
+                    f'padding-top:2px;">{fila}</div>')
+
         renglones = ''.join(
-            f'<tr><td style="padding:3px 0;font-family:{FONT};font-size:13px;color:{BODY};">'
-            f'{esc(str(b.get("name", "")))}</td>'
-            f'<td align="right" style="padding:3px 0;font-family:{FONT};font-size:13px;color:{BODY};'
+            f'<tr><td style="padding:5px 0;font-family:{FONT};font-size:13px;color:{BODY};">'
+            f'{esc(str(b.get("name", "")))}{_a_quien(b)}</td>'
+            f'<td align="right" valign="top" style="padding:5px 0;font-family:{FONT};font-size:13px;color:{BODY};'
             f'white-space:nowrap;">salen ya: <b>{int(b.get("en_mano", 0) or 0)}</b> · '
             f'mandar pedir: <b>{int(b.get("por_surtir", 0) or 0)}</b></td></tr>'
             for b in order['backorder_items'])
