@@ -5388,6 +5388,46 @@ async def avisos_de_ventas_atrasados():
 
 
 @app.on_event('startup')
+async def avisos_de_venta_apuntan_al_cliente():
+    """LOS AVISOS QUE YA ESTABAN GUARDADOS TAMBIÉN ABREN LA FICHA — Christián, 2026-07-30.
+
+    Desde hoy cada aviso de venta nace con `order_number` y `client_id`, así que tocarlo
+    abre el pedido y a quien lo hizo. Los que ya estaban guardados (los de las ventas de
+    María de esta misma semana) nacieron sin esos campos: el número de pedido se puede
+    leer del texto, pero el cliente no está en ninguna parte. Sin este barrido, los
+    únicos avisos de venta que existen hoy serían justo los que no llevan a la persona.
+
+    Una sola vez, con marca en `migraciones`, y sin tocar nada más del aviso."""
+    MARCA = 'avisos-de-venta-con-cliente-2026-07-30'
+    try:
+        tomada = await db.migraciones.update_one(
+            {'id': MARCA}, {'$setOnInsert': {'id': MARCA, 'empezada_en': now_iso()}}, upsert=True)
+        if tomada.upserted_id is None:
+            return
+        avisos = await db.notifications.find(
+            {'type': {'$in': ['venta_admin', 'new_sale']}}, {'_id': 0}).to_list(1000)
+        arreglados = 0
+        for n in avisos:
+            if n.get('client_id') and n.get('order_number'):
+                continue
+            m = re.search(r'EX-\d{6,}-\d+', f"{n.get('title') or ''} {n.get('body') or ''}")
+            if not m:
+                continue
+            o = await db.orders.find_one({'order_number': m.group(0)}, {'_id': 0})
+            if not o:
+                continue
+            await db.notifications.update_one({'id': n['id']}, {'$set': {
+                k: v for k, v in {'order_number': m.group(0),
+                                  'client_id': _id_de_cliente(o)}.items() if v}})
+            arreglados += 1
+        await db.migraciones.update_one({'id': MARCA},
+                                        {'$set': {'aplicada_en': now_iso(), 'avisos': arreglados}})
+        logger.info('Avisos de venta que ya apuntan al cliente: %d.', arreglados)
+    except Exception:
+        logger.exception('No pude apuntar los avisos de venta al cliente')
+
+
+@app.on_event('startup')
 async def seed_db():
     try:
         # Llaves de pasarelas que Christian pegó desde el Admin. El .env manda,
