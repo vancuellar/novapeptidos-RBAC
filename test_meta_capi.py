@@ -132,6 +132,26 @@ def test_pedido_incompleto_no_produce_evento(pedido):
     assert meta_capi.construir_evento(pedido) is None
 
 
+def test_los_pedidos_de_las_pruebas_nunca_llegan_a_meta():
+    """`npm run auditoria` y los E2E levantan pedidos REALES con correo
+    @example.com, los confirman y los borran. De nuestra base se borran; de Meta
+    NO se pueden borrar. Cada corrida le enseñaría una compra inventada e
+    inflaría el ROAS — justo la señal falsa que hace subir presupuesto de más."""
+    import asyncio
+    for dominio in ('@example.com', '@example.org', '@test.invalid'):
+        pedido = {**PEDIDO, 'customer': {**PEDIDO['customer'],
+                                         'email': 'e2e-no-responder' + dominio}}
+        assert meta_capi.es_pedido_de_prueba(pedido)
+        assert meta_capi.construir_evento(pedido) is None
+        r = asyncio.run(meta_capi.enviar_compra(pedido))
+        assert r == {'enviado': False, 'motivo': 'pedido de prueba'}
+
+
+def test_un_pedido_de_verdad_si_sale():
+    assert not meta_capi.es_pedido_de_prueba(PEDIDO)
+    assert meta_capi.construir_evento(PEDIDO) is not None
+
+
 def test_test_event_code_solo_si_esta_puesto():
     assert 'test_event_code' not in meta_capi.construir_evento(PEDIDO)
     cuerpo = meta_capi.construir_evento(PEDIDO, test='TEST12345')

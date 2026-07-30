@@ -691,6 +691,10 @@ def test_los_tres_metodos_de_pasarela_pasan_por_la_confirmacion(db, monkeypatch)
     monkeypatch.setattr(server, 'comprar_guia_del_pedido',
                         lambda o: compradas.append(o.get('order_number')))
     monkeypatch.setattr(server, 'send_payment_confirmed_email', lambda *a, **k: None)
+    # De la confirmación también cuelgan el aviso interno y el aviso a Meta
+    # (Conversions API). Aquí no se prueban y no deben salir a internet.
+    monkeypatch.setattr(server, 'send_purchase_alert', lambda *a, **k: None)
+    monkeypatch.setattr(server.meta_capi, 'enviar_compra', lambda *a, **k: None)
     monkeypatch.setattr(server.asyncio, 'create_task', lambda c: c)
     asyncio.run(db.orders.insert_one(_orden('tarjeta')))
     asyncio.run(server._confirm_paid_order('EX-20260728-0001'))

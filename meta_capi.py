@@ -149,6 +149,21 @@ def _cuando(order):
     return int(datetime.now(timezone.utc).timestamp())
 
 
+# Dominios reservados por la RFC 2606 para pruebas. Las auditorías y los E2E
+# (`npm run auditoria`, `e2e:cripto`, `e2e:tarjeta`) levantan pedidos REALES con
+# un correo `@example.com`, los confirman y los borran. El pedido se borra de
+# nuestra base, pero lo que ya se le mandó a Meta NO SE PUEDE BORRAR: cada
+# corrida le enseñaría una compra que nunca existió, inflaría el ROAS del panel
+# y acabaría haciendo que se suba el presupuesto por una señal falsa. Por eso
+# estos pedidos nunca salen.
+DOMINIOS_DE_PRUEBA = ('@example.com', '@example.org', '@example.net', '@test.invalid')
+
+
+def es_pedido_de_prueba(order):
+    correo = _norm_email((order.get('customer') or {}).get('email'))
+    return correo.endswith(DOMINIOS_DE_PRUEBA)
+
+
 def event_id(order_number):
     """La llave de la deduplicación. TIENE que ser idéntica a la del navegador
     (`track.js`), o Meta contará la misma compra dos veces."""
@@ -165,6 +180,8 @@ def construir_evento(order, test=None):
     numero = order.get('order_number') or ''
     total = float(order.get('total') or 0)
     if not numero or total <= 0:
+        return None
+    if es_pedido_de_prueba(order):
         return None
 
     cliente = order.get('customer') or {}
@@ -235,6 +252,9 @@ async def enviar_compra(order, test=None):
                        'La compra %s no se le avisó a Meta.',
                        (order or {}).get('order_number', '?'))
         return {'enviado': False, 'motivo': 'sin token'}
+
+    if es_pedido_de_prueba(order or {}):
+        return {'enviado': False, 'motivo': 'pedido de prueba'}
 
     cuerpo = construir_evento(order or {}, test=test)
     if not cuerpo:
