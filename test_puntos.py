@@ -16,6 +16,7 @@ dice en `matched_count`. Sin eso la prueba no probaría nada.
 """
 import asyncio
 import os
+import re
 
 import pytest
 
@@ -317,9 +318,10 @@ def test_la_venta_directa_no_puede_pasar_del_maximo_de_la_casa():
     src = open(server.__file__, encoding='utf-8').read()
     cuerpo = src.split('async def admin_create_order(')[1].split('\n@api_router')[0]
     assert 'min(0.60' not in cuerpo, 'volvió el techo del 60%'
-    assert 'min(loyalty.MAX_DISCOUNT' in cuerpo
+    # Desde el 2026-07-31 el número no vive aquí: sale del techo único del sistema.
+    assert 'min(techo_de_descuento(u)' in cuerpo
     import loyalty
-    assert loyalty.MAX_DISCOUNT == 0.40
+    assert server.TECHO_DESCUENTO == loyalty.MAX_DISCOUNT == 0.40
 
 
 def test_la_venta_directa_respeta_el_tope_por_producto():
@@ -472,7 +474,114 @@ def test_el_checkout_y_el_carrito_leen_el_MISMO_cupon_topado():
     assert 'tasa_de_cupon(cdoc)' in publico, 'el validador público anuncia el rate crudo'
     crear = src.split('async def admin_send_coupon(')[1].split('\n@api_router')[0]
     assert 'min(0.50' not in crear, 'volvió el regalo del 50%'
-    assert 'min(loyalty.MAX_DISCOUNT' in crear
+    assert 'min(TECHO_DESCUENTO' in crear
+
+
+# ==========================================================================
+#  EL TECHO ÚNICO DEL 40% — Christián, 2026-07-31
+# ==========================================================================
+# «Baja también Paz Cambray a 40%, nadie por encima de ese 40% a menos que seamos
+#  María y yo.»
+#
+# El 40% se fue descubriendo puerta por puerta: venta directa al 60% (cerrada el 29-jul),
+# cupón GIFT al 50% y trato especial al 50% (las dos el 31-jul). Por eso ahora hay UN
+# SOLO número (`server.TECHO_DESCUENTO`) y una sola función (`techo_de_descuento`): si
+# alguien abre una puerta nueva sin pasar por ahí, estas pruebas lo cazan.
+
+def test_el_techo_es_UNO_SOLO_y_vale_40():
+    import loyalty
+    assert server.TECHO_DESCUENTO == loyalty.MAX_DISCOUNT == 0.40
+
+
+def test_ninguna_puerta_de_descuento_trae_su_propio_numero():
+    """El candado contra la puerta olvidada: toda puerta topa con el techo compartido,
+    nunca con un `min(0.50, …)` suyo. Si alguien agrega una puerta con su propio número,
+    esta prueba truena y hay que mandarla al techo único."""
+    src = open(server.__file__, encoding='utf-8').read()
+    puertas = {
+        'admin_create_order': 'techo_de_descuento(u)',       # venta directa
+        'admin_send_coupon': 'min(TECHO_DESCUENTO',          # cupón GIFT
+        'admin_set_personal_discount': 'techo_de_descuento(u)',  # trato especial
+    }
+    for fn, esperado in puertas.items():
+        cuerpo = src.split(f'async def {fn}(')[1].split('\n@api_router')[0]
+        assert esperado in cuerpo, f'{fn} ya no pasa por el techo único'
+        # El renglón que fija la TASA del pedido no puede traer un número propio. Se
+        # mira sólo esa línea: el `min(0.50, commission_cap)` del tope POR PRODUCTO es
+        # otra regla y sí vive ahí.
+        linea = [l for l in cuerpo.splitlines()
+                 if re.match(r'\s*rate = ', l)]
+        assert linea, f'{fn}: no encontré dónde fija la tasa'
+        for l in linea:
+            assert '0.50' not in l and '0.60' not in l and '0.40' not in l, \
+                f'{fn} volvió a traer su propio tope: {l.strip()}'
+    # Y el checkout topa TODAS las tasas de una sola vez, después de juntarlas.
+    checkout = src.split('async def create_order(')[1].split('\n@api_router')[0]
+    assert 'techo = techo_de_descuento(user)' in checkout, 'el checkout no topa el total'
+    assert 'tasa_base = min(tasa_base, techo)' in checkout
+    assert 'tasas_pedidas = {k: min(v, techo)' in checkout
+
+
+def test_el_trato_especial_de_Paz_Cambray_se_topa_en_40(db):
+    """Admitía hasta 50%. Era la tercera puerta arriba del techo."""
+    db.cols['users'] = FakeCol([{'id': 'u-paz', 'name': 'Paz Cambray', 'role': 'customer'}])
+    salida = asyncio.run(server.admin_set_personal_discount(
+        'u-paz', server.PersonalRate(rate=0.50), admin={'id': 'a', 'role': 'admin'}))
+    assert salida['personal_discount_rate'] == 0.40, salida
+    assert db.cols['users'].docs[0]['personal_discount_rate'] == 0.40
+
+
+def test_un_trato_especial_YA_PUESTO_en_50_cobra_40():
+    """No hay que tocarle la cuenta a nadie: el techo también va al COBRAR."""
+    assert server.buyer_own_rate({'role': 'customer', 'personal_discount_rate': 0.50}) == 0.40
+    assert server.buyer_own_rate({'role': 'customer', 'personal_discount_rate': 0.25}) == 0.25
+
+
+# ---------- La excepción: Christián (admin) y María ----------
+
+def test_Christian_y_Maria_SI_pueden_pasar_del_40():
+    """La única excepción. Christián por su rol; María por la marca que él le pone."""
+    christian = {'role': 'admin', 'personal_discount_rate': 0.50}
+    maria = {'role': 'customer', 'descuento_sin_tope': True, 'personal_discount_rate': 0.50}
+    assert server.sin_tope_de_descuento(christian) is True
+    assert server.sin_tope_de_descuento(maria) is True
+    assert server.techo_de_descuento(christian) == 0.50
+    assert server.techo_de_descuento(maria) == 0.50
+    assert server.buyer_own_rate(christian) == 0.50
+    assert server.buyer_own_rate(maria) == 0.50
+
+
+def test_la_excepcion_NACE_APAGADA_para_todos_los_demas():
+    """Un cliente cualquiera —y nadie sin la marca— sigue topado en 40."""
+    for quien in ({'role': 'customer'}, {'role': 'distributor'},
+                  {'role': 'customer', 'descuento_sin_tope': False}, {}, None):
+        assert server.sin_tope_de_descuento(quien) is False, quien
+        assert server.techo_de_descuento(quien) == 0.40, quien
+
+
+def test_la_excepcion_es_para_lo_que_COMPRAN_no_para_lo_que_REGALAN():
+    """Si María pudiera regalar 50%, habría un CLIENTE arriba del techo — que es justo
+    lo prohibido. El cupón no mira quién lo manda."""
+    assert server.tasa_de_cupon({'discount_rate': 0.50}) == 0.40
+
+
+def test_un_regalo_a_Christian_por_venta_directa_SI_puede_pasar_del_40(db):
+    """El otro lado del candado: la venta directa mira al COMPRADOR."""
+    db.cols['users'] = FakeCol([{'id': 'u-chris', 'role': 'admin', 'name': 'Christián',
+                                 'email': 'c@exygenlabs.com', 'points_balance': 0}])
+    db.cols['products'] = FakeCol([{
+        'id': 'p1', 'sku': 'P1', 'name': 'Orexin A 10 mg', 'price': 1000.0,
+        'slug': 'orexin-a-10-mg', 'presentation': '10 mg',
+        'commission_cap': 0.50, 'category': 'longevidad', 'stock': 40}])
+    salida = asyncio.run(server.admin_create_order(
+        server.ManualOrderCreate(
+            user_id='u-chris',
+            items=[server.OrderItem(product_id='p1', name='Orexin A 10 mg',
+                                    price=1000.0, quantity=10, presentation='10 mg')],
+            discount_rate=0.50),
+        admin={'id': 'a', 'role': 'admin'}))
+    assert db.cols['orders'].docs[0]['discount_rate'] == 0.50, 'a Christián sí se le permite'
+    assert salida['discount'] == 5000, salida
 
 
 # ---------- Pagado ≠ entregado (Christián, 2026-07-29) ----------

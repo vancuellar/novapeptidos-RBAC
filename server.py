@@ -1157,6 +1157,53 @@ async def delete_product(product_id: str, admin=Depends(get_current_admin)):
 # Tope duro de comision de distribuidores (regla de Christian, 2026-07-21).
 COMMISSION_CAP = 0.50
 
+
+# ⛔⛔ EL TECHO ÚNICO DEL DESCUENTO — 40%. VIVE AQUÍ Y EN NINGÚN OTRO LADO.
+#
+# Christián, 2026-07-31, textual:
+#   «Baja también Paz Cambray a 40%, nadie por encima de ese 40% a menos que seamos
+#    María y yo.»
+#
+# POR QUÉ UNA SOLA FUNCIÓN Y NO UN `min(0.40, …)` EN CADA PUERTA: porque ya se intentó
+# lo otro y falló tres veces. El techo del 40% se fue descubriendo de una en una —
+# la venta directa del admin estaba en 60% (cerrada el 29-jul), el cupón GIFT en 50%
+# (el 31-jul) y el trato especial por cuenta en 50% (el 31-jul también) — y cada vez
+# el auditor tuvo que encontrar la puerta olvidada. Cada `min` suelto es una puerta
+# más que alguien puede subir sin que nada truene. Aquí sólo hay un número.
+#
+# LA EXCEPCIÓN son las cuentas de Christián y María, y es SOLO PARA LO QUE ELLOS
+# COMPRAN. No es permiso para REGALAR más del 40% a un tercero: si María pudiera
+# otorgar 50%, habría un cliente por encima del techo, que es justo lo prohibido.
+#
+# ⚠️ ENCIMA DE ESTO SIGUEN MANDANDO SIEMPRE, sin excepción para nadie:
+#   · el tope de CADA producto (`commission_cap`) — el ROI de la casa manda;
+#   · los insumos (`NO_DISCOUNT_CATEGORIES`) nunca llevan descuento;
+#   · con el 40% NO se acumulan puntos (`loyalty.earns_points`).
+TECHO_DESCUENTO = loyalty.MAX_DISCOUNT          # 0.40 — un solo número, un solo lugar
+
+
+def sin_tope_de_descuento(user) -> bool:
+    """¿Esta cuenta puede comprar por encima del 40%? Sólo Christián y María.
+
+    Se decide por DATOS de la cuenta, nunca por un correo escrito en el código: un
+    correo hardcodeado es una puerta trasera que nadie encuentra al auditar, y el día
+    que Christián cambie de correo deja de funcionar sin avisar.
+
+      · `role == 'admin'`  → Christián.
+      · `descuento_sin_tope`  → la marca que Christián le pone a María desde el Panel.
+
+    Nace APAGADA para todo el mundo: si nadie la trae, el techo es 40% para todos, que
+    es exactamente el estado que pidió Christián."""
+    if not user:
+        return False
+    return user.get('role') == 'admin' or bool(user.get('descuento_sin_tope'))
+
+
+def techo_de_descuento(user=None) -> float:
+    """El descuento MÁXIMO que puede llevar una compra de `user`. 40% salvo Christián
+    y María. Toda puerta de descuento del sistema pasa por aquí."""
+    return COMMISSION_CAP if sin_tope_de_descuento(user) else TECHO_DESCUENTO
+
 # Insumos: NUNCA entran a ningun descuento ni pagan comision (regla de Christian,
 # 2026-07-25). El agua bacteriostatica es el caso que lo motivo: se vende casi al
 # costo, un descuento encima la deja en perdida. El descuento se aplica a los demas
@@ -1177,8 +1224,12 @@ def tasa_de_cupon(doc):
     regalo, sólo vale menos), y el candado no depende de por dónde se creó el documento.
 
     Encima de esto sigue mandando el tope de CADA producto (`_disc_of` → `commission_cap`)
-    y los insumos siguen fuera: el 40% es el techo, no un piso garantizado."""
-    return max(0.0, min(loyalty.MAX_DISCOUNT, float((doc or {}).get('discount_rate') or 0)))
+    y los insumos siguen fuera: el 40% es el techo, no un piso garantizado.
+
+    El número sale de `techo_de_descuento`, que es donde vive el único 40% del sistema.
+    Un cupón es un REGALO a un tercero, así que aquí no hay excepción de cuenta: la de
+    Christián y María es para lo que ELLOS compran, no para lo que regalan."""
+    return max(0.0, min(TECHO_DESCUENTO, float((doc or {}).get('discount_rate') or 0)))
 
 
 def es_hgh_neto(product_id, name):
@@ -1956,13 +2007,19 @@ def buyer_own_rate(user):
       (el caso de Paz Cambray, 40% aunque sea solo cliente).
 
     Siempre se recorta al tope de CADA producto (el ROI manda) y los insumos quedan
-    fuera. Es un piso, no un techo: si trae un código mejor, gana el mayor."""
+    fuera. Es un piso, no un techo: si trae un código mejor, gana el mayor.
+
+    ⛔ TOPADO AL 40% (`techo_de_descuento`), salvo Christián y María. El trato especial
+    admitía hasta 50%: era la tercera puerta arriba del techo que aparecía en dos días.
+    Se topa AQUÍ, al cobrar, y no sólo al guardarlo, para que los tratos que ya están
+    puestos por encima valgan 40% sin tener que tocarle la cuenta a nadie."""
     if not user:
         return 0.0
     if user.get('role') == 'distributor':
         return pyramid.effective_rate(user)
     try:
-        return max(0.0, min(COMMISSION_CAP, float(user.get('personal_discount_rate') or 0)))
+        return max(0.0, min(techo_de_descuento(user),
+                            float(user.get('personal_discount_rate') or 0)))
     except (TypeError, ValueError):
         return 0.0
 
@@ -2818,6 +2875,23 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # antes. El promedio efectivo no sirve aquí: pintaría "34.7%" en los reportes y
     # aflojaría el candado del 40% sin que nadie lo decidiera. El desglose fino, el
     # que sí explica qué pagó cada renglón, va en `discount_lines`.
+    # ⛔⛔ EL TECHO DEL 40%, EN EL EMBUDO POR DONDE PASAN TODAS LAS PUERTAS.
+    # Christián, 2026-07-31: «nadie por encima de ese 40% a menos que seamos María y yo».
+    #
+    # Aquí ya se juntaron TODAS las formas de descontar del checkout: el cupón, el código
+    # del distribuidor, la promo automática, la compra propia y la regla de 5. Topar en
+    # este punto —y no en cada una— es justamente lo que evita la puerta olvidada: en dos
+    # días aparecieron TRES (venta directa 60%, cupón GIFT 50%, trato especial 50%), cada
+    # una encontrada por separado. Lo que entre aquí arriba de 40 sale en 40, venga de
+    # donde venga.
+    #
+    # ⚠️ Esto TAMBIÉN acota el código de un distribuidor de nivel alto (diamante 43%,
+    # manual hasta 50%): un cliente suyo ya no puede recibir 43%. Su COMISIÓN no se toca
+    # —eso es otra regla, tope 50%— pero su compra propia sí queda en 40%.
+    techo = techo_de_descuento(user)
+    tasa_base = min(tasa_base, techo)
+    tasas_pedidas = {k: min(v, techo) for k, v in tasas_pedidas.items()}
+
     discount, discount_rate, discount_capped, discount_lines = descuentos.repartir(
         payload.items, _clave_de, lambda it: _cap_of(it) if _eligible(it) else 0.0,
         tasas_pedidas, tasa_base)
@@ -4532,7 +4606,7 @@ async def create_distributor(payload: DistributorCreate, admin=Depends(get_curre
         # Tope duro de Christian (2026-07-21): ningun distribuidor comisiona
         # arriba del 50%. El servidor lo exige; el navegador no basta.
         'commission_rate': max(0.0, min(COMMISSION_CAP, payload.commission_rate)),
-        'customer_discount_rate': max(0.05, min(0.50, payload.customer_discount_rate)),
+        'customer_discount_rate': max(0.05, min(TECHO_DESCUENTO, payload.customer_discount_rate)),
         # Pirámide (§4ter): todo distribuidor nuevo entra como JUNIOR salvo que el
         # admin diga otra cosa; upline = quién lo trajo (para las sobrecomisiones).
         'tier': payload.tier if payload.tier in pyramid.TIER_RATES else 'junior',
@@ -4599,7 +4673,7 @@ async def resolve_distributor_application(app_id: str, payload: dict, admin=Depe
     if action != 'aprobar':
         raise HTTPException(status_code=400, detail='Acción inválida')
     commission = max(0.0, min(COMMISSION_CAP, float(payload.get('commission_rate', 0.25) or 0)))
-    discount = max(0.05, min(0.50, float(payload.get('customer_discount_rate', 0.10) or 0.10)))
+    discount = max(0.05, min(TECHO_DESCUENTO, float(payload.get('customer_discount_rate', 0.10) or 0.10)))
     existing = await _usuario_por_correo(app_doc['email'])
     if existing and existing.get('role') == 'distributor':
         result = {'already': True}
@@ -4678,7 +4752,7 @@ async def convert_customer_to_distributor(user_id: str, payload: dict, admin=Dep
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail='Tasas inválidas')
     commission = max(0.0, min(COMMISSION_CAP, commission))
-    discount = max(0.05, min(0.50, discount))
+    discount = max(0.05, min(TECHO_DESCUENTO, discount))
     await db.users.update_one({'id': user_id}, {'$set': {
         'role': 'distributor',
         'distributor_code': code,
@@ -4709,7 +4783,7 @@ async def update_distributor_rates(dist_id: str, payload: dict, admin=Depends(ge
     if payload.get('commission_rate') is not None:
         update['commission_rate'] = max(0.0, min(COMMISSION_CAP, float(payload['commission_rate'])))
     if payload.get('customer_discount_rate') is not None:
-        update['customer_discount_rate'] = max(0.05, min(0.50, float(payload['customer_discount_rate'])))
+        update['customer_discount_rate'] = max(0.05, min(TECHO_DESCUENTO, float(payload['customer_discount_rate'])))
     if not update:
         raise HTTPException(status_code=400, detail='Nada que actualizar')
     await db.users.update_one({'id': dist_id}, {'$set': update})
@@ -7226,7 +7300,8 @@ async def admin_create_order(payload: ManualOrderCreate, admin=Depends(get_curre
     # (`loyalty.MAX_DISCOUNT`), que es el que sí respeta el checkout público. En un
     # pedido de $374,360 la diferencia son **$74,872** que salen de más.
     # Lo cazó el auditor de Codex el 2026-07-29.
-    rate = max(0.0, min(loyalty.MAX_DISCOUNT, payload.discount_rate))
+    # El techo del comprador: 40%, salvo que la venta directa sea para Christián o María.
+    rate = max(0.0, min(techo_de_descuento(u), payload.discount_rate))
     # ⛔ EL PRECIO LO PONE EL SERVIDOR, TAMBIÉN AQUÍ.
     # El checkout público ya se blindó el 2026-07-27 (`create_order` retasa cada renglón
     # contra el catálogo), pero la VENTA DIRECTA se quedó fuera: sumaba `i.price` tal cual
@@ -7467,7 +7542,7 @@ async def admin_send_coupon(user_id: str, payload: CouponCreate, admin=Depends(g
     # 0.50 y era la ÚNICA puerta que quedaba arriba del techo de la casa: la venta directa
     # se capó el 29-jul y el checkout público nunca pasó de ahí. Se topa también al
     # cobrarlo (`tasa_de_cupon`), para los que ya andan sueltos con 50%.
-    rate = max(0.05, min(loyalty.MAX_DISCOUNT, payload.discount_rate))
+    rate = max(0.05, min(TECHO_DESCUENTO, payload.discount_rate))
     code = 'GIFT-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     while await db.discount_codes.find_one({'code': code}):
         code = 'GIFT-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
@@ -7498,7 +7573,10 @@ async def admin_set_personal_discount(user_id: str, payload: PersonalRate, admin
         raise HTTPException(status_code=404, detail='Cliente no encontrado')
     if u.get('role') == 'distributor':
         raise HTTPException(status_code=400, detail='Un distribuidor ya compra con su comisión máxima')
-    rate = max(0.0, min(COMMISSION_CAP, float(payload.rate or 0)))
+    # ⛔ TOPADO AL 40% (Christián, 2026-07-31: «nadie por encima de ese 40%»). Estaba en
+    # 0.50. Se topa también AL COBRAR (`buyer_own_rate`), así que los tratos ya puestos
+    # arriba del techo valen 40% aunque nadie vuelva a tocar esta pantalla.
+    rate = max(0.0, min(techo_de_descuento(u), float(payload.rate or 0)))
     await db.users.update_one({'id': user_id}, {'$set': {'personal_discount_rate': rate}})
     if rate > 0:
         await notify(user_id, 'personal_discount', 'Tienes un descuento permanente',
