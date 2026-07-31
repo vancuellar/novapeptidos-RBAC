@@ -51,6 +51,7 @@ x-api-comun: &api-comun
   environment:
     - COA_DIR=/data/coa
     - FICHA_DIR=/data/fichas
+    - REPORTES_ADS_DIR=/data/reportes-ads
   volumes:
     # Los PDF de los certificados viven fuera del contenedor: se copian a
     # /opt/exygen/coa y se leen en cada consulta, sin volver a desplegar.
@@ -58,6 +59,13 @@ x-api-comun: &api-comun
     # Las fichas tecnicas: mismo esquema que los COA. Se copian a
     # /opt/exygen/fichas y se leen sin volver a desplegar.
     - /opt/exygen/fichas:/data/fichas:ro
+    # EL ARCHIVO DE REPORTES SEMANALES DE PUBLICIDAD (video + cifras de cada
+    # semana). Este SI va de lectura y escritura: el pipeline publica aqui la
+    # semana nueva. Fuera del contenedor a proposito — son ~15 MB por semana,
+    # 780 MB al año, y meterlos en git o en la imagen seria cargarlos para
+    # siempre. Los dos colores ven la MISMA carpeta, asi que el azul/verde no
+    # se lleva nada por delante.
+    - /opt/exygen/reportes-ads:/data/reportes-ads
   depends_on:
     - mongo
   # EL PUNTO CLAVE. Sin esto, un contenedor que arranca, revienta al importar

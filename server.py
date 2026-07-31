@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, FileResponse, Response, PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 import os
@@ -51,6 +51,10 @@ import secretos
 import meta_ads
 import meta_capi
 import marketing
+# El archivo histórico de los reportes semanales de publicidad: los MP4 viven en
+# disco (fuera de git y fuera del contenedor) y lo que se compara son las cifras
+# que quedan guardadas junto a cada video. Ver reportes_ads.py.
+import reportes_ads
 import director
 import recovery
 from google_auth import verify_google_token, google_enabled, GOOGLE_CLIENT_ID
@@ -7827,6 +7831,147 @@ async def admin_marketing_director(payload: DirectorPedido, admin=Depends(get_cu
         'briefing': brief,
         'enlace': marketing.enlace(SITE_URL, nombre),
     }
+
+
+# =====================================================================
+#  ARCHIVO DE REPORTES SEMANALES DE PUBLICIDAD
+# =====================================================================
+#  Orden de Christián (2026-07-31): "este video de publicidad debe estar en mi
+#  página de Marketing e irse archivando por fecha, semana con semana".
+#
+#  El video NO va en git (15 MB × 52 semanas = 780 MB al año, y git no olvida).
+#  Vive en disco del servidor y sólo sale por estas rutas, que exigen sesión de
+#  quien lleva la difusión. No hay carpeta pública ni URL adivinable: son datos
+#  del negocio (gasto, ventas, embudo). Ver reportes_ads.py.
+# =====================================================================
+
+@api_router.get('/admin/marketing/reportes')
+async def admin_reportes_ads(admin=Depends(get_current_marketing)):
+    """El archivo completo: cada semana con sus cifras, de la más nueva a la más
+    vieja. Las cifras viajan aunque el video no exista, porque comparar semanas
+    es para lo que sirve de verdad este archivo."""
+    reportes = reportes_ads.listar()
+    return {
+        'reportes': reportes,
+        'almacen': reportes_ads.almacen(reportes),
+        'retencion': reportes_ads.retencion(),
+        'cifras': list(reportes_ads.CIFRAS),
+    }
+
+
+@api_router.get('/admin/marketing/reportes/{semana}/texto')
+async def admin_reporte_ads_texto(semana: str, admin=Depends(get_current_marketing)):
+    """El reporte escrito que acompaña al video, en Markdown."""
+    d = reportes_ads.uno(semana)
+    if not d:
+        raise HTTPException(status_code=404, detail='No hay reporte de esa semana.')
+    return {'semana': semana, 'markdown': reportes_ads.texto_de(semana)}
+
+
+async def _usuario_de_token_de_video(token: str):
+    """Quién es el dueño de un token que viaja por la URL.
+
+    La etiqueta <video> del navegador no manda headers, así que el token de
+    sesión va como query — igual que en /api/tutorials. Que el token viaje por
+    la URL no afloja el candado: se valida la firma, se relee al usuario de la
+    base (por si lo bloquearon) y se le exige el rol.
+    """
+    import jwt as _jwt
+    from auth import JWT_SECRET, JWT_ALGORITHM
+    try:
+        payload = _jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = payload.get('sub')
+    except Exception:
+        raise HTTPException(status_code=401, detail='No autenticado')
+    user = await db.users.find_one({'id': user_id},
+                                   {'_id': 0, 'role': 1, 'blocked': 1, 'extra_roles': 1})
+    if not user or user.get('blocked'):
+        raise HTTPException(status_code=401, detail='No autenticado')
+    if user.get('role') not in ('admin', 'marketing') \
+            and 'marketing' not in (user.get('extra_roles') or []):
+        raise HTTPException(status_code=403, detail='Sólo para administradores o marketing')
+    return user
+
+
+@api_router.get('/admin/marketing/reportes/{semana}/video')
+async def admin_reporte_ads_video(semana: str, request: Request, token: str = Query(...),
+                                  descargar: int = 0):
+    """El MP4 de una semana. Con soporte de rangos (Safari exige 206 para <video>)."""
+    await _usuario_de_token_de_video(token)
+    path = reportes_ads.ruta_video(semana)
+    if path is None:
+        raise HTTPException(status_code=404, detail='No hay video de esa semana.')
+    size = path.stat().st_size
+    headers = {'Accept-Ranges': 'bytes', 'Cache-Control': 'private, max-age=3600'}
+    if descargar:
+        headers['Content-Disposition'] = f'attachment; filename="{reportes_ads.nombre_descarga(semana)}"'
+    rng = parse_range_header(request.headers.get('range'), size)
+    if rng is None:
+        return FileResponse(path, media_type='video/mp4', headers=headers)
+    start, end = rng
+    with open(path, 'rb') as f:
+        f.seek(start)
+        chunk = f.read(end - start + 1)
+    headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+    from starlette.responses import Response as _Response
+    return _Response(content=chunk, status_code=206, media_type='video/mp4', headers=headers)
+
+
+@api_router.post('/admin/marketing/reportes')
+async def admin_publicar_reporte_ads(
+    semana: str = Form(...),
+    datos: str = Form(...),
+    video: UploadFile = File(None),
+    texto: str = Form(None),
+    admin=Depends(get_current_admin),
+):
+    """PUBLICAR EL REPORTE DE LA SEMANA. Esto es lo que llama el pipeline.
+
+    Multipart: `semana` (2026-W31), `datos` (JSON con fechas, duración, resumen y
+    cifras), `video` (el MP4, opcional) y `texto` (el reporte escrito, opcional).
+    Publicar dos veces la misma semana la REEMPLAZA, para que una corrida repetida
+    no llene el archivo de duplicados.
+    """
+    deny_view_as(admin)
+    try:
+        d = json.loads(datos)
+        if not isinstance(d, dict):
+            raise ValueError
+    except Exception:
+        raise HTTPException(status_code=400, detail='`datos` tiene que ser un JSON.')
+    contenido = await video.read() if video is not None else None
+    if contenido is not None and not contenido:
+        contenido = None
+    try:
+        guardado = reportes_ads.publicar(semana, d, video=contenido, texto=texto)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    logger.info('Reporte de publicidad archivado: %s', semana)
+    return {'ok': True, 'reporte': guardado, 'almacen': reportes_ads.almacen()}
+
+
+class RetencionReportes(BaseModel):
+    semanas: int
+
+
+@api_router.put('/admin/marketing/reportes/retencion')
+async def admin_retencion_reportes(payload: RetencionReportes, admin=Depends(get_current_admin)):
+    """Cuántas semanas conservar. Cambiarlo NO borra nada: lo que se pase de la
+    raya sale marcado como "por vencer" en el panel y se borra a mano."""
+    deny_view_as(admin)
+    try:
+        return reportes_ads.guardar_retencion(int(payload.semanas))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@api_router.delete('/admin/marketing/reportes/{semana}')
+async def admin_borrar_reporte_ads(semana: str, admin=Depends(get_current_admin)):
+    """Borrado MANUAL de una semana. Ningún temporizador llama aquí."""
+    deny_view_as(admin)
+    if not reportes_ads.borrar(semana):
+        raise HTTPException(status_code=404, detail='No hay reporte de esa semana.')
+    return {'ok': True, 'almacen': reportes_ads.almacen()}
 
 
 @api_router.get('/admin/series')
