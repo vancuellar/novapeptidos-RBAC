@@ -2152,3 +2152,25 @@ def test_usuario_por_correo_aguanta_vacio():
         assert asyncio.run(S._usuario_por_correo(None)) is None
     finally:
         S.db = original
+
+
+# ---------- Tope personal de descuento (María al 30%, 2026-07-30) ----------
+def test_sin_override_los_tiers_no_cambian():
+    import pyramid
+    d = {'commission_rate': 0.30, 'tier': 'junior0'}
+    assert pyramid.discount_tiers_de(d) == pyramid.discount_tiers_for(pyramid.effective_rate(d))
+
+
+def test_maria_con_override_llega_al_30():
+    import pyramid
+    d = {'commission_rate': 0.30, 'tier': 'junior0', 'max_discount_override': 0.30}
+    tiers = pyramid.discount_tiers_de(d)
+    assert max(tiers) == 0.30          # puede otorgar hasta su comisión completa
+    assert 0.25 in tiers and 0.15 in tiers
+
+
+def test_el_override_no_pasa_de_su_propia_comision():
+    # Ni con permiso escrito se regala más de lo que ella gana.
+    import pyramid
+    d = {'commission_rate': 0.30, 'tier': 'junior0', 'max_discount_override': 0.45}
+    assert max(pyramid.discount_tiers_de(d)) == 0.30

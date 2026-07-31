@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, UploadFile, File
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, Response
 from starlette.middleware.cors import CORSMiddleware
 import os
 import base64
@@ -24,6 +24,7 @@ from models import (
     ProtocolInput, ProtocolUpdate, PerfilSalud, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
+    QuoteEmailRequest,
 )
 from auth import (
     hash_password, verify_password, create_token, create_view_as_token, deny_view_as,
@@ -48,6 +49,10 @@ import pyramid
 import descuentos
 # Los TEXTOS de la campanita cuando entra una venta (en los tres idiomas).
 import avisos_de_venta
+# ⛔ ACUERDO DE DISTRIBUIDOR — aceptación electrónica. NACE APAGADO: mientras
+# ACUERDO_DISTRIBUIDOR_ACTIVO no valga 'true', ninguna de estas llamadas cambia
+# nada para nadie. Ver acuerdo.py.
+import acuerdo
 # ⛔ QUÉ CUENTA COMO INGRESO. Una sola regla para todo el backend: ver cobrado.py.
 # Los nombres se re-exportan aquí porque medio server.py (y los tests) ya los usaban
 # cuando la regla vivía dentro de este archivo.
@@ -65,7 +70,7 @@ from fastapi import Request
 def crypto_enabled() -> bool:
     """Hay vía cripto si CUALQUIER proveedor está encendido."""
     return nowpayments.enabled() or btcpay.enabled()
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote as urlquote
 from webauthn import (
     generate_registration_options, verify_registration_response,
     generate_authentication_options, verify_authentication_response, options_to_json,
@@ -82,7 +87,7 @@ from emails import (
     send_welcome_email, send_reset_email, send_verification_email,
     send_invitation_email, send_order_email, send_payment_confirmed_email, normalize_language, email_enabled,
     send_admin_notification, send_distributor_welcome_email, send_news_email,
-    send_purchase_alert, send_shipped_email,
+    send_purchase_alert, send_shipped_email, send_quote_email,
 )
 from datetime import timedelta
 import asyncio
@@ -3718,7 +3723,7 @@ async def _ensure_distributor_codes(dist, force_rotate=False):
     que falten, ROTA los caducados (nuevo texto, el viejo muere), y desactiva los
     que ya no correspondan a su nivel. Devuelve los códigos vigentes ordenados."""
     rate_basis = pyramid.effective_rate(dist)
-    tiers = pyramid.discount_tiers_for(rate_basis)
+    tiers = pyramid.discount_tiers_de(dist)
     tierset = {round(r, 4) for r in tiers}
     existing = await db.discount_codes.find({'distributor_id': dist['id']}).to_list(300)
     by_rate = {}
@@ -3752,10 +3757,28 @@ async def _ensure_distributor_codes(dist, force_rotate=False):
     return out
 
 
+# ------------------- ACUERDO DE DISTRIBUIDOR: el candado suave -------------------
+# ⛔ APAGADO POR OMISIÓN. `acuerdo.bloquea()` contesta False sin tocar la base
+# mientras ACUERDO_DISTRIBUIDOR_ACTIVO no valga 'true', así que hoy estas tres
+# líneas no hacen absolutamente nada. Cuando Christián encienda el interruptor,
+# frenan SÓLO lo que crea obligaciones nuevas: generar códigos, cotizar y
+# devengar comisión. Ver el panel, los pedidos y los clientes sigue abierto.
+async def _exigir_acuerdo(dist):
+    """403 con un código que el navegador reconoce para abrir la pantalla solo."""
+    if await acuerdo.bloquea(db, dist):
+        raise HTTPException(status_code=403, detail=acuerdo.AVISO,
+                            headers={'X-Acuerdo': acuerdo.CODIGO})
+
+
 @api_router.get('/distributor/codes')
 async def list_discount_codes(dist=Depends(get_current_distributor)):
     """Los códigos AUTO del distribuidor (uno por nivel de descuento). Se generan
-    y rotan solos cada 30 días; el distribuidor solo elige cuál da a cada cliente."""
+    y rotan solos cada 30 días; el distribuidor solo elige cuál da a cada cliente.
+
+    Esta ruta CREA códigos (`_ensure_distributor_codes`), no sólo los lee: por eso
+    el candado del acuerdo va aquí y no únicamente en `/rotate`. Sin firmar, no se
+    emite ni un código nuevo."""
+    await _exigir_acuerdo(dist)
     codes = await _ensure_distributor_codes(dist)
     return {'max_discount': pyramid.effective_rate(dist),
             'rotate_days': CODE_TTL_DAYS,
@@ -3781,6 +3804,7 @@ async def distributor_quote_caps(dist=Depends(get_current_distributor)):
     Se emite una fila por CADA llave con la que el carrito puede nombrar al
     producto (su id y su SKU), porque el navegador manda cualquiera de las dos.
     """
+    await _exigir_acuerdo(dist)
     productos = await db.products.find(
         {},
         {'_id': 0, 'id': 1, 'sku': 1, 'name': 1, 'category': 1,
@@ -3798,16 +3822,216 @@ async def distributor_quote_caps(dist=Depends(get_current_distributor)):
         # Su descuento máximo: el mayor de los niveles que le tocan por su comisión
         # (con la base de 30% del canal son 25%). Es el MISMO número que ya ve en
         # "Mis Códigos"; no es información nueva, y menos aún un costo.
-        'max_discount': max(pyramid.discount_tiers_for(pyramid.effective_rate(dist)) or [0]),
+        'max_discount': max(pyramid.discount_tiers_de(dist) or [0]),
         'caps': caps,
     }
+
+
+# ----------------- La cotización por CORREO -----------------
+#
+# El distribuidor arma la cotización en su panel y se la manda al correo de su
+# cliente. Tres candados, todos en el servidor:
+#
+#   1. `get_current_distributor` + `deny_view_as` — un cliente no entra (403), y el
+#      "ver como" del admin es SOLO LECTURA: espiar un panel no puede convertirse
+#      en mandar correos desde la cuenta de otro.
+#   2. EL PRECIO LO PONE EL SERVIDOR. Del navegador sólo viajan qué producto y
+#      cuántos; el precio, el tope de cada renglón y el total se calculan aquí con
+#      el catálogo real. Si no fuera así, cualquiera con la consola abierta podría
+#      mandar un correo firmado por Exygen prometiendo Retatrutida a $1.
+#   3. TOPE DE ENVÍOS. El botón manda correo a una dirección escrita a mano: sin
+#      freno es un cañón de spam con el dominio de Exygen de munición, y el dominio
+#      se quema para TODOS los correos (pedidos incluidos).
+
+COTIZACIONES_POR_HORA = 20        # a mano nadie cotiza más rápido que esto
+COTIZACIONES_POR_DIA = 60
+_COTIZACIONES_MANDADAS = {}       # distribuidor -> marcas de tiempo del último día
+
+
+def _puede_mandar_cotizacion(dist_id, ahora=None):
+    """Freno por distribuidor: 20 por hora y 60 por día. En memoria a propósito —
+    si el proceso se reinicia el contador se va, y eso está bien: el freno protege
+    del abuso sostenido, no es una cuota contable."""
+    import time as _t
+    ahora = ahora if ahora is not None else _t.time()
+    marcas = [m for m in _COTIZACIONES_MANDADAS.get(dist_id, []) if ahora - m < 86400]
+    if sum(1 for m in marcas if ahora - m < 3600) >= COTIZACIONES_POR_HORA \
+            or len(marcas) >= COTIZACIONES_POR_DIA:
+        _COTIZACIONES_MANDADAS[dist_id] = marcas
+        return False
+    marcas.append(ahora)
+    _COTIZACIONES_MANDADAS[dist_id] = marcas
+    return True
+
+
+def _nombre_cotizable(doc):
+    """El nombre que ve el cliente: producto + presentación, sin repetirla."""
+    nombre = (doc.get('name') or '').strip()
+    pres = (doc.get('presentation') or '').strip()
+    if pres and pres.lower() not in nombre.lower():
+        return f'{nombre} {pres}'.strip()
+    return nombre
+
+
+def _armar_cotizacion(items, pedido_pct, tope_dist, catalogo):
+    """Los renglones de la cotización CON LOS PRECIOS DEL SERVIDOR.
+
+    El descuento de cada renglón es el menor de tres: el que pidió el distribuidor,
+    lo que aguanta ese producto (`tope_de_descuento`, la misma función del checkout)
+    y su propio máximo. Es la misma aritmética que la pantalla, para que el correo y
+    la hoja impresa digan el mismo número."""
+    lineas, lista_total, total = [], 0.0, 0.0
+    for it in items:
+        doc = catalogo.get(it.product_id)
+        if not doc or doc.get('hidden'):
+            continue
+        precio = float(doc.get('price') or 0)
+        if precio <= 0:
+            continue
+        pct = min(pedido_pct, tope_de_descuento(doc), tope_dist)
+        unit = round(precio * (1 - pct))
+        qty = int(it.quantity)
+        lineas.append({'name': _nombre_cotizable(doc), 'quantity': qty,
+                       'unit_price': unit, 'list_price': round(precio),
+                       'amount': unit * qty})
+        lista_total += round(precio) * qty
+        total += unit * qty
+    return lineas, lista_total, total
+
+
+@api_router.post('/distributor/quote/email')
+async def distributor_quote_email(payload: QuoteEmailRequest,
+                                  dist=Depends(get_current_distributor)):
+    """Manda la cotización al correo del cliente. Nada de costos viaja adentro."""
+    deny_view_as(dist)
+    if not payload.items:
+        raise HTTPException(status_code=400, detail='La cotización no tiene renglones')
+    if len(payload.items) > 40:
+        raise HTTPException(status_code=400, detail='Demasiados renglones en la cotización')
+    if not _puede_mandar_cotizacion(dist['id']):
+        raise HTTPException(status_code=429,
+                            detail='Demasiadas cotizaciones seguidas. Espera un momento.')
+
+    catalogo = await _catalogo_de(payload.items)
+    tope_dist = max(pyramid.discount_tiers_de(dist) or [0])
+    lineas, lista_total, total = _armar_cotizacion(
+        payload.items, max(0.0, float(payload.discount or 0)), tope_dist, catalogo)
+    if not lineas:
+        raise HTTPException(status_code=400, detail='Ninguno de esos productos se puede cotizar')
+
+    codigo = (dist.get('distributor_code') or '').strip()
+    site = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+    enlace = f'{site}/catalogo?ref={urlquote(codigo)}' if codigo else f'{site}/catalogo'
+    cotizacion = {
+        'folio': (payload.folio or '').strip()[:32],
+        'client_name': (payload.client_name or '').strip()[:80],
+        'advisor': (dist.get('name') or '').strip()[:80],
+        'code': codigo,
+        'link': enlace,
+        'lines': lineas,
+        'list_total': lista_total,
+        'savings': max(0.0, lista_total - total),
+        'total': total,
+    }
+    # El correo sale del dominio de Exygen (el autenticado); la RESPUESTA va al
+    # distribuidor, para que el cliente le conteste a quien le cotizó.
+    salio = await send_quote_email(
+        payload.email, cotizacion,
+        language=payload.language or dist.get('language'),
+        reply_to=(dist.get('email') or None))
+    if not salio:
+        raise HTTPException(status_code=502, detail='No se pudo enviar la cotización')
+    return {'sent': True, 'total': total, 'lines': len(lineas)}
 
 
 @api_router.post('/distributor/codes/rotate')
 async def rotate_discount_codes(dist=Depends(get_current_distributor)):
     """Renueva YA todos los códigos (nuevos textos). Los viejos dejan de servir."""
+    await _exigir_acuerdo(dist)
     codes = await _ensure_distributor_codes(dist, force_rotate=True)
     return {'rotated': True, 'codes': [_code_projection(c) for c in codes]}
+
+
+# ----------------- Acuerdo de Distribuidor: texto, firma y copia -----------------
+# ⛔ NADA DE ESTO SE ACTIVA SOLO. Con el interruptor apagado —que es como está
+# hoy— estas rutas siguen existiendo pero contestan `requiere_aceptacion: false`
+# y el panel del distribuidor no enseña ni una pantalla nueva. Ver acuerdo.py
+# para el porqué legal (Código de Comercio arts. 93, 93 Bis y 1298-A).
+
+
+@api_router.get('/acuerdo/distribuidor')
+async def leer_acuerdo(user=Depends(get_optional_user)):
+    """El acuerdo vigente + si ESTE usuario ya lo firmó.
+
+    `get_optional_user` a propósito: la pantalla de ACTIVACIÓN tiene que poder
+    enseñar el texto antes de que exista la sesión —nadie firma a ciegas—, y el
+    texto no es secreto: es lo que se le pide firmar a cualquiera que entre al
+    canal. Los datos de la aceptación (IP, fecha) sólo salen si hay sesión, y
+    sólo los suyos."""
+    return await acuerdo.estado_para(db, user)
+
+
+@api_router.post('/acuerdo/distribuidor/aceptar')
+async def aceptar_acuerdo(payload: AceptarAcuerdoInput, request: Request,
+                          user=Depends(get_current_user)):
+    """Registra la aceptación. Aquí nace la prueba.
+
+    ⛔ TRES CANDADOS:
+      1. Sesión real (`get_current_user`) — una firma anónima no prueba nada.
+      2. `deny_view_as` — el "ver como" del admin es SOLO LECTURA: espiar el
+         panel de alguien JAMÁS puede convertirse en firmar un contrato en su
+         nombre. Éste es el caso donde más caro saldría.
+      3. La versión que manda el navegador tiene que ser la vigente. Si el
+         acuerdo cambió mientras la pantalla estaba abierta, se rechaza y se
+         recarga: nadie firma un texto distinto del que leyó.
+
+    Y la casilla: `acepto` tiene que llegar en `true` explícito. El modelo la
+    declara `False` por omisión, así que un cuerpo vacío NO firma nada."""
+    deny_view_as(user)
+    if not acuerdo.activo():
+        raise HTTPException(status_code=409,
+                            detail='La aceptación del acuerdo todavía no está habilitada.')
+    if not payload.acepto:
+        raise HTTPException(status_code=400,
+                            detail='Debes marcar la casilla de aceptación.')
+    if payload.version and payload.version != acuerdo.VERSION:
+        raise HTTPException(status_code=409,
+                            detail='El acuerdo cambió mientras lo leías. Vuelve a cargarlo.')
+    await acuerdo.registrar(db, user, ip=acuerdo.ip_de(request),
+                            user_agent=acuerdo.user_agent_de(request), origen='panel')
+    return await acuerdo.estado_para(db, user)
+
+
+@api_router.get('/acuerdo/distribuidor/copia')
+async def descargar_acuerdo(user=Depends(get_current_user)):
+    """La COPIA DESCARGABLE del art. 93 Bis: el texto íntegro más su acta de
+    aceptación (quién, cuándo, desde qué IP, sobre qué huella SHA-256).
+
+    Un HTML autocontenido —sin estilos externos ni JavaScript— que se abre igual
+    dentro de diez años y se imprime a PDF con Ctrl+P. Se entrega aunque todavía
+    no haya firmado: leer lo que se le pide firmar no puede depender de firmarlo."""
+    ace = await acuerdo.aceptacion_de(db, user['id'])
+    return Response(content=acuerdo.copia_imprimible(ace), media_type='text/html; charset=utf-8',
+                    headers={'Content-Disposition':
+                             f'attachment; filename="{acuerdo.nombre_de_archivo()}"'})
+
+
+@api_router.get('/admin/acuerdo/aceptaciones')
+async def listar_aceptaciones(admin=Depends(get_current_admin)):
+    """El expediente completo, para Christián: quién firmó, qué versión y cuándo.
+
+    Es la lista que se enseña si algún día hay que probar el consentimiento de
+    todo el canal. Sólo admin: son datos personales de terceros (IP incluida)."""
+    docs = await db[acuerdo.COLECCION].find({}, {'_id': 0}).to_list(2000)
+    docs.sort(key=lambda d: d.get('accepted_at', ''), reverse=True)
+    return {
+        'activo': acuerdo.activo(),
+        'version_vigente': acuerdo.VERSION,
+        'hash_vigente': acuerdo.hash_documento(),
+        'total': len(docs),
+        'al_dia': sum(1 for d in docs if d.get('version') == acuerdo.VERSION),
+        'aceptaciones': docs,
+    }
 
 
 # ----------------- Centro de noticias: feed del usuario -----------------
@@ -3998,7 +4222,7 @@ def _distributor_rollup(dist, users, orders):
         'tier': pyramid.normalize_tier(dist.get('tier')),
         # Lo que de verdad gana y el descuento máximo que puede dar (nivel o mano).
         'effective_rate': pyramid.effective_rate(dist),
-        'max_discount': max(pyramid.discount_tiers_for(pyramid.effective_rate(dist)) or [0]),
+        'max_discount': max(pyramid.discount_tiers_de(dist) or [0]),
         'upline_id': dist.get('upline_id'),
         'created_at': dist.get('created_at'),
         'email_verified': dist.get('email_verified', False),

@@ -296,3 +296,22 @@ def prorratear_por_dinero(rows, paid_merchandise, after_discount):
         if r['amount'] > 0:
             out.append(r)
     return out
+
+
+def discount_tiers_de(dist):
+    """Los niveles de descuento que ESTE distribuidor puede otorgar.
+
+    Normalmente = discount_tiers_for(su comisión), que topa 5% abajo de ella.
+    Christián puede autorizar a UNA persona un tope personal mayor con
+    `max_discount_override` en su cuenta (María al 30%, 2026-07-30): se
+    agregan los escalones que falten, nunca arriba de su propia comisión —
+    otorgar el tope completo significa que esa venta le deja 0 de comisión."""
+    base = discount_tiers_for(effective_rate(dist))
+    extra = float((dist or {}).get('max_discount_override') or 0)
+    if not extra:
+        return base
+    tope = round(min(extra, effective_rate(dist)), 4)
+    tiers = {round(t, 4) for t in base}
+    tiers |= {round(x / 100, 4) for x in range(DISCOUNT_FLOOR, int(round(tope * 100)) + 1, 5)}
+    tiers.add(tope)
+    return sorted(t for t in tiers if t <= tope + 1e-9)
