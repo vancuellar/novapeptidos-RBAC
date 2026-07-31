@@ -192,6 +192,10 @@ esta_corriendo() { corriendo_id "$(contenedor_de "$1")"; }
 salud_de() {
   local id; id="$(contenedor_de "$1")"
   [ -n "$id" ] || { echo "no-existe"; return 0; }
+  # Un contenedor APAGADO conserva la ultima salud que tuvo, y esa suele ser
+  # "unhealthy" porque el healthcheck fallo justo al apagarlo. Decirlo asi
+  # asusta sin motivo: el color en reserva esta apagado a proposito.
+  corriendo_id "$id" || { echo "apagado"; return 0; }
   docker inspect "$id" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}sin-healthcheck{{end}}' 2>/dev/null || echo desconocido
 }
 
@@ -231,11 +235,19 @@ guardar_marcha_atras() {
     "$img" "$commit" "${color:-legado}" "$(date -Iseconds)" > "$ESTADO"
 }
 
+# El codigo HTTP de una URL. curl ya imprime "000" cuando no logra conectarse,
+# asi que aqui NO va un "|| echo 000": duplicaba la respuesta y se leia "000000".
+codigo_de() {
+  local c
+  c="$(curl -s -o /dev/null -w '%{http_code}' --max-time "${2:-10}" "$1" 2>/dev/null || true)"
+  echo "${c:-000}"
+}
+
 # Espera a que la API conteste 200 en una URL. Devuelve 1 si se agota el plazo.
 esperar_200() {
   local url="$1" plazo="${2:-60}" i=0 codigo
   while [ "$i" -lt "$plazo" ]; do
-    codigo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" || echo 000)"
+    codigo="$(codigo_de "$url" 5)"
     if [ "$codigo" = "200" ]; then return 0; fi
     i=$((i + 2)); sleep 2
   done
@@ -255,7 +267,7 @@ esperar_sano() {
       rojo "  El color $color se declaro 'unhealthy'."
       return 1
     fi
-    codigo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" || echo 000)"
+    codigo="$(codigo_de "$url" 5)"
     if [ "$codigo" = "200" ] && { [ "$salud" = "healthy" ] || [ "$salud" = "sin-healthcheck" ]; }; then
       return 0
     fi
@@ -602,12 +614,12 @@ estado() {
   echo ""
   local codigo
   for u in "$URL_LOCAL" "$URL_PUERTA" "$URL_PUBLICA"; do
-    codigo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u" || echo 000)"
+    codigo="$(codigo_de "$u")"
     printf '  %-38s -> %s\n' "$u" "$codigo"
   done
   for c in azul verde; do
     if [ -n "$(contenedor_de "$c")" ]; then
-      codigo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$(url_de "$c")" || echo 000)"
+      codigo="$(codigo_de "$(url_de "$c")" 5)"
       printf '  color %-5s %-26s -> %s   [%s]\n' "$c" "$(url_de "$c")" "$codigo" "$(salud_de "$c")"
     fi
   done
@@ -749,7 +761,7 @@ desplegar() {
     morir "Se apago el color viejo y la tienda dejo de contestar. Se intento la marcha atras."
   fi
   local codigo_local
-  codigo_local="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL_LOCAL" || echo 000)"
+  codigo_local="$(codigo_de "$URL_LOCAL")"
   verde "  $URL_PUBLICA -> 200   |   $URL_LOCAL -> $codigo_local"
   gris  "  Salud del color $nuevo: $(salud_de "$nuevo")"
 
