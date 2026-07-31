@@ -51,9 +51,17 @@ import time
 
 import requests
 
+import ritmo
 import skydropx
 
 logger = logging.getLogger(__name__)
+
+# ⛔ SU PROPIO TOPE, SU PROPIA CUENTA. También son 2 peticiones por segundo, pero se
+# cuentan aparte de las de Skydropx: el límite es por cuenta, no del mundo. Compartir un
+# solo freno entre los dos proveedores frenaría a la mitad sin motivo — que es justo lo
+# que haría más lento el doble cotizador y lo volvería un estorbo.
+RITMO = ritmo.Ritmo(float(os.environ.get('ENVIOSINT_REQ_POR_SEG', 2)),
+                    'enviosinternacionales')
 
 # El nombre con el que este proveedor aparece en el panel y en la bitácora.
 NOMBRE = 'Envios Internacionales'
@@ -116,6 +124,7 @@ def _pedir_token() -> str:
     cid, secreto = _credenciales()
     if not enabled():
         raise RuntimeError('Faltan ENVIOSINT_CLIENT_ID / ENVIOSINT_CLIENT_SECRET')
+    RITMO.esperar()          # el trámite del token también gasta cupo de la cuenta
     resp = requests.post(f'{API}/oauth/token',
                          headers={'Content-Type': 'application/json'},
                          json={'client_id': cid, 'client_secret': secreto,
@@ -148,9 +157,11 @@ def _headers(token: str) -> dict:
 
 def _llamar(fn, ruta: str, **kw):
     """Una petición con token. Si contesta 401, pide token nuevo y reintenta UNA vez."""
+    RITMO.esperar()
     resp = fn(f'{API}{ruta}', headers=_headers(_token()), timeout=TIMEOUT, **kw)
     if getattr(resp, 'status_code', 0) == 401:
         olvidar_token()
+        RITMO.esperar()
         resp = fn(f'{API}{ruta}', headers=_headers(_token(refrescar=True)),
                   timeout=TIMEOUT, **kw)
     if resp.status_code >= 300:

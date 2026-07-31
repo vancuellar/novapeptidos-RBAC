@@ -74,6 +74,9 @@ class ApiFalsa:
     def __init__(self, tarifas, revienta=False):
         self.tarifas, self.revienta = tarifas, revienta
         self.compras = []
+        # Cuántas veces se pidió token. Importa: el token dura 2 horas y pedirlo de más
+        # regala la mitad del cupo de 2 peticiones por segundo.
+        self.tokens = 0
 
     def _ruta(self, url):
         return url.split('/api/v1', 1)[-1] if '/api/v1' in url else url
@@ -81,6 +84,7 @@ class ApiFalsa:
     def post(self, url, headers=None, json=None, timeout=None):
         ruta = self._ruta(url)
         if ruta == '/oauth/token':
+            self.tokens += 1
             return FakeResp({'access_token': 'tok', 'expires_in': 7200})
         if self.revienta:
             return FakeResp({'message': 'caido'}, 500)

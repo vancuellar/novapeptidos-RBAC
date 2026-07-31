@@ -34,7 +34,14 @@ import time
 
 import requests
 
+import ritmo
+
 logger = logging.getLogger(__name__)
+
+# ⛔ EL TOPE DE LA CUENTA: 2 peticiones por segundo. Lo marca Skydropx y lo comparten
+# TODAS las cotizaciones a la vez — no cada una por su lado. Ver `ritmo.py`: con dos
+# despachos simultáneos, el `sleep` de las consultas no alcanzaba y se llegaba al 429.
+RITMO = ritmo.Ritmo(float(os.environ.get('SKYDROPX_REQ_POR_SEG', 2)), 'skydropx')
 
 # La cuenta PRO del dueño vive aquí. Se deja configurable para poder apuntar a un
 # ambiente de pruebas sin tocar código.
@@ -104,6 +111,7 @@ def _pedir_token() -> str:
     cid, secreto = _credenciales()
     if not (cid and secreto):
         raise RuntimeError('Faltan SKYDROPX_CLIENT_ID / SKYDROPX_CLIENT_SECRET')
+    RITMO.esperar()          # el trámite del token también gasta cupo de la cuenta
     resp = requests.post(f'{API}/oauth/token',
                          headers={'Content-Type': 'application/json'},
                          json={'client_id': cid, 'client_secret': secreto,
@@ -141,9 +149,11 @@ def _llamar(fn, ruta: str, **kw):
     credenciales). Reintentar una vez evita que eso tumbe una cotización; reintentar
     en bucle convertiría un 401 legítimo en una tormenta de peticiones.
     """
+    RITMO.esperar()
     resp = fn(f'{API}{ruta}', headers=_headers(_token()), timeout=TIMEOUT, **kw)
     if getattr(resp, 'status_code', 0) == 401:
         olvidar_token()
+        RITMO.esperar()
         resp = fn(f'{API}{ruta}', headers=_headers(_token(refrescar=True)),
                   timeout=TIMEOUT, **kw)
     if resp.status_code >= 300:
