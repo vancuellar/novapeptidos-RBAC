@@ -4218,6 +4218,15 @@ async def admin_stats(admin=Depends(get_current_admin)):
     total_products = await db.products.count_documents({})
     total_orders = await db.orders.count_documents({})
     total_users = await db.users.count_documents({'role': 'user'})
+    # ⛔ EL MOSAICO TIENE QUE DAR EL MISMO NÚMERO QUE LA LISTA (Christián, 2026-07-31).
+    # Desde que los invitados son clientes, contar sólo las cuentas dejaba el tablero
+    # diciendo «4 clientes» y la pestaña de al lado enseñando 6 — y a un tablero que se
+    # contradice con la lista que abre no se le vuelve a creer. Se cuenta EXACTAMENTE lo
+    # mismo que arma `/admin/customers`: un renglón por correo de invitado. Si alguno de
+    # esos correos ya tiene cuenta, ahí siguen los dos renglones a propósito, marcados
+    # como posible duplicado, hasta que Christián decida fusionarlos.
+    todos = await db.orders.find({}, {'_id': 0, 'user_id': 1, 'customer': 1}).to_list(20000)
+    total_users += len(_agrupar_invitados(todos))
     orders = await db.orders.find(
         {}, {'_id': 0, 'total': 1, 'status': 1, 'paid': 1,
              'backorder_items': 1, 'archived': 1}).to_list(1000)
@@ -4469,6 +4478,95 @@ async def admin_motor_decidir(llave: str, payload: dict,
 
 
 # ----------------- Admin: Customers -----------------
+#
+# ⛔ TODO EL QUE COMPRA ES CLIENTE, TENGA CUENTA O NO (Christián, 2026-07-31).
+# El checkout permite comprar como invitado, y esta lista se armaba únicamente con
+# `users.role == 'user'`: quien compró sin abrir cuenta NO EXISTÍA para la casa. Le
+# pasó a Brenda ($4,827) y a Aidee ($2,830) el 2026-07-30 — dinero cobrado, guía puesta,
+# comisión pagada, y ni una ficha a la que volver para venderles otra vez.
+
+def _correo_llave(x) -> str:
+    """La llave con la que se identifica a una persona SIN cuenta: su correo, en
+    minúsculas y sin espacios. «Juan@X.mx» y «juan@x.mx» son la misma persona."""
+    return (x or '').strip().lower()
+
+
+def _correos_de_la_cuenta(u) -> list:
+    """El correo principal MÁS los alternos. `alt_emails` puede venir como texto suelto
+    (así lo guardó la fusión de cuentas de la casa) o como lista: se aceptan los dos."""
+    alt = u.get('alt_emails') or []
+    if isinstance(alt, str):
+        alt = [alt]
+    return [c for c in (_correo_llave(x) for x in [u.get('email'), *alt]) if c]
+
+
+async def _mapa_de_correos_con_cuenta() -> dict:
+    """correo → cuenta, mirando también los alternos.
+
+    ⛔ MISMA REGLA QUE EN LA PUERTA DE ENTRADA. `_usuario_por_correo` ya resuelve el
+    login con `{'$or': [{'email': e}, {'alt_emails': e}]}` desde que se fusionaron las
+    dos direcciones de la casa. Si las listas de clientes miraran sólo `email`, la misma
+    persona saldría dos veces: una por su cuenta y otra como «invitada» de su correo
+    alterno. Una persona, una ficha — también aquí."""
+    users = await db.users.find({}, {'_id': 0, 'id': 1, 'name': 1, 'email': 1,
+                                     'alt_emails': 1, 'role': 1,
+                                     'email_verified': 1}).to_list(5000)
+    mapa = {}
+    for u in users:
+        for c in _correos_de_la_cuenta(u):
+            mapa.setdefault(c, u)
+    return mapa
+
+
+def _agrupar_invitados(orders) -> dict:
+    """Los pedidos SIN cuenta, agrupados por correo. correo → lista de pedidos.
+
+    Un pedido sin correo no se puede atribuir a nadie y se queda fuera: no hay llave."""
+    por_correo = {}
+    for o in orders:
+        if o.get('user_id'):
+            continue                     # con cuenta: sale por la otra vía
+        correo = _correo_llave((o.get('customer') or {}).get('email'))
+        if not correo:
+            continue
+        por_correo.setdefault(correo, []).append(o)
+    return por_correo
+
+
+def _contacto_mas_reciente(pedidos) -> dict:
+    """Nombre, teléfono y domicilios de un invitado: los de su pedido MÁS NUEVO manda,
+    porque la gente corrige sus datos al recomprar."""
+    ordenados = sorted(pedidos, key=lambda o: o.get('created_at', ''), reverse=True)
+    nombre, telefonos, domicilios = '', [], []
+    for o in ordenados:
+        c = o.get('customer') or {}
+        nombre = nombre or (c.get('full_name') or '')
+        tel = (c.get('phone') or '').strip()
+        if tel and tel not in telefonos:
+            telefonos.append(tel)
+        pais = c.get('country') if c.get('country') not in (None, '', 'MX') else None
+        dom = ', '.join(x for x in [c.get('address'), c.get('city'), c.get('state'),
+                                    c.get('postal_code'), pais] if x)
+        if dom and dom not in domicilios:
+            domicilios.append(dom)
+    return {'name': nombre, 'phones': telefonos, 'addresses': domicilios}
+
+
+def _lo_que_suele_llevar(orders, tope=5) -> list:
+    """Qué productos compra esta persona, del que más piezas se lleva al que menos.
+
+    Es la pregunta que se hace quien va a volver a venderle: «¿qué le ofrezco?». Sin
+    esto había que abrir sus pedidos uno por uno y sumar de memoria."""
+    agg = {}
+    for o in orders:
+        for it in (o.get('items') or []):
+            nombre = it.get('name') or '—'
+            fila = agg.setdefault(nombre, {'name': nombre, 'units': 0, 'orders': 0})
+            fila['units'] += int(it.get('quantity', 0) or 0)
+            fila['orders'] += 1
+    return sorted(agg.values(), key=lambda f: (-f['units'], f['name']))[:tope]
+
+
 @api_router.get('/admin/customers')
 async def admin_customers(admin=Depends(get_current_admin)):
     """Todos los clientes con su historial de compra. Nunca expone password_hash."""
@@ -4494,6 +4592,7 @@ async def admin_customers(admin=Depends(get_current_admin)):
                 phones.append(c['phone'])
         out.append({
             **u,
+            'guest': False,
             'orders_count': len(uo),
             # Lo que este cliente REALMENTE PAGÓ, y aparte lo que debe. "Gastado" era
             # todo lo no cancelado, así que un cliente fiado se veía como el que mejor
@@ -4505,8 +4604,111 @@ async def admin_customers(admin=Depends(get_current_admin)):
             'phones': phones,
             'orders': uo,
         })
-    out.sort(key=lambda u: (-u['total_spent'], u.get('created_at', '')))
+
+    # ⛔ Y LOS QUE COMPRARON SIN CUENTA. Mismo renglón, misma ficha, con el distintivo
+    # de «invitado» para que se sepa de un vistazo que no hay perfil detrás.
+    cuentas = await _mapa_de_correos_con_cuenta()
+    for correo, pedidos in _agrupar_invitados(orders).items():
+        vivos = [o for o in pedidos if esta_vivo(o)]
+        pedidos.sort(key=lambda o: o.get('created_at', ''), reverse=True)
+        contacto = _contacto_mas_reciente(pedidos)
+        fila = {
+            'id': f'invitado:{correo}',
+            'guest': True,
+            'name': contacto['name'] or correo,
+            'email': correo,
+            'role': 'user',
+            # Para un invitado, «desde cuándo es cliente» es su PRIMERA compra: no hay
+            # fecha de registro porque no hay registro.
+            'created_at': min((o.get('created_at', '') for o in pedidos), default=None),
+            'orders_count': len(pedidos),
+            'total_spent': sum(cobrado_de(o) for o in vivos),
+            'por_cobrar': sum(por_cobrar_de(o) for o in vivos),
+            'last_order_at': pedidos[0].get('created_at') if pedidos else None,
+            'addresses': contacto['addresses'],
+            'phones': contacto['phones'],
+            'orders': pedidos,
+        }
+        # Si ese correo YA tiene cuenta y aun así el pedido quedó huérfano, es que la
+        # cuenta nunca confirmó el correo (`_adoptar_pedidos_de_invitado` no adopta sin
+        # confirmar, y con razón). NO se fusiona a ciegas: se marca para que el admin
+        # decida. Ver /admin/clientes/duplicados.
+        gemela = cuentas.get(correo)
+        if gemela:
+            fila['posible_duplicado_de'] = {'id': gemela.get('id'), 'name': gemela.get('name'),
+                                            'email': gemela.get('email')}
+        out.append(fila)
+
+    out.sort(key=lambda u: (-u['total_spent'], u.get('created_at') or ''))
     return out
+
+
+@api_router.get('/admin/clientes/duplicados')
+async def clientes_duplicados(admin=Depends(get_current_admin)):
+    """LA MISMA PERSONA, DOS VECES. Un reporte, no una fusión.
+
+    ⛔ NO SE FUSIONA A CIEGAS (Christián, 2026-07-31). Juntar dos fichas es regalarle a
+    una cuenta el historial de compras de otra —nombre, teléfono, domicilio y qué
+    compró— y si el emparejamiento se equivoca no hay vuelta atrás. Así que aquí sólo se
+    señala; la decisión es de Christián.
+
+    Tres formas de estar duplicado:
+      · `invitado_con_cuenta` — compró como invitado con un correo que YA tiene cuenta.
+        Pasa cuando la cuenta nunca confirmó su correo: la adopción automática exige la
+        confirmación (es la única prueba de que el buzón es suyo).
+      · `correo_repetido` — dos cuentas con el mismo correo normalizado (o el principal
+        de una es el alterno de la otra).
+      · `telefono_repetido` — dos personas distintas con el mismo teléfono. Puede ser
+        legítimo (una pareja, una oficina); por eso se reporta y no se toca.
+    """
+    users = await db.users.find({}, {'_id': 0, 'password_hash': 0,
+                                     'totp_secret': 0}).to_list(5000)
+    orders = await db.orders.find({}, {'_id': 0}).to_list(20000)
+    cuentas = await _mapa_de_correos_con_cuenta()
+    hallazgos = []
+
+    for correo, pedidos in _agrupar_invitados(orders).items():
+        cuenta = cuentas.get(correo)
+        if not cuenta:
+            continue
+        vivos = [o for o in pedidos if esta_vivo(o)]
+        hallazgos.append({
+            'tipo': 'invitado_con_cuenta',
+            'llave': correo,
+            'invitado': {'id': f'invitado:{correo}', 'name': _contacto_mas_reciente(pedidos)['name'],
+                         'email': correo, 'orders_count': len(pedidos),
+                         'total_spent': sum(cobrado_de(o) for o in vivos)},
+            'cuenta': {'id': cuenta.get('id'), 'name': cuenta.get('name'),
+                       'email': cuenta.get('email'),
+                       'email_verified': bool(cuenta.get('email_verified'))},
+            # Qué hacer: si la cuenta confirma su correo, la adopción es automática y el
+            # duplicado desaparece solo. Por eso el motivo va explícito.
+            'motivo': 'correo_sin_confirmar' if not cuenta.get('email_verified') else 'pedido_huerfano',
+        })
+
+    por_correo, por_telefono = {}, {}
+    for u in users:
+        for c in _correos_de_la_cuenta(u):
+            por_correo.setdefault(c, []).append(u)
+        tel = re.sub(r'\D', '', str(u.get('phone') or ''))[-10:]
+        if len(tel) == 10:
+            por_telefono.setdefault(tel, []).append(u)
+
+    def _fichas(lista):
+        return [{'id': x.get('id'), 'name': x.get('name'), 'email': x.get('email'),
+                 'role': x.get('role')} for x in lista]
+
+    for correo, lista in por_correo.items():
+        if len({x.get('id') for x in lista}) > 1:
+            hallazgos.append({'tipo': 'correo_repetido', 'llave': correo,
+                              'cuentas': _fichas(lista)})
+    for tel, lista in por_telefono.items():
+        if len({x.get('id') for x in lista}) > 1:
+            hallazgos.append({'tipo': 'telefono_repetido', 'llave': tel,
+                              'cuentas': _fichas(lista)})
+
+    hallazgos.sort(key=lambda h: (h['tipo'], h['llave']))
+    return {'total': len(hallazgos), 'duplicados': hallazgos}
 
 
 # ----------------- Admin: Analytics -----------------
@@ -8720,8 +8922,16 @@ async def ficha_de_cliente(client_id: str, user=Depends(get_current_user)):
             raise HTTPException(status_code=404, detail='Cliente no encontrado')
         # Si con el tiempo abrió cuenta con ese mismo correo, deja de ser invitado:
         # una persona, una ficha. Si no, existe únicamente dentro de sus pedidos.
-        cuenta = await db.users.find_one({'email': correo},
-                                         {'_id': 0, 'password_hash': 0, 'totp_secret': 0})
+        #
+        # ⛔ TAMBIÉN POR EL CORREO ALTERNO. Se buscaba sólo por `email`, así que quien
+        # compró como invitado con la dirección que después quedó de `alt_emails` seguía
+        # abriendo una ficha aparte — la misma persona, dos fichas. La puerta de entrada
+        # (`_usuario_por_correo`) mira las dos desde la fusión de cuentas de la casa;
+        # aquí también.
+        cuenta = await _usuario_por_correo(correo)
+        if cuenta:
+            cuenta = {k: v for k, v in cuenta.items()
+                      if k not in ('_id', 'password_hash', 'totp_secret')}
         if cuenta:
             invitado = False
             client_id = cuenta['id']
@@ -8766,8 +8976,24 @@ async def ficha_de_cliente(client_id: str, user=Depends(get_current_user)):
     if not invitado and cuenta.get('phone') and cuenta['phone'] not in telefonos:
         telefonos.insert(0, cuenta['phone'])
 
-    persona['phones'] = telefonos
-    persona['addresses'] = domicilios
+    # ⛔ EL INTERRUPTOR DE CONTACTO TAMBIÉN MANDA AQUÍ (Christián, 2026-07-31). La ficha
+    # del pedido (`_detalle_de_pedido`) y el autollenado (`/cotizador/clientes`) ya
+    # recortaban correo, teléfono y domicilio al distribuidor SIN el interruptor; esta
+    # ruta —que se abre desde ocho lugares— los mandaba enteros. Un distribuidor que
+    # abría a su propio cliente se llevaba su contacto completo, justo lo que la regla
+    # del 2026-07-23 prohíbe. Lo que no se puede ver, NO VIAJA: se recorta aquí, en el
+    # servidor, no en la pantalla.
+    #
+    # Lo que NUNCA se recorta: el NOMBRE (nunca fue secreto) y sus pedidos CON ÉL, que
+    # son de lo que vive el distribuidor.
+    ve_contacto = es_admin or ve_datos_del_cliente(user)
+    if ve_contacto:
+        persona['phones'] = telefonos
+        persona['addresses'] = domicilios
+    else:
+        persona.pop('email', None)
+        persona['phones'] = []
+        persona['addresses'] = []
 
     ficha = {
         'scope': 'admin' if es_admin else 'distributor',
@@ -8778,8 +9004,17 @@ async def ficha_de_cliente(client_id: str, user=Depends(get_current_user)):
             'paid_total': sum(cobrado_de(o) for o in vivos),
             'paid_count': len(solo_cobrados(vivos)),
             'por_cobrar': sum(por_cobrar_de(o) for o in vivos),
+            # PRIMERA y ÚLTIMA compra. La última sola no dice nada: «desde cuándo es
+            # cliente» y «hace cuánto no vuelve» son dos preguntas distintas, y las dos
+            # se contestan mirando este par.
+            'first_order_at': min((o.get('created_at', '') for o in vivos), default=None),
             'last_order_at': max((o.get('created_at', '') for o in vivos), default=None),
         },
+        # Lo que suele llevar: la respuesta a «¿qué le ofrezco?» sin abrir pedido por
+        # pedido. Al distribuidor sólo le cuenta lo que le compró A ÉL — y sólo si tiene
+        # el interruptor: «qué compuestos compró su cliente» estaba en la misma lista de
+        # lo prohibido del 2026-07-23 que el correo y el teléfono.
+        'top_products': _lo_que_suele_llevar(vivos) if ve_contacto else [],
     }
     if dist_id:
         ficha['totals']['my_earnings'] = sum(_my_amount(o, dist_id) for o in vivos)
