@@ -453,8 +453,20 @@ PAID_BODIES = {
 
 
 async def send_payment_confirmed_email(order, language=None):
-    """Aviso al cliente de que su pago quedo confirmado (SPEI verificado por el
-    admin, o cripto liquidada). Nunca lanza."""
+    """⚠️ JUBILADA EL 2026-07-31. NO LA VUELVAS A CONECTAR AL FLUJO DE COMPRA.
+
+    Éste era el correo de en medio de los TRES que recibía quien compraba con
+    tarjeta: decía «confirmamos tu pago» y nada más, y llegaba entre el de
+    «recibimos tu pedido» y el de «va en camino». Christián mandó consolidarlos.
+
+    Lo que hace su trabajo hoy es `send_order_email(order, lang, etapa='pagado')`,
+    que dice lo mismo Y lleva el detalle del pedido Y el número de guía adentro —
+    los tres correos en uno. Y se manda por una sola puerta (`avisar_al_cliente` en
+    server.py) que lleva el candado de «nunca dos veces lo mismo».
+
+    Se conserva porque sigue siendo un correo correcto y hay una prueba que lo cuida,
+    pero **conectarla otra vez a la confirmación de pago devuelve el tercer correo**.
+    """
     if not email_enabled():
         return
     customer = order.get('customer', {}) or {}
@@ -562,6 +574,51 @@ ORDER_SUBJECTS = {
     'pt': 'Recebemos seu pedido {number} — Exygen Labs',
 }
 
+# ==========================================================================
+#  UN SOLO CORREO CUANDO SE PUEDA (Christián, 2026-07-31)
+# ==========================================================================
+# ⛔ EL PROBLEMA QUE ESTO RESUELVE. Una compra con tarjeta mandaba TRES correos casi
+# seguidos: «recibimos tu pedido», «confirmamos tu pago» y «va en camino». Tres
+# correos por una sola compra es ruido: el cliente deja de abrirlos y el que de
+# verdad importa —el del número de guía— se pierde entre los otros dos.
+#
+# LA REGLA, en sus palabras: «un solo correo cuando se pueda; nadie debe recibir
+# tres correos por una compra».
+#
+# CÓMO SE CUMPLE. El mismo correo rico de siempre (el del detalle del pedido) se
+# rinde en TRES ETAPAS y cada compra usa las MENOS posibles:
+#
+#   · 'nuevo'   → «recibimos tu pedido» + los datos para pagar (CLABE / ficha).
+#                 SÓLO sale cuando el pago no es inmediato (SPEI, OXXO): con tarjeta
+#                 o cripto no se manda nada todavía, se espera al pago.
+#   · 'pagado'  → «confirmamos tu pago» + el detalle completo + EL NÚMERO DE GUÍA si
+#                 ya se compró. Es el correo que hace el trabajo de tres.
+#   · 'enviado' → sólo el rastreo, y sólo cuando la guía apareció DESPUÉS del correo
+#                 de pago (guía comprada a mano, reintento, o la segunda caja de un
+#                 envío partido). Ése sí es un evento nuevo de verdad.
+#
+# Lo que queda en la práctica:
+#   tarjeta/cripto + guía comprada  → 1 correo
+#   SPEI/OXXO + guía comprada       → 2 correos
+#   pago inmediato sin guía todavía → 2 correos (pago, y luego el rastreo)
+#
+# ⛔ EL CANDADO DE «NUNCA DOS VECES LO MISMO» NO VIVE AQUÍ, vive en el pedido
+# (`emails_sent` en server.py, apartado en un solo paso condicionado igual que el
+# cupón y los puntos). Aquí sólo se decide qué DICE cada etapa.
+ORDER_SUBJECTS_PAGADO = {
+    'es': 'Confirmamos tu pago del pedido {number} — Exygen Labs',
+    'en': 'Payment confirmed for order {number} — Exygen Labs',
+    'pt': 'Pagamento confirmado do pedido {number} — Exygen Labs',
+}
+# Cuando el pago Y la guía caen en el mismo correo, el asunto lo dice: es lo que hace
+# que el cliente lo abra. «Confirmamos tu pago» se puede dejar para después; «ya va en
+# camino, aquí está tu guía» no.
+ORDER_SUBJECTS_PAGADO_CON_GUIA = {
+    'es': 'Pago confirmado y tu pedido {number} ya va en camino — Exygen Labs',
+    'en': 'Payment confirmed — order {number} is on its way — Exygen Labs',
+    'pt': 'Pagamento confirmado — seu pedido {number} já está a caminho — Exygen Labs',
+}
+
 ORDER_COPY = {
     'es': {
         'heading': 'Recibimos tu pedido',
@@ -594,6 +651,25 @@ ORDER_COPY = {
         # nota corta pegada a CADA producto sobre pedido, igual que en el sitio.
         'backorderItemNote': 'Se surte desde EUA: tarda un poco mas en llegar. Te mantendremos al tanto.',
         'thanks': 'GRACIAS POR TU COMPRA',
+        # --- Etapa 'pagado': el correo que hace el trabajo de tres ---
+        'headingPaid': 'Confirmamos tu pago',
+        'headingPaidShipped': 'Pago confirmado: tu pedido va en camino',
+        'preheaderPaid': 'Recibimos tu pago del pedido {number}. Aqui esta todo el detalle.',
+        'introPaid': 'Recibimos y confirmamos tu pago. Aqui esta todo el detalle de tu pedido, para que lo tengas por escrito.',
+        # Pagado Y con guia: el rastreo va en este mismo correo, no en otro.
+        'nextPaidShipped': 'Tu pedido ya salio. Abajo esta tu numero de guia; puede tardar unas horas en aparecer en el sitio de la paqueteria.',
+        # Pagado y todavia sin guia (empaque por confirmar, o algo fallo).
+        'nextPaidWaiting': 'Ya lo estamos preparando. En cuanto salga te mandamos el numero de guia por correo; es el unico correo que falta.',
+        # Pagado y NADA salia de bodega ese dia: se dice la verdad, sin plazo inventado.
+        'nextPaidBackorder': 'Ya lo estamos trabajando: las piezas de tu pedido se surten desde EUA. En cuanto salga te mandamos el numero de guia por correo.',
+        # Caja del rastreo dentro del correo.
+        'trackingTitle': 'Tu numero de guia',
+        'trackingCarrier': 'Paqueteria',
+        'trackingNumber': 'Numero de guia',
+        'trackShipment': 'Rastrear mi pedido',
+        # ENVIO PARTIDO: cuando el cliente pidio que lo disponible salga ya, este
+        # paquete NO lleva todo. Decirlo aqui evita el mensaje de "me falto algo".
+        'partialShipment': 'Este envio lleva lo que ya teniamos en existencia. Lo demas sale en un segundo envio y te mandamos su propio numero de guia.',
     },
     'en': {
         'heading': 'We received your order',
@@ -623,6 +699,18 @@ ORDER_COPY = {
         'pointsUsed': 'Points redeemed',
         'backorderItemNote': "Ships from the USA - takes a little longer. We'll keep you posted.",
         'thanks': 'THANK YOU FOR YOUR ORDER',
+        'headingPaid': 'Payment confirmed',
+        'headingPaidShipped': 'Payment confirmed - your order is on its way',
+        'preheaderPaid': 'We received your payment for order {number}. Here is the full detail.',
+        'introPaid': 'We received and confirmed your payment. Here is the full detail of your order, for your records.',
+        'nextPaidShipped': 'Your order has shipped. Your tracking number is below; it can take a few hours to show up on the carrier site.',
+        'nextPaidWaiting': 'We are preparing it now. As soon as it ships we will email you the tracking number - that is the only email left.',
+        'nextPaidBackorder': 'We are working on it: the items in your order ship from the USA. As soon as it leaves we will email you the tracking number.',
+        'trackingTitle': 'Your tracking number',
+        'trackingCarrier': 'Carrier',
+        'trackingNumber': 'Tracking number',
+        'trackShipment': 'Track my order',
+        'partialShipment': 'This shipment carries what we already had in stock. The rest goes out in a second shipment with its own tracking number.',
     },
     'pt': {
         'heading': 'Recebemos seu pedido',
@@ -652,6 +740,18 @@ ORDER_COPY = {
         'pointsUsed': 'Pontos resgatados',
         'backorderItemNote': 'Vem dos EUA: demora um pouco mais para chegar. Vamos te manter informado.',
         'thanks': 'OBRIGADO PELA SUA COMPRA',
+        'headingPaid': 'Confirmamos seu pagamento',
+        'headingPaidShipped': 'Pagamento confirmado: seu pedido esta a caminho',
+        'preheaderPaid': 'Recebemos seu pagamento do pedido {number}. Aqui esta todo o detalhe.',
+        'introPaid': 'Recebemos e confirmamos seu pagamento. Aqui esta todo o detalhe do seu pedido, para o seu controle.',
+        'nextPaidShipped': 'Seu pedido ja foi despachado. Abaixo esta o codigo de rastreio; pode levar algumas horas para aparecer no site da transportadora.',
+        'nextPaidWaiting': 'Ja estamos preparando. Assim que for despachado mandamos o codigo de rastreio por e-mail; e o unico e-mail que falta.',
+        'nextPaidBackorder': 'Ja estamos trabalhando nele: as pecas do seu pedido vem dos EUA. Assim que sair mandamos o codigo de rastreio por e-mail.',
+        'trackingTitle': 'Seu codigo de rastreio',
+        'trackingCarrier': 'Transportadora',
+        'trackingNumber': 'Codigo de rastreio',
+        'trackShipment': 'Rastrear meu pedido',
+        'partialShipment': 'Este envio leva o que ja tinhamos em estoque. O restante sai em um segundo envio, com seu proprio codigo de rastreio.',
     },
 }
 
@@ -691,11 +791,50 @@ DARK_EMAIL_STYLE = """
 """
 
 
-def _order_email_html(order, copy, link):
+def _algo_sale_ya(order) -> bool:
+    """¿Hay AL MENOS UNA pieza de este pedido que salga de la bodega hoy?
+
+    Se usa para no prometer de más. Si NADA sale hoy, el correo de pago confirmado
+    dice «lo estamos trabajando, se surte desde EUA» en vez de «ya lo estamos
+    preparando»; y si algo sí sale, el envío que se manda es parcial y hay que
+    decirlo. La cuenta se hace comparando lo PEDIDO contra lo que quedó por surtir,
+    que es justo lo que guarda `backorder_items` (`pedidas` vs `por_surtir`).
+    """
+    lineas = (order or {}).get('backorder_items') or []
+    if not lineas:
+        return True                     # sin renglones por surtir, todo sale ya
+    for b in lineas:
+        try:
+            pedidas = int(b.get('pedidas') or b.get('quantity') or 0)
+            faltan = int(b.get('por_surtir') or b.get('faltan') or 0)
+        except (TypeError, ValueError):
+            continue
+        if pedidas > faltan:
+            return True                 # de este renglón sí sale una parte
+    # Y si algún renglón del pedido NO aparece en la lista de por surtir, ése sale ya.
+    ids = {str(b.get('product_id')) for b in lineas if b.get('product_id')}
+    nombres = {str(b.get('name', '')).strip().lower() for b in lineas if b.get('name')}
+    for it in (order or {}).get('items', []) or []:
+        get = (lambda k: getattr(it, k, None)) if not isinstance(it, dict) else it.get
+        if (str(get('product_id') or '') not in ids
+                and str(get('name') or '').strip().lower() not in nombres):
+            return True
+    return False
+
+
+def _order_email_html(order, copy, link, etapa='nuevo'):
     """Mismo lenguaje visual que el correo de bienvenida: tarjeta blanca sobre
     fondo gris, tablas anidadas y estilos en linea, que es lo unico que rinde
     parejo en Gmail, Outlook y Apple Mail. Con version oscura via clases em-*
-    (ver DARK_EMAIL_STYLE)."""
+    (ver DARK_EMAIL_STYLE).
+
+    `etapa` decide QUE dice este mismo correo (ver ORDER_SUBJECTS_PAGADO arriba):
+
+      · 'nuevo'  → recibimos tu pedido + como pagar (CLABE / ficha).
+      · 'pagado' → confirmamos tu pago + el detalle + el numero de guia si ya lo hay.
+
+    ⛔ LOS DATOS DE PAGO SOLO VAN EN 'nuevo'. Mandarle la CLABE a alguien que ya pago
+    es invitarlo a pagar dos veces."""
     esc = html.escape
     INK, BODY, MUTED, LINE, BG = '#132763', '#3D4657', '#8A93A8', '#E4E8F0', '#FBFCFE'
     FONT = 'Helvetica,Arial,sans-serif'
@@ -752,9 +891,23 @@ def _order_email_html(order, copy, link):
                                         customer.get('state', ''), customer.get('postal_code', ''),
                                         # El país solo cuando no es México (el caso normal no estorba).
                                         customer.get('country', '') if customer.get('country') not in ('', 'MX') else ''] if b))
+    es_pagado = etapa == 'pagado'
     is_spei = (order.get('payment_method') or '') == 'spei'
-    next_text = copy['nextSpei'] if is_spei else copy['nextCard']
-    spei = order.get('spei') if is_spei else None
+    rastreo = str(order.get('tracking_number') or '').strip()
+    # ⛔ QUE SIGUE, por etapa. En 'pagado' hay tres verdades distintas y cada una tiene
+    # su texto: ya salio (y aqui va la guia), sigue en preparacion, o todo se surte
+    # desde EUA. Ninguno promete una fecha que no se pueda cumplir.
+    if es_pagado:
+        if rastreo:
+            next_text = copy['nextPaidShipped']
+        elif order.get('backorder') and not _algo_sale_ya(order):
+            next_text = copy['nextPaidBackorder']
+        else:
+            next_text = copy['nextPaidWaiting']
+    else:
+        next_text = copy['nextSpei'] if is_spei else copy['nextCard']
+    # Los datos bancarios NUNCA viajan en el correo de pago confirmado.
+    spei = order.get('spei') if (is_spei and not es_pagado) else None
     spei_html = ''
     if spei and spei.get('clabe'):
         line = ('<tr><td style="padding:3px 0;font-family:{f};font-size:13px;color:{m};">{k}</td>'
@@ -774,6 +927,47 @@ def _order_email_html(order, copy, link):
             f'</td></tr></table></td></tr>'
         )
     number = esc(str(order.get('order_number', '')))
+
+    # ⛔ LA CAJA DEL RASTREO. Es la razon de ser de todo esto: el numero de guia viaja
+    # DENTRO del correo de pago confirmado en vez de en un tercer correo aparte.
+    rastreo_html = ''
+    if es_pagado and rastreo:
+        fila = ('<tr><td style="padding:3px 0;font-family:{f};font-size:13px;color:{m};">{k}</td>'
+                '<td align="right" style="padding:3px 0;font-family:{f};font-size:13px;color:{b};font-weight:bold;">{v}</td></tr>')
+        filas = ''.join(fila.format(f=FONT, m=MUTED, b=BODY, k=k, v=esc(str(v))) for k, v in [
+            (copy.get('trackingCarrier', 'Paqueteria'), order.get('carrier', '')),
+            (copy.get('trackingNumber', 'Numero de guia'), rastreo),
+        ] if v)
+        # Envio partido: este paquete NO lleva todo y hay que decirlo aqui mismo.
+        parcial = ''
+        if order.get('backorder_items') and _algo_sale_ya(order):
+            parcial = (f'<div class="em-muted" style="font-family:{FONT};font-size:11px;'
+                       f'line-height:1.5;color:{MUTED};padding-top:8px;">'
+                       f'{copy.get("partialShipment", "")}</div>')
+        rastreo_html = (
+            f'<tr><td style="padding:18px 40px 0 40px;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-box" '
+            f'style="background-color:{BG};border:1px solid {LINE};border-radius:10px;"><tr><td style="padding:14px 18px;">'
+            f'<div class="em-ink" style="font-family:{FONT};font-size:13px;font-weight:bold;color:{INK};padding-bottom:6px;">{copy.get("trackingTitle", "Tu numero de guia")}</div>'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{filas}</table>'
+            f'{parcial}'
+            f'</td></tr></table></td></tr>'
+        )
+
+    # Encabezado, preheader, intro y boton, segun la etapa.
+    if es_pagado:
+        heading = copy['headingPaidShipped'] if rastreo else copy['headingPaid']
+        preheader = copy['preheaderPaid'].format(number=number)
+        intro = copy['introPaid']
+        boton = copy.get('trackShipment', copy['track']) if rastreo else copy['track']
+        # Con guia, el boton lleva al rastreo de la paqueteria; sin ella, a la ficha.
+        if rastreo and order.get('tracking_url'):
+            link = order['tracking_url']
+    else:
+        heading = copy['heading']
+        preheader = copy['preheader'].format(number=number)
+        intro = copy['intro']
+        boton = copy['track']
 
     # Estilo ticket de super: ahorro y puntos en cajas punteadas, solo si aplican.
     ticket_lines = []
@@ -798,7 +992,7 @@ def _order_email_html(order, copy, link):
 <html lang="es-MX">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{DARK_EMAIL_STYLE}</head>
 <body class="em-bg" style="margin:0; padding:0; background-color:{BG};">
-  <div style="display:none; max-height:0; overflow:hidden; mso-hide:all;">{copy['preheader'].format(number=number)}</div>
+  <div style="display:none; max-height:0; overflow:hidden; mso-hide:all;">{preheader}</div>
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-bg" style="background-color:{BG};">
     <tr>
       <td align="center" style="padding:32px 16px;">
@@ -813,9 +1007,9 @@ def _order_email_html(order, copy, link):
 
           <tr>
             <td style="padding:28px 40px 0 40px; font-family:{FONT};">
-              <h1 class="em-ink" style="margin:0; font-size:26px; line-height:1.25; color:{INK}; font-weight:bold;">{copy['heading']}</h1>
+              <h1 class="em-ink" style="margin:0; font-size:26px; line-height:1.25; color:{INK}; font-weight:bold;">{heading}</h1>
               <p class="em-body" style="margin:16px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{copy['greet'].format(name=esc(str(customer.get('full_name', '')).upper()))}</p>
-              <p class="em-body" style="margin:12px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{copy['intro']}</p>
+              <p class="em-body" style="margin:12px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{intro}</p>
             </td>
           </tr>
 
@@ -839,6 +1033,7 @@ def _order_email_html(order, copy, link):
           </tr>
           {ticket_html}
           {spei_html}
+          {rastreo_html}
           <tr>
             <td style="padding:24px 40px 0 40px; font-family:{FONT};">
               <div class="em-muted" style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase;">{copy['nextTitle']}</div>
@@ -851,7 +1046,7 @@ def _order_email_html(order, copy, link):
 
           <tr>
             <td align="center" style="padding:28px 40px 8px 40px;">
-              <a href="{link}" class="em-btn" style="display:inline-block; background-color:{INK}; color:#FFFFFF; font-family:{FONT}; font-size:15px; font-weight:bold; text-decoration:none; padding:14px 36px; border-radius:999px;">{copy['track']}</a>
+              <a href="{link}" class="em-btn" style="display:inline-block; background-color:{INK}; color:#FFFFFF; font-family:{FONT}; font-size:15px; font-weight:bold; text-decoration:none; padding:14px 36px; border-radius:999px;">{boton}</a>
             </td>
           </tr>
 
@@ -890,9 +1085,17 @@ def _order_email_html(order, copy, link):
 </html>"""
 
 
-async def send_order_email(order, language=None):
-    """Confirmacion de pedido. Nunca lanza: una compra no puede fallar porque
-    el proveedor de correo este caido."""
+async def send_order_email(order, language=None, etapa='nuevo'):
+    """EL correo del cliente. Nunca lanza: una compra no puede fallar porque
+    el proveedor de correo este caido.
+
+    `etapa='nuevo'`  → «recibimos tu pedido» (+ CLABE si es SPEI).
+    `etapa='pagado'` → «confirmamos tu pago» + el detalle + LA GUIA si ya se compro.
+                       Es el correo que sustituye a los tres de antes.
+
+    ⛔ QUIEN LLAMA NO DECIDE SI SE MANDA. El candado de una-sola-vez vive en el pedido
+    (`_apartar_correo` en server.py): aqui se manda lo que se pida, siempre.
+    """
     if not email_enabled():
         logger.info('EMAIL_ENABLED != true, skipping order email for %s', order.get('order_number'))
         return
@@ -903,13 +1106,21 @@ async def send_order_email(order, language=None):
     lang = normalize_language(language)
     copy = ORDER_COPY[lang]
     site = os.environ.get('SITE_URL', 'https://exygenlabs.com')
-    link = f"{site}/pedido/{order.get('order_number', '')}"
-    subject = ORDER_SUBJECTS[lang].format(number=order.get('order_number', ''))
+    numero = order.get('order_number', '')
+    link = f"{site}/pedido/{numero}"
+    if etapa == 'pagado':
+        asuntos = (ORDER_SUBJECTS_PAGADO_CON_GUIA if order.get('tracking_number')
+                   else ORDER_SUBJECTS_PAGADO)
+    else:
+        asuntos = ORDER_SUBJECTS
+    subject = asuntos[lang].format(number=numero)
     try:
-        await asyncio.to_thread(_send_email_sync, to_address, subject, _order_email_html(order, copy, link))
-        logger.info('Order email sent to %s (order=%s, lang=%s)', to_address, order.get('order_number'), lang)
+        await asyncio.to_thread(_send_email_sync, to_address, subject,
+                                _order_email_html(order, copy, link, etapa))
+        logger.info('Order email sent to %s (order=%s, lang=%s, etapa=%s)',
+                    to_address, numero, lang, etapa)
     except Exception:
-        logger.exception('Failed to send order email for %s', order.get('order_number'))
+        logger.exception('Failed to send order email for %s', numero)
 
 
 # ---------- Aviso interno de compra: qué hay que preparar y mandar ----------

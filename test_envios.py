@@ -42,8 +42,28 @@ def _match(doc, filtro):
             if doc.get(k) not in v['$in']:
                 return False
             continue
+        if isinstance(v, dict) and '$nin' in v:
+            if doc.get(k) in v['$nin']:
+                return False
+            continue
+        if isinstance(v, dict) and '$lt' in v:
+            try:
+                if not float(doc.get(k) or 0) < float(v['$lt']):
+                    return False
+            except (TypeError, ValueError):
+                return False
+            continue
         if isinstance(v, dict) and '$ne' in v:
-            if doc.get(k) == v['$ne']:
+            actual = doc.get(k)
+            # ⛔ EN UN CAMPO DE LISTA, `$ne` SIGNIFICA «NINGÚN ELEMENTO ES IGUAL».
+            # El doble comparaba la lista entera contra el valor, así que
+            # {'emails_sent': {'$ne': 'pagado'}} SIEMPRE daba verdadero y el candado
+            # de «un correo por evento» no bloqueaba nada: la prueba pasaba en verde
+            # mientras el mismo correo salía dos veces.
+            if isinstance(actual, list):
+                if v['$ne'] in actual:
+                    return False
+            elif actual == v['$ne']:
                 return False
             continue
         if '.' in k:                      # 'opciones.opcion_id' → busca dentro de la lista
@@ -90,6 +110,13 @@ class FakeCol:
                 d.update(cambio.get('$set') or {})
                 for k, n in (cambio.get('$inc') or {}).items():
                     d[k] = (d.get(k) or 0) + n
+                # `$addToSet`: lo usa el candado de los correos (`emails_sent`), que
+                # es lo que impide que el mismo aviso salga dos veces.
+                for k, val in (cambio.get('$addToSet') or {}).items():
+                    lista = list(d.get(k) or [])
+                    if val not in lista:
+                        lista.append(val)
+                    d[k] = lista
                 return _Res(1)
         if upsert:
             # El doble ignoraba `upsert` y devolvía 0 en silencio. Los ajustes de
@@ -646,9 +673,14 @@ def test_si_la_paqueteria_no_contesta_no_se_inventa_un_cargo(db, con_llave, monk
 
 
 def test_apagado_el_envio_se_comporta_EXACTAMENTE_como_hoy(db):
-    """Sin prender nada: cero cargo y ninguna cotización guardada."""
+    """Sin COTIZAR en el checkout: cero cargo por cotización y nada guardado.
+
+    ⚠️ La compra automática de la guía SÍ está prendida desde el 2026-07-31 (orden de
+    Christián) y es otro interruptor: cotizarle al cliente en el checkout y comprar la
+    guía cuando entra el dinero son dos decisiones distintas. Este caso vigila la
+    primera, que sigue apagada.
+    """
     assert envios.COTIZAR_EN_CHECKOUT is False      # ⛔ nace apagado
-    assert envios.COMPRAR_GUIA_AL_PAGAR is False    # ⛔ nace apagado
     assert server.envio_se_cotiza() is False
     # Sin cotización viva se cae a la tarifa plana de $250, que es la política nueva.
     cobrado, guardado = asyncio.run(server._envio_del_pedido(_pedido(), 1000, PFLAGS))
@@ -756,20 +788,61 @@ def test_comprar_la_guia_manda_el_cuerpo_QUE_LA_API_PRO_ACEPTA(
     assert envio['address_from']['email'] == 'envios@exygenlabs.com'
 
 
+def _en_segundo_plano(monkeypatch):
+    """Atrapa lo que se manda a segundo plano y devuelve la lista para correrlo.
+
+    ⛔ POR QUÉ NO ALCANZA `create_task = lambda c: c`. Ese truco servía mientras lo que
+    colgaba de la confirmación eran funciones sueltas; desde que el pago manda a
+    `_confirmar_y_avisar` —que primero compra la guía y DESPUÉS manda un solo correo—
+    lo que se agenda es una corrutina de verdad, y una corrutina que nadie espera no
+    corre nunca. La prueba pasaba en verde sin haber ejecutado nada.
+    """
+    pendientes = []
+
+    def agendar(coro):
+        pendientes.append(coro)
+        return coro
+    monkeypatch.setattr(server.asyncio, 'create_task', agendar)
+    return pendientes
+
+
+def _correr_pendientes(pendientes):
+    async def todo():
+        for coro in list(pendientes):
+            if asyncio.iscoroutine(coro):
+                await coro
+    asyncio.run(todo())
+
+
+def _cazar_guias(monkeypatch, compradas):
+    """Sustituye la compra de guía por una que sólo anota. Acepta `avisar=`.
+
+    Desde el 2026-07-31 la compra ya no cuelga directo de la confirmación: pasa por
+    `_confirmar_y_avisar`, que primero compra (sin avisar por su cuenta) y DESPUÉS
+    manda un solo correo con el pago y el rastreo juntos. La firma lleva `avisar`.
+    """
+    async def falsa(o, avisar=True):
+        compradas.append(o.get('order_number'))
+        return None
+    monkeypatch.setattr(server, 'comprar_guia_del_pedido', falsa)
+
+
 def test_los_tres_metodos_de_pasarela_pasan_por_la_confirmacion(db, monkeypatch):
     """Tarjeta, OXXO y cripto confirman por webhook y todos caen en
     `_confirm_paid_order`. Se prueba que ESA es la que dispara la guía."""
     compradas = []
-    monkeypatch.setattr(server, 'comprar_guia_del_pedido',
-                        lambda o: compradas.append(o.get('order_number')))
-    monkeypatch.setattr(server, 'send_payment_confirmed_email', lambda *a, **k: None)
+    _cazar_guias(monkeypatch, compradas)
+    monkeypatch.setattr(server, 'avisar_al_cliente', _async_nada)
     # De la confirmación también cuelgan el aviso interno y el aviso a Meta
     # (Conversions API). Aquí no se prueban y no deben salir a internet.
-    monkeypatch.setattr(server, 'send_purchase_alert', lambda *a, **k: None)
+    # Async de verdad: ahora que las tareas de segundo plano SÍ se corren, un doble
+    # síncrono revienta con «NoneType can't be used in await».
+    monkeypatch.setattr(server, 'send_purchase_alert', _async_nada)
     monkeypatch.setattr(server.meta_capi, 'enviar_compra', lambda *a, **k: None)
-    monkeypatch.setattr(server.asyncio, 'create_task', lambda c: c)
+    pendientes = _en_segundo_plano(monkeypatch)
     asyncio.run(db.orders.insert_one(_orden('tarjeta')))
     asyncio.run(server._confirm_paid_order('EX-20260728-0001'))
+    _correr_pendientes(pendientes)
     assert compradas == ['EX-20260728-0001']
     assert db.orders.docs[0]['status'] == 'confirmado'
 
@@ -778,15 +851,15 @@ def test_spei_compra_su_guia_cuando_el_admin_confirma_el_deposito(db, monkeypatc
     """SPEI no tiene webhook: lo confirma el admin a mano. Es el cuarto método y
     tiene que comprar guía igual que los otros tres."""
     compradas = []
-    monkeypatch.setattr(server, 'comprar_guia_del_pedido',
-                        lambda o: compradas.append(o.get('order_number')))
-    monkeypatch.setattr(server, 'send_payment_confirmed_email', lambda *a, **k: None)
+    _cazar_guias(monkeypatch, compradas)
+    monkeypatch.setattr(server, 'avisar_al_cliente', _async_nada)
     monkeypatch.setattr(server, 'notify', _async_nada)
-    monkeypatch.setattr(server.asyncio, 'create_task', lambda c: c)
+    pendientes = _en_segundo_plano(monkeypatch)
     asyncio.run(db.orders.insert_one(_orden('spei')))
     from models import OrderStatusUpdate
     asyncio.run(server.update_order_status('o1', OrderStatusUpdate(status='confirmado'),
                                            admin={'id': 'admin'}))
+    _correr_pendientes(pendientes)
     assert compradas == ['EX-20260728-0001']
 
 

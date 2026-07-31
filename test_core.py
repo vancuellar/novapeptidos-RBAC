@@ -1770,8 +1770,20 @@ def test_el_cobro_del_pedido_respeta_el_interruptor():
     import envios
     assert envios.COTIZAR_EN_CHECKOUT is False, \
         'la cotización de Skydropx se prendió sin que nadie lo pidiera'
-    assert envios.COMPRAR_GUIA_AL_PAGAR is False, \
-        'la compra automática de guías se prendió sin que nadie lo pidiera'
+    # ✅ LA COMPRA AUTOMÁTICA DE GUÍAS SÍ SE PRENDIÓ, y la pidió Christián el
+    # 2026-07-31. Este candado ya no vigila que esté apagada —vigila que no esté
+    # SUELTA. Gastar dinero solo sin frenos es peor que no gastarlo: por eso lo que se
+    # exige ahora son los dos frenos que él puso como condición para encenderla.
+    assert envios.COMPRAR_GUIA_AL_PAGAR is True, \
+        'la compra automática de guías se apagó sin que nadie lo pidiera'
+    assert envios.TOPE_GUIA_AUTOMATICA_MXN == 400, \
+        'el tope de gasto automático cambió: eso es una decisión de dinero de Christián'
+    assert envios.empaques(), \
+        'sin tabla de empaques la guía se cotizaría contra medidas inventadas'
+    assert 'tope_mxn=envios.TOPE_GUIA_AUTOMATICA_MXN' in src, \
+        'la compra automática dejó de pasar el tope de gasto: puede comprar una guía de $900 sola'
+    assert 'empaque = envios.empaque_para(piezas)' in src, \
+        'la compra automática dejó de mirar en qué empaque cabe: vuelve el recobro por sobrepeso'
 
 
 def test_el_sitio_se_entera_de_que_no_se_cobra_envio():

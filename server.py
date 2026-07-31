@@ -10,6 +10,7 @@ import string
 import re
 import json
 import io
+import html as html_lib          # para escapar lo que va en los avisos internos
 # `csv` a secas chocaría con el parámetro `csv=1` de /admin/envios/costo-real, que es
 # como se pide el export en ese formato. Se renombra el módulo, no el parámetro.
 import csv as csv_mod
@@ -24,7 +25,8 @@ from models import (
     ProductCreate, ProductUpdate, Product, Category,
     OrderCreate, Order, OrderItem, CustomerInfo, OrderStatusUpdate, OrderShippingUpdate,
     DistributorShippingUpdate,
-    ShippingQuoteRequest, TrackEvent, RemitenteUpdate, CajasUpdate, ComprarGuiaRequest,
+    ShippingQuoteRequest, TrackEvent, RemitenteUpdate, CajasUpdate, EmpaquesUpdate,
+    ComprarGuiaRequest,
     ProtocolInput, ProtocolUpdate, PerfilSalud, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput, AceptarAcuerdoInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
@@ -72,6 +74,10 @@ import nowpayments
 import envios
 import paqueterias
 import skydropx
+# EL PDF DE LA GUÍA, servido por la casa y listo para imprimir desde el panel
+# (admin y distribuidor). Vive aparte porque trae sus propias rutas y su propio
+# candado de rol; ver etiquetas.py.
+import etiquetas
 from fastapi import Request
 
 
@@ -1345,6 +1351,15 @@ def _pesos_de_entorno(nombre: str, por_omision: int) -> int:
 # pueda moverlo sin desplegar: el 2026-07-31 dijo «creo que Certified cobra $250 flat;
 # si es cierto, nosotros debemos cobrar menos, quizas $200 o $219». Eso fue un QUIZAS,
 # no una orden: hasta que el decida, se queda en $250.
+# ⛔ QUÉ PAGOS NO SON INMEDIATOS. Es lo que decide si al cliente le sale un correo al
+# comprar o si se espera al de «pago confirmado» (ver el checkout más abajo).
+#
+# SPEI: tiene que ir a su banco a transferir y necesita la CLABE por escrito.
+# OXXO:  tiene que ir a la tienda con su ficha.
+# Tarjeta y cripto se confirman en segundos: mandarles un correo al comprar y otro al
+# confirmar es mandar dos correos con un minuto de diferencia.
+PAGOS_DIFERIDOS = ('spei', 'oxxo')
+
 SHIPPING_FLAT = _pesos_de_entorno('SHIPPING_FLAT', 250)
 
 # LO QUE LA GUIA LE CUESTA A LA CASA cuando no hay cotizacion real de Skydropx. Es un
@@ -1612,6 +1627,9 @@ async def _cargar_ajustes_envio() -> dict:
     doc = await db[COLECCION_AJUSTES_ENVIO].find_one({'id': 'envios'}, {'_id': 0}) or {}
     skydropx.cargar_remitente_del_panel(doc.get('remitente') or {})
     envios.cargar_cajas_del_panel(doc.get('cajas') or [])
+    # Los empaques REALES (los que deciden si la guía se compra sola). Vacío = manda
+    # la tabla de fábrica, que hoy es la única bolsa que Christián tiene.
+    envios.cargar_empaques_del_panel(doc.get('empaques') or [])
     return doc
 
 
@@ -1637,6 +1655,14 @@ async def admin_envios_config(admin=Depends(get_current_admin)):
         'cajas': [dict(c, peso_volumetrico_kg=envios.peso_volumetrico(c))
                   for c in envios.cajas()],
         'cajas_de_fabrica': not bool(doc.get('cajas')),
+        # Los empaques de verdad: qué hay en la bodega y hasta cuántas piezas le caben.
+        # Es lo que decide si el servidor compra la guía solo o le pregunta a Christián.
+        'empaques': [dict(e, peso_volumetrico_kg=envios.peso_volumetrico(e))
+                     for e in envios.empaques()],
+        'empaques_de_fabrica': not bool(doc.get('empaques')),
+        'piezas_que_compran_solas': max(
+            (int(e.get('hasta_piezas') or 0) for e in envios.empaques()), default=0),
+        'tope_guia_automatica': envios.TOPE_GUIA_AUTOMATICA_MXN,
         'cotiza_en_checkout': envios.COTIZAR_EN_CHECKOUT,
         'compra_guia_al_pagar': envios.COMPRAR_GUIA_AL_PAGAR,
     }
@@ -1767,6 +1793,38 @@ async def admin_guardar_cajas(payload: CajasUpdate, admin=Depends(get_current_ad
     await _cargar_ajustes_envio()
     return {'cajas': [dict(c, peso_volumetrico_kg=envios.peso_volumetrico(c))
                       for c in envios.cajas()]}
+
+
+@api_router.put('/admin/envios/empaques')
+async def admin_guardar_empaques(payload: EmpaquesUpdate, admin=Depends(get_current_admin)):
+    """Los empaques REALES de la bodega y hasta cuántas piezas le caben a cada uno.
+
+    ⛔ ES LA PANTALLA QUE DESTRABA LA COMPRA AUTOMÁTICA. Hoy Christián tiene un solo
+    empaque —la bolsa stand-up de 12×15×1 cm, ~4 piezas— y por eso todo pedido de 5
+    piezas o más se detiene y le pregunta a él. El día que compre cajas, captura aquí
+    sus medidas y hasta cuántas piezas les caben, y ese tamaño de pedido empieza a
+    comprar guía solo. **Sin tocar código y sin desplegar.**
+
+    Guardar una lista vacía devuelve el control a la tabla de fábrica (la bolsa), que es
+    lo correcto: quedarse sin empaques sería quedarse sin poder despachar nada.
+    """
+    empaques = [e.model_dump() for e in (payload.empaques or [])]
+    if empaques and not envios.cargar_empaques_del_panel(empaques):
+        # Medidas en cero o sin tope de piezas: no se guarda nada. Un empaque inválido
+        # haría que el servidor comprara guías cotizadas contra basura, que es
+        # exactamente el recobro por sobrepeso que esto viene a evitar.
+        raise HTTPException(
+            status_code=400,
+            detail='Cada empaque necesita medidas mayores a cero y cuántas piezas le caben')
+    await db[COLECCION_AJUSTES_ENVIO].update_one(
+        {'id': 'envios'},
+        {'$set': {'id': 'envios', 'empaques': empaques, 'updated_at': now_iso()}},
+        upsert=True)
+    await _cargar_ajustes_envio()
+    return {'empaques': [dict(e, peso_volumetrico_kg=envios.peso_volumetrico(e))
+                         for e in envios.empaques()],
+            'piezas_que_compran_solas': max(
+                (int(e.get('hasta_piezas') or 0) for e in envios.empaques()), default=0)}
 
 
 # ==========================================================================
@@ -1949,6 +2007,94 @@ async def admin_comprar_guia(order_id: str, payload: ComprarGuiaRequest,
     return fresco
 
 
+# ==========================================================================
+#  UN SOLO CORREO CUANDO SE PUEDA — el candado vive aquí
+# ==========================================================================
+# ⛔ EL PROBLEMA. Una compra con tarjeta mandaba TRES correos casi seguidos:
+# «recibimos tu pedido», «confirmamos tu pago» y «va en camino». Orden de Christián
+# (2026-07-31): «nadie debe recibir tres correos por una compra. Consolida.»
+#
+# LA REGLA, en una línea: **un correo por EVENTO REAL, y jamás dos por el mismo
+# evento.** Los eventos son tres y no más:
+#
+#   1. hay que pagar    → sólo existe cuando el pago NO es inmediato (SPEI, OXXO)
+#   2. entró el dinero  → siempre
+#   3. salió un paquete → sólo si la guía apareció DESPUÉS del correo del punto 2
+#
+# Cuando dos eventos caen juntos en el tiempo, caen juntos en el mismo correo. Por eso
+# el pago se confirma DESPUÉS de intentar comprar la guía y no antes: así el correo de
+# «pago confirmado» ya puede llevar el número de guía adentro y el tercero desaparece.
+#
+# Lo que le llega al cliente, en la práctica:
+#   tarjeta/cripto + guía comprada   → 1 correo
+#   SPEI/OXXO + guía comprada        → 2 correos
+#   pago inmediato sin guía todavía  → 2 correos
+#
+# ⛔ EL CANDADO ES ATÓMICO, como el del cupón y el de los puntos. Un `$addToSet`
+# condicionado en un solo paso: gana el primero que llegue y el segundo se va en
+# silencio. Sin esto, dos webhooks de la pasarela llegando juntos —que pasa— mandan el
+# mismo correo dos veces, que es exactamente el ruido que esto viene a quitar.
+async def _apartar_correo(order_id: str, ranura: str) -> bool:
+    """Aparta la ranura de correo. True si le tocó mandarlo, False si ya se mandó.
+
+    `ranura` es el evento, no el correo: 'nuevo', 'pagado', y 'enviado:<guía>' para el
+    rastreo. La guía va en el nombre a propósito — en un envío partido hay DOS guías y
+    cada una es un aviso legítimo; con una ranura pelada, el segundo paquete saldría
+    mudo.
+    """
+    if not order_id or not ranura:
+        return False
+    res = await db.orders.update_one(
+        {'id': order_id, 'emails_sent': {'$ne': ranura}},
+        {'$addToSet': {'emails_sent': ranura}})
+    return res.modified_count > 0
+
+
+async def _idioma_del_pedido(order: dict) -> str | None:
+    """En qué idioma le escribimos a quien compró. None = español, el de la casa."""
+    if not (order or {}).get('user_id'):
+        return None
+    u = await db.users.find_one({'id': order['user_id']}, {'_id': 0, 'language': 1})
+    return (u or {}).get('language')
+
+
+async def avisar_al_cliente(order: dict, evento: str) -> bool:
+    """LA ÚNICA PUERTA por la que le sale un correo de compra a un cliente.
+
+    Existe para que la regla de «nunca tres correos» se pueda cumplir en UN lugar en
+    vez de en los cinco sitios que mandaban correos por su cuenta. Devuelve True si de
+    verdad salió uno.
+
+    ⛔ 'pagado' APARTA TAMBIÉN LA RANURA DEL RASTREO que va dentro. Sin eso, comprar la
+    guía y confirmar el pago casi al mismo tiempo mandaría el correo de pago CON la
+    guía y, un segundo después, el de «va en camino» con la MISMA guía. Apartar las dos
+    ranuras de un tirón es lo que hace imposible ese duplicado.
+    """
+    if not order or not order.get('id'):
+        return False
+    numero = order.get('order_number', '')
+    rastreo = str(order.get('tracking_number') or '').strip()
+    if evento == 'enviado' and not rastreo:
+        return False                        # sin guía no hay nada que avisar
+    ranura = f'enviado:{rastreo}' if evento == 'enviado' else evento
+    if not await _apartar_correo(order['id'], ranura):
+        logger.info('Correo %s del pedido %s: ya se había mandado, no se repite',
+                    evento, numero)
+        return False
+    lang = await _idioma_del_pedido(order)
+    if evento == 'pagado':
+        # El rastreo viaja DENTRO de este correo: se aparta su ranura para que el
+        # camino del envío no lo vuelva a mandar por separado.
+        if rastreo:
+            await _apartar_correo(order['id'], f'enviado:{rastreo}')
+        asyncio.create_task(send_order_email(order, lang, 'pagado'))
+    elif evento == 'enviado':
+        asyncio.create_task(send_shipped_email(order, lang))
+    else:
+        asyncio.create_task(send_order_email(order, lang, 'nuevo'))
+    return True
+
+
 async def avisar_del_envio(order: dict) -> bool:
     """Le manda al cliente su número de guía. Nunca revienta hacia arriba.
 
@@ -1959,32 +2105,96 @@ async def avisar_del_envio(order: dict) -> bool:
     """
     if not order or not order.get('tracking_number'):
         return False
-    lang = None
-    if order.get('user_id'):
-        u = await db.users.find_one({'id': order['user_id']}, {'_id': 0, 'language': 1})
-        lang = (u or {}).get('language')
     num = order.get('order_number')
+    # La campanita lleva la guía en el `dedup` por lo mismo que la ranura del correo:
+    # un envío partido tiene DOS guías y las dos merecen su aviso.
     await notify(order.get('user_id'), 'order_shipped', 'Tu pedido va en camino',
                  f'El pedido {num} ya salió. Guía {order.get("tracking_number")}.',
-                 link=f'/pedido/{num}', dedup=f'shipped:{num}')
-    asyncio.create_task(send_shipped_email(order, lang))
+                 link=f'/pedido/{num}', dedup=f'shipped:{num}:{order["tracking_number"]}')
+    # ⛔ POR LA PUERTA ÚNICA. Si este rastreo ya viajó dentro del correo de «pago
+    # confirmado» —que es el caso normal desde hoy— aquí no sale nada. Ése es
+    # exactamente el tercer correo que Christián mandó quitar.
+    await avisar_al_cliente(order, 'enviado')
     return True
 
 
-async def comprar_guia_del_pedido(order: dict) -> dict | None:
+# ==========================================================================
+#  LA GUÍA SE COMPRA SOLA — con dos frenos y un candado
+# ==========================================================================
+# ⛔ ESTO GASTA DINERO DE VERDAD SIN QUE NADIE APRIETE UN BOTÓN. Por eso lleva:
+#
+#   FRENO 1 — EL EMPAQUE (`envios.empaque_para`). Christián tiene UN empaque: la bolsa
+#     stand-up de 12×15×1 cm, donde caben ~4 piezas. Antes TODO se cotizaba como si
+#     cupiera en la caja de 1 kg, y lo que no cabía volvía como RECOBRO por sobrepeso
+#     semanas después. Ahora: 1-4 piezas compra sola; 5 o más se detiene y se le
+#     pregunta a él qué empaque va a usar. El día que compre cajas las captura en el
+#     Panel y ese rango empieza a comprar solo, sin desplegar nada.
+#
+#   FRENO 2 — EL TOPE DE GASTO ($400, `envios.TOPE_GUIA_AUTOMATICA_MXN`). Arriba de
+#     eso no compra: pide el visto bueno. Se revisa ENTRE cotizar y comprar, que es el
+#     único momento en que un tope sirve para algo.
+#
+#   CANDADO — atómico, como el del cupón. `label_lock` se toma en un solo paso
+#     condicionado: dos webhooks de la pasarela llegando juntos —que pasa— comprarían
+#     DOS guías del mismo pedido y las dos se pagan. Mirar `tracking_number` en un dict
+#     ya leído no alcanza: entre la lectura y la compra cabe el otro webhook completo.
+#
+# NINGUNO DE LOS TRES FRENOS DEJA AL CLIENTE SIN NOTICIAS: los tres devuelven None y
+# quien llama manda igual el correo de pago confirmado diciendo que el rastreo va en
+# camino. Un freno nunca puede convertirse en silencio.
+async def _liberar_candado_guia(order_id: str, extra: dict | None = None):
+    """Suelta el candado de compra y, de paso, escribe por qué no se compró."""
+    await db.orders.update_one({'id': order_id},
+                               {'$set': {'label_lock': False, **(extra or {})}})
+
+
+async def _avisar_a_christian(asunto: str, cuerpo: str, *, titulo: str,
+                              orden: dict, urgente: bool = False):
+    """Correo + campanita a TODOS los admin. Nunca revienta hacia arriba.
+
+    Van las dos cosas porque las dos fallan distinto: el correo se pierde entre otros
+    correos y la campanita sólo se ve si entra al Panel. Un pedido pagado que no puede
+    salir tiene que encontrarlo a él, no esperar a que él lo encuentre.
+    """
+    numero = (orden or {}).get('order_number', '')
+    marca = '🚨 URGENTE — ' if urgente else '⚠️ '
+    try:
+        await send_admin_notification(
+            f'{marca}{asunto} (pedido {numero})',
+            f'<p style="font-family:Helvetica,Arial,sans-serif;font-size:15px;'
+            f'line-height:1.6;">{cuerpo}</p>'
+            f'<p style="font-family:Helvetica,Arial,sans-serif;font-size:15px;">'
+            f'<a href="{SITE_URL}/admin?tab=orders">Abrir el pedido en el Panel</a></p>')
+    except Exception:
+        logger.exception('No se pudo avisar por correo de %s', numero)
+    try:
+        admins = await db.users.find({'role': 'admin'}, {'_id': 0, 'id': 1}).to_list(20)
+        for a in admins:
+            await notify(a['id'], 'guia_pendiente', titulo,
+                         f'Pedido {numero}: {asunto}.', link='/admin?tab=orders',
+                         dedup=f'guia:{numero}:{asunto[:40]}',
+                         meta={'order_number': numero})
+    except Exception:
+        logger.exception('No se pudo poner la campanita de %s', numero)
+
+
+async def comprar_guia_del_pedido(order: dict, avisar: bool = True) -> dict | None:
     """Compra la guía de un pedido YA PAGADO y la deja en el pedido. Idempotente.
 
     La llaman los cuatro caminos del dinero: tarjeta y OXXO (Mercado Pago), cripto
     (NOWPayments/BTCPay) y SPEI (cuando el admin confirma el depósito). Todos pasan
     por aquí porque todos terminan en el mismo lugar: el pedido en 'confirmado'.
 
+    `avisar=False` lo usa el camino del pago: ahí la guía va DENTRO del correo de «pago
+    confirmado», así que avisar por separado sería el tercer correo que se quitó.
+
     Nunca revienta hacia arriba: un pedido pagado no se puede quedar a medias
     porque la paquetería tenga un mal día. Si falla, lo deja escrito en el pedido
-    (`label_error`) y en la bitácora, y el admin compra la guía a mano como hoy.
+    (`label_error`), le avisa a Christián y el admin compra la guía a mano como hoy.
     """
     if not envios.COMPRAR_GUIA_AL_PAGAR:
         return None
-    if not order or order.get('tracking_number'):
+    if not order or not order.get('id') or order.get('tracking_number'):
         return None                     # ya tiene guía: no se compra dos veces
     if not paqueterias.cuantos_activos():
         logger.info('Envio: no se compra guia de %s porque ningun proveedor de '
@@ -2001,6 +2211,59 @@ async def comprar_guia_del_pedido(order: dict) -> dict | None:
         await db.orders.update_one({'id': order['id']},
                                    {'$set': {'label_error': 'Falta configurar el remitente'}})
         return None
+
+    # ⛔ ENVÍO PARTIDO: LO QUE ELIGIÓ EL CLIENTE MANDA. Si pidió que todo llegue junto y
+    # todavía falta mercancía, aquí no se compra nada: comprar ahora sería mandarle la
+    # mitad justo después de que él dijo que prefería esperar.
+    if (order.get('shipping_preference') == 'completo'
+            and order.get('backorder_items')):
+        logger.info('Envio: %s espera a estar completo por decision del cliente',
+                    order.get('order_number'))
+        await db.orders.update_one(
+            {'id': order['id']},
+            {'$set': {'label_hold': 'espera_pedido_completo', 'label_error': ''}})
+        return None
+
+    # ⛔ FRENO 1: ¿en qué lo meto? Sin empaque que lo reciba no se compra: la guía
+    # saldría cotizada contra una caja que no existe y el sobrepeso vuelve como recobro.
+    piezas = envios.piezas_del_pedido(order.get('items') or [])
+    empaque = envios.empaque_para(piezas)
+    if empaque is None:
+        cabe = max((int(e.get('hasta_piezas') or 0) for e in envios.empaques()), default=0)
+        logger.warning('Envio: %s lleva %s piezas y el empaque mas grande aguanta %s. '
+                       'NO se compra sola; se le pregunta a Christian.',
+                       order.get('order_number'), piezas, cabe)
+        await db.orders.update_one(
+            {'id': order['id']},
+            {'$set': {'label_hold': 'sin_empaque', 'label_piezas': piezas,
+                      'label_error': ''}})
+        if avisar:
+            await _avisar_a_christian(
+                'este pedido no cabe en la bolsa: dime qué empaque uso',
+                f'El pedido lleva <strong>{piezas} piezas</strong> y hoy el único '
+                f'empaque registrado (la bolsa stand-up de 12×15×1 cm) aguanta '
+                f'{cabe}. <strong>No compré la guía</strong> para no cotizarla con '
+                f'medidas que no son y que la paquetería nos cobre el sobrepeso '
+                f'después.<br><br>Dos formas de resolverlo: cotiza y compra la guía '
+                f'a mano desde el Panel eligiendo el empaque, o captura las medidas '
+                f'de la caja en Admin → Envíos y a partir de ahí este tamaño de '
+                f'pedido también compra solo.<br><br>El cliente ya recibió su '
+                f'confirmación de pago; sabe que el rastreo le llega en cuanto salga.',
+                titulo='Falta empaque para un pedido pagado', orden=order)
+        return None
+
+    # ⛔ EL CANDADO, justo antes de gastar. Gana el primero que llegue; el segundo se va
+    # sin comprar nada. Se pide que el pedido siga SIN guía en la misma condición: si
+    # otro camino ya la compró, esto no se ejecuta aunque el candado estuviera libre.
+    tomado = await db.orders.update_one(
+        {'id': order['id'], 'label_lock': {'$ne': True},
+         'tracking_number': {'$in': [None, '']}},
+        {'$set': {'label_lock': True}})
+    if tomado.modified_count == 0:
+        logger.info('Envio: la guia de %s ya la esta comprando otro camino',
+                    order.get('order_number'))
+        return None
+
     c = order.get('customer') or {}
     destino = {
         'name': c.get('full_name', ''), 'company': '',
@@ -2011,14 +2274,59 @@ async def comprar_guia_del_pedido(order: dict) -> dict | None:
         'reference': c.get('notes', ''), 'contents': 'Insumos de laboratorio',
     }
     quote = order.get('shipping_quote') or {}
-    paquete = quote.get('paquete') or envios.paquete_del_pedido(order.get('items') or [], {})
+    # ⛔ EL BULTO SALE DEL EMPAQUE DE VERDAD, no de un peso calculado contra un catálogo
+    # que no trae pesos. Es la diferencia entre cotizar lo que se manda y cotizar una
+    # suposición — y la suposición es la que produce el recobro.
+    paquete = envios.paquete_de_empaque(empaque)
     try:
         # Doble cotizador: pregunta en Skydropx y en enviosinternacionales.com y compra
         # la más barata de las permitidas. Con uno solo encendido se comporta como antes.
-        guia = paqueterias.guia_para(destino, paquete, quote.get('service_code', ''))
+        # ⛔ FRENO 2 va aquí dentro, entre cotizar y pagar.
+        guia = paqueterias.guia_para(destino, paquete, quote.get('service_code', ''),
+                                     tope_mxn=envios.TOPE_GUIA_AUTOMATICA_MXN)
+    except paqueterias.TopeDeGastoExcedido as tope:
+        logger.warning('Envio: la guia de %s cuesta $%s y el tope automatico es $%s. '
+                       'NO se compra; se le pregunta a Christian.',
+                       order.get('order_number'), tope.precio, tope.tope)
+        await _liberar_candado_guia(order['id'], {
+            'label_hold': 'sobre_tope', 'label_error': '',
+            'label_precio_cotizado': tope.precio})
+        if avisar:
+            await _avisar_a_christian(
+                f'la guía cuesta ${tope.precio:,.0f} y el tope automático es '
+                f'${tope.tope:,.0f}',
+                f'La más barata que encontré es <strong>{tope.paqueteria} '
+                f'{tope.servicio}</strong> a <strong>${tope.precio:,.2f}</strong>, '
+                f'arriba del tope de ${tope.tope:,.2f} que puede gastar el servidor '
+                f'solo. <strong>No compré nada.</strong><br><br>Si te parece bien el '
+                f'precio, cotiza y compra desde el Panel con un clic. Si no, ahí mismo '
+                f'puedes ver todas las tarifas y elegir otra.<br><br>El cliente ya '
+                f'recibió su confirmación de pago; sabe que el rastreo le llega en '
+                f'cuanto salga.',
+                titulo='Una guía necesita tu visto bueno', orden=order)
+        return None
     except Exception as e:
+        # Sin saldo, API caída, dirección rechazada: es un FALLO, no un freno. Aquí sí
+        # se reintenta solo (ver `_reintentar_guias_pendientes`) y el aviso es urgente.
         logger.exception('Envio: no se pudo comprar la guia de %s', order.get('order_number'))
-        await db.orders.update_one({'id': order['id']}, {'$set': {'label_error': str(e)[:300]}})
+        intentos = int(order.get('label_intentos') or 0) + 1
+        await _liberar_candado_guia(order['id'], {
+            'label_error': str(e)[:300], 'label_hold': '',
+            'label_intentos': intentos, 'label_ultimo_intento': now_iso()})
+        if avisar:
+            await _avisar_a_christian(
+                'no se pudo comprar la guía',
+                f'El pedido está <strong>pagado</strong> y la compra de la guía falló: '
+                f'<code>{html_lib.escape(str(e)[:300])}</code><br><br>Las causas de '
+                f'siempre son tres: <strong>no hay saldo</strong> en la cuenta de la '
+                f'paquetería (Admin → Envíos → Saldo), la API está caída, o la '
+                f'dirección del cliente no la acepta la paquetería.<br><br>'
+                f'<strong>Entra al Panel y cómprala a mano.</strong> Va por el intento '
+                f'#{intentos}; el servidor sigue reintentando solo cada 10 minutos.'
+                f'<br><br>El cliente ya recibió su confirmación de pago; sabe que el '
+                f'rastreo le llega en cuanto salga. No se le prometió ningún número '
+                f'que no exista.',
+                titulo='No se pudo comprar una guía', orden=order, urgente=True)
         return None
     numero = guia.get('tracking_number') or ''
     update = {
@@ -2028,17 +2336,24 @@ async def comprar_guia_del_pedido(order: dict) -> dict | None:
         'label_url': guia.get('label_url') or '',
         'label_provider': guia.get('proveedor') or 'skydropx',
         'label_error': '',
+        'label_hold': '',
+        'label_lock': False,
+        'label_empaque': empaque.get('nombre', ''),
         'shipping_cost': guia.get('costo') or quote.get('cost') or 0,
         'shipped_at': order.get('shipped_at') or now_iso(),
         'status': 'enviado',
     }
     await db.orders.update_one({'id': order['id']}, {'$set': update})
-    logger.info('Envio: guia comprada para %s — %s %s (via %s)',
+    logger.info('Envio: guia comprada para %s — %s %s en %s por $%s (via %s)',
                 order.get('order_number'), update['carrier'], numero,
+                update['label_empaque'], update['shipping_cost'],
                 update['label_provider'])
     # El cliente se entera por correo, no entrando a buscar. Se le manda el pedido ya
     # actualizado: con el de antes iría sin número de guía, que es justo lo que avisa.
-    await avisar_del_envio(dict(order, **update))
+    # ⛔ Salvo cuando quien llama va a mandar el correo de «pago confirmado» con la guía
+    # adentro: ahí avisar aquí sería el tercer correo.
+    if avisar:
+        await avisar_del_envio(dict(order, **update))
     return update
 
 
@@ -3064,6 +3379,13 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         # Se guarda lo que dice el navegador y NO se inventa una fecha cuando viene
         # vacía: una constancia fabricada por el servidor no prueba nada.
         terms_accepted_at=(payload.terms_accepted_at or '').strip()[:40],
+        # ⛔ SE NORMALIZA EN EL SERVIDOR. Lo que llegue que no sea exactamente
+        # 'completo' vale 'partido', que es lo que se hacía hasta hoy y lo que nunca
+        # deja mercancía pagada detenida. Un valor inventado en el navegador no puede
+        # convertirse en un pedido que se queda esperando para siempre.
+        shipping_preference=('completo'
+                             if (payload.shipping_preference or '').strip() == 'completo'
+                             else 'partido'),
     )
     # ⛔ LAS PIEZAS SE APARTAN JUSTO ANTES DE GRABAR EL PEDIDO, mirando y restando en el
     # MISMO paso (ver `_reservar_inventario`). Aquí y no antes: entre esta línea y el
@@ -3134,7 +3456,23 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     email_order = order.model_dump()
     if payload.payment_method == 'spei':
         email_order['spei'] = spei_details()   # la CLABE también va en el correo
-    asyncio.create_task(send_order_email(email_order, user.get('language') if user else None))
+    # ⛔ EL CORREO DE «RECIBIMOS TU PEDIDO» SÓLO SALE CUANDO EL PAGO NO ES INMEDIATO.
+    #
+    # Con SPEI y OXXO el cliente TIENE que hacer algo todavía —transferir, o ir a la
+    # tienda— y necesita los datos por escrito: ése correo se gana su lugar. Christián
+    # lo pidió explícitamente para SPEI: «las dos cosas», en pantalla Y por correo.
+    #
+    # Con tarjeta y cripto no: el pago se confirma en segundos y este correo llegaría
+    # pegado al de «pago confirmado». Ahí está el tercer correo que sobraba. Se calla
+    # aquí y todo el detalle del pedido viaja dentro del de pago confirmado.
+    #
+    # ⚠️ La única forma de que un pedido con tarjeta se quede sin ningún correo es que
+    # el cliente nunca pague — y para eso está la recuperación de carritos, no un
+    # correo de confirmación de algo que no se cobró.
+    if payload.payment_method in PAGOS_DIFERIDOS:
+        if await _apartar_correo(order.id, 'nuevo'):
+            asyncio.create_task(send_order_email(
+                email_order, user.get('language') if user else None, 'nuevo'))
     # Y el aviso interno: Christián necesita saber QUÉ PREPARAR, sobre todo si el pedido
     # trae piezas que hay que mandar pedir. En segundo plano como el del cliente: el
     # checkout no se cae porque el correo no salga. Y va con A QUIÉN COMPRARLE pegado:
@@ -3162,12 +3500,25 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
                 webhook_url=f"{API_BASE_URL}/api/payments/mercadopago/webhook",
                 metodo=payload.payment_method,
             )
+            # ⛔ LA URL DE PAGO SE GUARDA, NO SÓLO SE DEVUELVE. Con OXXO esa URL ES la
+            # ficha con el código de barras: hasta hoy viajaba una sola vez en la
+            # respuesta del checkout y si el cliente cerraba la pestaña, se perdía y no
+            # había forma de recuperarla desde el sitio. Christián pidió justo lo
+            # contrario: «que pueda volver a verlos las veces que haga falta».
             await db.orders.update_one(
                 {'id': order.id},
-                {'$set': {'card_preference_id': pref['preference_id'], 'card_provider': 'mercadopago'}})
+                {'$set': {'card_preference_id': pref['preference_id'],
+                          'card_provider': 'mercadopago',
+                          'card_checkout_url': pref['checkout_url']}})
             result['card_checkout_url'] = pref['checkout_url']
         except Exception:
             logger.exception('MercadoPago preference failed for %s', order.order_number)
+            # Sin liga de pago el cliente se queda sin poder pagar Y sin correo: por eso
+            # aquí sí sale el de «recibimos tu pedido», para que tenga algo por escrito
+            # y a quién contestarle.
+            if await _apartar_correo(order.id, 'nuevo'):
+                asyncio.create_task(send_order_email(
+                    email_order, user.get('language') if user else None, 'nuevo'))
     if payload.payment_method == 'cripto':
         order_url = f"{SITE_URL}/pedido/{order.order_number}"
         try:
@@ -3188,7 +3539,44 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
                 result['crypto_checkout_url'] = inv['checkout_url']
         except Exception:
             logger.exception('Crypto invoice failed for %s', order.order_number)
+            # Igual que con la tarjeta: sin factura no puede pagar, así que al menos
+            # que le quede el pedido por escrito.
+            if await _apartar_correo(order.id, 'nuevo'):
+                asyncio.create_task(send_order_email(
+                    email_order, user.get('language') if user else None, 'nuevo'))
     return result
+
+
+async def _confirmar_y_avisar(order: dict):
+    """Compra la guía y DESPUÉS manda UN correo con el pago y el rastreo juntos.
+
+    ⛔ ES EL CORAZÓN DE «UN SOLO CORREO». El orden importa y no es negociable:
+
+      1. se intenta comprar la guía (sin avisar por su cuenta),
+      2. se relee el pedido —ya con guía o sin ella—,
+      3. sale UN correo: «pago confirmado» y, si la guía existe, con su número dentro.
+
+    Si la guía no se pudo comprar (freno de empaque, tope de $400, o un fallo de la
+    paquetería) el correo sale igual diciendo que el rastreo llega en cuanto salga. ⛔
+    NUNCA se le manda al cliente un número de guía que no existe, y nunca se le deja
+    sin saber que su dinero llegó: las dos cosas al mismo tiempo.
+
+    Nunca revienta: se llama en segundo plano y el pago ya quedó confirmado antes.
+    """
+    try:
+        await comprar_guia_del_pedido(order, avisar=False)
+    except Exception:
+        logger.exception('Envio: fallo la compra automatica de la guia de %s',
+                         order.get('order_number'))
+    fresco = await db.orders.find_one({'id': order['id']}, {'_id': 0}) or order
+    await avisar_al_cliente(fresco, 'pagado')
+    if fresco.get('tracking_number'):
+        # La campanita del envío sí va aparte: es otra pantalla, no otro correo.
+        num = fresco.get('order_number')
+        await notify(fresco.get('user_id'), 'order_shipped', 'Tu pedido va en camino',
+                     f'El pedido {num} ya salió. Guía {fresco["tracking_number"]}.',
+                     link=f'/pedido/{num}',
+                     dedup=f'shipped:{num}:{fresco["tracking_number"]}')
 
 
 async def _confirm_paid_order(order_number: str):
@@ -3209,15 +3597,16 @@ async def _confirm_paid_order(order_number: str):
             {'$set': {'status': 'confirmado', 'paid': True, 'paid_at': now_iso()}})
         fresh = await db.orders.find_one({'id': order['id']}, {'_id': 0})
         await award_order_points(fresh)
-        asyncio.create_task(send_payment_confirmed_email(fresh))
         # Segundo aviso a Christián: el primero dice qué se va a necesitar, éste dice que
         # ya se puede mandar. Con uno solo, o se prepara mercancía que nadie pagó o se
         # entera tarde de que ya puede salir.
         asyncio.create_task(_avisar_de_la_compra(fresh, 'pagado'))
-        # La guía se compra sola en cuanto entra el dinero (tarjeta, OXXO, cripto).
-        # En segundo plano: el webhook de la pasarela no debe quedarse esperando a
-        # la paquetería — si tarda o falla, el pago ya quedó confirmado igual.
-        asyncio.create_task(comprar_guia_del_pedido(fresh))
+        # ⛔ PRIMERO LA GUÍA, DESPUÉS EL CORREO. Ése es todo el truco de «un solo
+        # correo»: si la guía se compra antes, el correo de pago confirmado ya la
+        # lleva adentro y el tercer correo no existe. El webhook de la pasarela no se
+        # queda esperando —esto corre en segundo plano— pero el correo sí espera a la
+        # guía, que es lo que hay que esperar.
+        asyncio.create_task(_confirmar_y_avisar(fresh))
         # Y se le avisa a Meta que ENTRÓ EL DINERO (Conversions API). Sin esto,
         # las compras que llegan sin cookie —las de WhatsApp— Meta no las ve, y
         # una campaña que no ve compras no puede optimizar a Compras. En segundo
@@ -3380,13 +3769,34 @@ async def set_stock(payload: dict, admin=Depends(get_current_admin)):
 # propias rutas (`/distributor/orders`, `/admin/orders`), que no pasan por aquí.
 CAMPOS_DEL_DISTRIBUIDOR = ('referred_by', 'commission', 'commissions')
 
+# ⛔ NI LO QUE LE CUESTA LA GUÍA A LA CASA. La regla de Christián es que el cliente
+# NUNCA vea una cifra de envío: la casa lo absorbe y enseñarle lo que cuesta es
+# enseñarle el margen. Esa regla estaba cuidada en los correos pero NO en la API, que
+# devolvía el documento entero — `shipping_cost` (lo que se pagó de guía),
+# `shipping_absorbed` (lo que se comió la casa) y con quién se compró, todo a la vista
+# de cualquiera que abriera la consola del navegador. Y `/orders/{numero}` ni siquiera
+# pide sesión.
+#
+# Los `label_*` se suman por lo mismo: `label_precio_cotizado` es una cotización
+# interna y `label_error` / `label_hold` son problemas de la casa, no del cliente.
+# Lo que el cliente sí necesita —`tracking_number`, `tracking_url`, `carrier`— se
+# queda: eso es justo lo que se le prometió por correo.
+CAMPOS_INTERNOS_DE_ENVIO = (
+    'shipping_cost', 'shipping_absorbed', 'shipping_over_cap', 'shipping_quote',
+    'label_provider', 'label_error', 'label_hold', 'label_lock', 'label_intentos',
+    'label_ultimo_intento', 'label_precio_cotizado', 'label_piezas', 'label_empaque',
+    'emails_sent', 'card_checkout_url', 'card_preference_id', 'stock_taken',
+)
+
 
 def pedido_para_el_cliente(order):
-    """El pedido tal como puede verlo quien compró: sin quién lo refirió ni cuánto
-    ganó nadie. Devuelve una copia; el documento original no se toca."""
+    """El pedido tal como puede verlo quien compró: sin quién lo refirió, sin cuánto
+    ganó nadie y sin lo que la guía le costó a la casa. Devuelve una copia; el
+    documento original no se toca."""
     if not order:
         return order
-    limpio = {k: v for k, v in order.items() if k not in CAMPOS_DEL_DISTRIBUIDOR}
+    fuera = CAMPOS_DEL_DISTRIBUIDOR + CAMPOS_INTERNOS_DE_ENVIO
+    limpio = {k: v for k, v in order.items() if k not in fuera}
     limpio.pop('_id', None)
     return limpio
 
@@ -3422,6 +3832,17 @@ async def get_order(order_number: str):
     # Solo un pedido SPEI (y solo ese) lleva la CLABE; la referencia es el número de pedido.
     if (order.get('payment_method') or '') == 'spei':
         order['spei'] = spei_details()
+    # ⛔ Y LA FICHA DE OXXO, PARA QUE SE PUEDA VOLVER A ELLA. Es la URL de Mercado Pago
+    # con el código de barras: viajaba UNA sola vez en la respuesta del checkout y
+    # quien cerraba esa pestaña se quedaba sin forma de pagar. Se devuelve sólo si el
+    # pedido es de OXXO y SIGUE PENDIENTE: una liga de pago de algo ya pagado no le
+    # sirve a nadie y sólo invita a pagar dos veces.
+    if ((order.get('payment_method') or '') == 'oxxo'
+            and order.get('status') == 'pendiente'):
+        completo = await db.orders.find_one({'order_number': order_number},
+                                            {'_id': 0, 'card_checkout_url': 1})
+        if (completo or {}).get('card_checkout_url'):
+            order['card_checkout_url'] = completo['card_checkout_url']
     return order
 
 
@@ -3625,16 +4046,13 @@ async def update_order_status(order_id: str, payload: OrderStatusUpdate, admin=D
     # Aviso de pago confirmado al cliente, solo al ENTRAR a 'confirmado'.
     num = order.get('order_number')
     if payload.status == 'confirmado' and (prev.get('status') or '') != 'confirmado':
-        lang = None
-        if order.get('user_id'):
-            u = await db.users.find_one({'id': order['user_id']}, {'_id': 0, 'language': 1})
-            lang = (u or {}).get('language')
-        asyncio.create_task(send_payment_confirmed_email(order, lang))
         await notify(order.get('user_id'), 'payment_confirmed', 'Pago confirmado',
                      f'Confirmamos el pago de tu pedido {num}. ¡Gracias!', link=f'/pedido/{num}')
         # SPEI llega por aquí: el admin verifica el depósito y marca 'confirmado'.
-        # Es el cuarto método de pago, y compra su guía igual que los otros tres.
-        asyncio.create_task(comprar_guia_del_pedido(order))
+        # Es el cuarto método de pago, y compra su guía igual que los otros tres —y
+        # como los otros tres, el correo de pago sale DESPUÉS de la guía para que la
+        # lleve adentro. Con SPEI son dos correos en total: el de la CLABE y éste.
+        asyncio.create_task(_confirmar_y_avisar(order))
     # Notificación de entrega, solo al ENTRAR a 'entregado'.
     if payload.status == 'entregado' and (prev.get('status') or '') != 'entregado':
         await notify(order.get('user_id'), 'order_delivered', 'Pedido entregado',
@@ -5390,6 +5808,18 @@ def _detalle_de_pedido(o, dist_id=None, dist=None, es_admin=False):
         # forma de imprimirse desde la ficha — que es justo lo que hace falta para poder
         # pegarla en el paquete y llevarlo al mostrador.
         **({'label_url': o.get('label_url') or ''} if es_admin else {}),
+        # ⛔ IMPRIMIR LA GUÍA SÍ ES DE LOS DOS (Christián, 2026-07-31: «quiero manejar
+        # TODO desde nuestra app»). Lo que NO viaja al distribuidor es la URL cruda del
+        # proveedor —eso es la cuenta de envíos de la casa—: él pide el PDF por
+        # `/distributor/orders/{numero}/etiqueta` y el servidor se lo sirve.
+        #
+        # Es un SÍ/NO, no la liga, y dice «hay guía comprada por nosotros», no «hay
+        # PDF»: el papel puede tardar unos segundos en publicarse y aun así el botón
+        # tiene que estar (lo rescata solo). En cambio una guía TECLEADA a mano no
+        # tiene PDF que traer, y por eso el botón no aparece: prometer un papel que
+        # no existe es peor que no ofrecerlo.
+        'tiene_etiqueta': bool(o.get('label_url')
+                               or (o.get('label_provider') and o.get('tracking_number'))),
         # Los datos de contacto sólo si quien pregunta puede verlos: el admin siempre,
         # el distribuidor sólo con su interruptor encendido (hoy, sólo María).
         **_contacto_del_cliente(o, dist, es_admin),
@@ -6242,6 +6672,63 @@ async def arrancar_recuperacion():
                 await _barrer_intentos()
             except Exception:
                 logger.exception('Fallo el barrido de carritos abandonados')
+    asyncio.create_task(bucle())
+
+
+# ⛔ EL REINTENTO. Cuando la compra de la guía falla por algo pasajero —la cuenta se
+# quedó sin saldo y Christián la recargó, la API de la paquetería tuvo un mal rato— no
+# tiene sentido que un pedido pagado espere a que alguien se acuerde de entrar al Panel.
+# Cada 10 minutos se vuelve a intentar lo que falló.
+#
+# ⛔ SÓLO REINTENTA LOS FALLOS, NUNCA LOS FRENOS. Un pedido detenido por `label_hold`
+# —sin empaque, sobre el tope, o esperando a estar completo— está esperando una
+# DECISIÓN, no otra oportunidad: reintentarlo sería llenarle el correo a Christián con
+# el mismo aviso cada diez minutos sin que nada cambie.
+#
+# Y se rinde a los 6 intentos (una hora). Después de eso ya no es un problema pasajero
+# y el aviso urgente que él recibió es lo que corresponde, no un bucle eterno gastando
+# llamadas a la paquetería.
+MAX_INTENTOS_GUIA = 6
+
+
+async def _reintentar_guias_pendientes() -> int:
+    """Vuelve a intentar la compra de las guías que FALLARON. Devuelve cuántas salieron."""
+    if not envios.COMPRAR_GUIA_AL_PAGAR:
+        return 0
+    pendientes = await db.orders.find({
+        'label_error': {'$nin': ['', None]},
+        'tracking_number': {'$in': [None, '']},
+        'label_lock': {'$ne': True},
+        'status': {'$in': list(ESTADOS_PAGADOS)},
+        'label_intentos': {'$lt': MAX_INTENTOS_GUIA},
+    }, {'_id': 0}).to_list(50)
+    salieron = 0
+    for pedido in pendientes:
+        # `avisar=False`: el cliente ya recibió su correo de pago confirmado cuando esto
+        # falló la primera vez, así que si ahora sí sale, el rastreo es un evento nuevo
+        # y lo manda `avisar_del_envio` — una sola vez, por la ranura del correo.
+        try:
+            update = await comprar_guia_del_pedido(pedido, avisar=False)
+        except Exception:
+            logger.exception('Reintento: fallo la guia de %s', pedido.get('order_number'))
+            continue
+        if update:
+            salieron += 1
+            logger.info('Reintento: por fin salio la guia de %s', pedido.get('order_number'))
+            await avisar_del_envio(dict(pedido, **update))
+    return salieron
+
+
+@app.on_event('startup')
+async def arrancar_reintento_de_guias():
+    """Cada 10 minutos reintenta las guías que no se pudieron comprar."""
+    async def bucle():
+        while True:
+            await asyncio.sleep(600)
+            try:
+                await _reintentar_guias_pendientes()
+            except Exception:
+                logger.exception('Fallo el reintento de guias pendientes')
     asyncio.create_task(bucle())
 
 
@@ -7968,6 +8455,8 @@ async def guardar_nota_de_cliente(client_id: str, payload: NotaDeCliente,
 
 
 app.include_router(api_router)
+# Las rutas del PDF de la guía traen su propio prefijo `/api` y sus propios candados.
+app.include_router(etiquetas.router)
 
 
 app.add_middleware(

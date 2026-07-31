@@ -126,7 +126,30 @@ def ahorro(comparacion: dict) -> dict:
             'gana': gana, 'mejores': mejores}
 
 
-def guia_para(destino: dict, paquete: dict, servicio_codigo: str = '') -> dict:
+class TopeDeGastoExcedido(RuntimeError):
+    """La guía más barata cuesta más de lo que el servidor puede gastar solo.
+
+    ⛔ NO ES UN ERROR: es el freno funcionando. Se distingue de un fallo de verdad
+    (API caída, sin saldo, dirección rechazada) porque lo que hay que hacer es
+    distinto: aquí no se reintenta nada, se le pregunta a Christián si autoriza el
+    gasto. Por eso es su propia clase y no un `RuntimeError` pelón — quien la atrapa
+    río arriba tiene que poder decir «esto necesita tu visto bueno» en vez de
+    «la paquetería falló».
+    """
+
+    def __init__(self, precio: float, tope: float, paqueteria: str = '',
+                 servicio: str = ''):
+        self.precio = round(float(precio or 0), 2)
+        self.tope = round(float(tope or 0), 2)
+        self.paqueteria = paqueteria or ''
+        self.servicio = servicio or ''
+        super().__init__(
+            f'La guía más barata cuesta ${self.precio:,.2f} y el tope automático '
+            f'es ${self.tope:,.2f}')
+
+
+def guia_para(destino: dict, paquete: dict, servicio_codigo: str = '',
+              tope_mxn: float | None = None) -> dict:
     """De cero a guía en un solo llamado: cotiza en los DOS, elige y compra la mejor.
 
     Es el camino automático, el que corre solo cuando un pago se confirma. Aplica las
@@ -136,6 +159,13 @@ def guia_para(destino: dict, paquete: dict, servicio_codigo: str = '') -> dict:
     Si el pedido guardó qué servicio eligió el cliente, se respeta ÉSE; si ya no está
     disponible, cae a la más barata de las permitidas — nunca a una paquetería que el
     cliente no pidió ni a un plazo que no se le prometió.
+
+    ⛔ `tope_mxn` ES EL FRENO DE GASTO y se revisa ENTRE cotizar y comprar, que es el
+    único momento en que sirve: después de comprar el dinero ya salió. Si la elegida
+    se pasa, revienta con `TopeDeGastoExcedido` SIN comprar nada. Se pasa como
+    parámetro y no se lee de una constante aquí adentro para que el camino del admin
+    —que compra a mano lo que él eligió y ya vio el precio— no herede un tope pensado
+    para lo que hace el servidor solo.
     """
     if not skydropx.remitente_configurado():
         # A propósito revienta en vez de comprar con un remitente inventado.
@@ -150,6 +180,23 @@ def guia_para(destino: dict, paquete: dict, servicio_codigo: str = '') -> dict:
     elegida = next((t for t in tarifas
                     if servicio_codigo and t['servicio_codigo'] == servicio_codigo),
                    tarifas[0])
+    # ⛔ EL FRENO, JUSTO ANTES DE GASTAR. Si el servicio que pidió el cliente se pasa
+    # del tope pero hay una permitida más barata que sí cabe, se toma ésa: el tope es
+    # sobre el dinero de la casa, no una razón para no despachar. Sólo cuando NINGUNA
+    # cabe se detiene todo y se le pregunta a Christián.
+    if tope_mxn is not None:
+        tope = float(tope_mxn)
+        if float(elegida.get('precio') or 0) > tope:
+            cabe = next((t for t in tarifas if float(t.get('precio') or 0) <= tope), None)
+            if cabe is None:
+                barata = tarifas[0]
+                raise TopeDeGastoExcedido(barata.get('precio') or 0, tope,
+                                          barata.get('paqueteria', ''),
+                                          barata.get('servicio', ''))
+            logger.info('Envio: el servicio pedido costaba $%s (tope $%s); se toma '
+                        '%s a $%s', elegida.get('precio'), tope,
+                        cabe.get('paqueteria'), cabe.get('precio'))
+            elegida = cabe
     numero = 1
     paquetes = (comp.get('cotizaciones') or {}).get(
         elegida.get('proveedor') or 'skydropx', {}).get('packages') or []

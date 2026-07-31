@@ -24,7 +24,20 @@ aquí y nada más.
 # guía automáticamente sin cobrarle el envío al cliente (la casa lo absorbe), pero
 # no al revés — cobrar un envío que nadie compra es cobrar por nada.
 COTIZAR_EN_CHECKOUT = False
-COMPRAR_GUIA_AL_PAGAR = False
+COMPRAR_GUIA_AL_PAGAR = True
+
+
+# ------------------------------------------------ el tope de gasto de la guía
+# ⛔ CUÁNTO PUEDE GASTAR EL SERVIDOR SOLO, SIN PREGUNTARLE A NADIE.
+# Orden de Christián (2026-07-31). La compra automática es cómoda hasta el día que
+# una guía sale en $900 y nadie se entera hasta ver el estado de cuenta. Arriba de
+# este número el servidor NO compra: deja el pedido esperando y le avisa a Christián
+# para que él dé el visto bueno desde el Panel.
+#
+# No es un límite de la paquetería: es el límite de LA CONFIANZA que se le da al
+# automatismo. Subirlo es una decisión de dinero, por eso vive escrito aquí y no
+# escondido dentro de una función.
+TOPE_GUIA_AUTOMATICA_MXN = 400.0
 
 
 # ------------------------------------------------------------------- el peso
@@ -251,6 +264,140 @@ def paquete_del_pedido(items, pflags: dict | None = None) -> dict:
         'caja': caja.get('nombre', ''),
         'peso_contenido_kg': contenido,
         'peso_volumetrico_kg': peso_volumetrico(caja),
+    }
+
+
+# =========================================================================
+#  EL EMPAQUE DE VERDAD: cuántas piezas caben en lo que Christián TIENE
+# =========================================================================
+# ⛔ ESTO NACE DE UN RECOBRO. Hasta hoy TODO pedido se cotizaba con la caja que le
+# tocaba por peso calculado, y como el catálogo no trae pesos reales, todo caía en
+# la misma caja de 1 kg. Cuando el paquete de verdad no cabe ahí, la paquetería lo
+# vuelve a pesar y le cobra la diferencia a la casa (recobro por sobrepeso), que es
+# el cargo que aparece semanas después y que nadie cotizó.
+#
+# ⛔ LO QUE HAY HOY, DICHO POR CHRISTIÁN (2026-07-31), SIN ADORNOS:
+#
+#     «Solo existe UN empaque: la bolsa blanca stand-up de 12×15×1 cm, y caben
+#      unos 4 viales cómodamente. Nunca he mandado un pedido tan grande que
+#      necesite caja.»
+#
+# O sea: NO HAY CAJAS. No las tiene, no sabe cuánto miden y no se van a inventar
+# aquí — una medida inventada es exactamente lo que produce el recobro que esto
+# viene a evitar. Por eso la tabla trae UN solo renglón y todo lo que no cabe en él
+# NO se compra solo: se le pregunta al dueño qué empaque va a usar.
+#
+# ⛔ ES CONFIGURACIÓN, NO PROGRAMACIÓN. El día que compre cajas, captura sus
+# medidas en el Panel (Admin → Envíos) y ese rango empieza a comprar solo, sin
+# tocar código y sin desplegar. Mismo mecanismo que las cajas de cotización:
+# `cargar_empaques_del_panel` empuja lo que guardó el admin y manda sobre esta tabla.
+#
+# `peso_facturable_kg` es 1 kg porque es el MÍNIMO que cobran todas las paqueterías:
+# la bolsa con cuatro viales pesa ~200 g de verdad, así que ahí hay colchón de sobra
+# y nunca puede haber recobro por peso en este rango.
+EMPAQUES = (
+    {'nombre': 'bolsa stand-up', 'hasta_piezas': 4,
+     'largo_cm': 12, 'ancho_cm': 15, 'alto_cm': 1,
+     'peso_facturable_kg': 1.0},
+)
+
+# Medidas de empaque puestas desde el Panel. Vacío = manda la tabla de arriba.
+_EMPAQUES_DEL_PANEL: list = []
+
+
+def cargar_empaques_del_panel(empaques) -> int:
+    """Sustituye la tabla de empaques por la que capturó el admin. Devuelve cuántos quedaron.
+
+    Se valida aquí, que es donde duele: un empaque con medidas en cero o sin tope de
+    piezas haría que el servidor comprara guías contra basura. Lo que no sirve se tira
+    en silencio; si no queda ninguno bueno, se devuelve el control a la tabla de fábrica
+    en vez de dejar al sitio sin empaques (que sería no poder despachar nada).
+    """
+    global _EMPAQUES_DEL_PANEL
+    buenos = []
+    for e in (empaques or []):
+        if not isinstance(e, dict):
+            continue
+        try:
+            medidas = {k: float(e.get(k) or 0) for k in ('largo_cm', 'ancho_cm', 'alto_cm')}
+        except (TypeError, ValueError):
+            continue
+        if any(v <= 0 for v in medidas.values()):
+            continue
+        try:
+            tope = int(e.get('hasta_piezas') or 0)
+        except (TypeError, ValueError):
+            continue
+        if tope <= 0:
+            continue                # un empaque sin tope no dice nada: qué cabe es el dato
+        try:
+            peso = float(e.get('peso_facturable_kg') or 0)
+        except (TypeError, ValueError):
+            peso = 0.0
+        buenos.append(dict(medidas, nombre=str(e.get('nombre') or 'empaque'),
+                           hasta_piezas=tope,
+                           peso_facturable_kg=max(PESO_MINIMO_KG, peso)))
+    _EMPAQUES_DEL_PANEL = sorted(buenos, key=lambda e: e['hasta_piezas'])
+    return len(_EMPAQUES_DEL_PANEL)
+
+
+def empaques() -> tuple:
+    """Los empaques vigentes: los del panel si los hay, si no los de fábrica."""
+    return tuple(_EMPAQUES_DEL_PANEL) if _EMPAQUES_DEL_PANEL else EMPAQUES
+
+
+def piezas_del_pedido(items) -> int:
+    """Cuántas PIEZAS lleva el pedido en total. Es lo que decide el empaque.
+
+    Se cuentan TODAS las piezas, no sólo los viales: un frasco de agua de 30 ml y una
+    jeringa ocupan lugar en la bolsa igual que un vial, y quien decide si cabe es el
+    bulto, no la etiqueta del producto. Contar de más se equivoca hacia el lado bueno —
+    manda el pedido a revisión humana— y contar de menos se equivoca hacia el recobro.
+    """
+    total = 0
+    for it in items or []:
+        get = (lambda k: getattr(it, k, None)) if not isinstance(it, dict) else it.get
+        try:
+            total += max(0, int(get('quantity') or 0))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def empaque_para(piezas: int) -> dict | None:
+    """En qué empaque cabe este pedido. **None cuando no cabe en ninguno.**
+
+    ⛔ EL `None` ES EL FRENO, no un error. Significa "esto no entra en nada de lo que
+    hay en la bodega": el servidor NO compra la guía sola y le pregunta a Christián qué
+    empaque va a usar. Es exactamente lo que él pidió para los pedidos de 5 piezas o
+    más, que hoy no tienen empaque que los reciba.
+    """
+    try:
+        n = int(piezas or 0)
+    except (TypeError, ValueError):
+        return None
+    if n <= 0:
+        return None
+    for e in empaques():
+        if n <= int(e.get('hasta_piezas') or 0):
+            return dict(e)
+    return None
+
+
+def paquete_de_empaque(empaque: dict) -> dict:
+    """Traduce un empaque a lo que la paquetería necesita saber del bulto.
+
+    Mismas llaves que `paquete_del_pedido` para que los dos caminos —el automático y
+    el que despacha el admin a mano— hablen el mismo idioma río abajo.
+    """
+    empaque = empaque or {}
+    return {
+        'peso_kg': max(PESO_MINIMO_KG, float(empaque.get('peso_facturable_kg') or 0)),
+        'largo_cm': empaque.get('largo_cm'),
+        'ancho_cm': empaque.get('ancho_cm'),
+        'alto_cm': empaque.get('alto_cm'),
+        'caja': empaque.get('nombre', ''),
+        'peso_volumetrico_kg': peso_volumetrico(empaque),
     }
 
 

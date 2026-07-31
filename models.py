@@ -261,6 +261,23 @@ class OrderCreate(BaseModel):
     # marcarla el botón de pagar parecía muerto; la casilla se quitó y quedó esto,
     # que es lo único que aportaba: la constancia. Christian, 2026-07-28.
     terms_accepted_at: str = ''
+    # ⛔ ENVÍO PARTIDO: LO ELIGE EL CLIENTE, NO NOSOTROS (Christián, 2026-07-31).
+    #
+    # Cuando el pedido no se puede surtir completo hay dos formas de atenderlo y las
+    # dos son razonables: mandar lo que hay YA (2-5 días) y el resto después, o
+    # esperar a tenerlo todo junto (~1 semana). Hasta hoy la casa decidía sola y
+    # siempre partía; a quien tenía prisa le servía y a quien no quería dos entregas
+    # le molestaba, y nadie le preguntó.
+    #
+    #   'partido' → manda lo disponible ya; el resto en un segundo envío (con su
+    #               propia guía y su propio aviso). ES EL VALOR POR OMISIÓN, porque es
+    #               lo que se hacía hasta hoy y porque un pedido completo nunca se
+    #               parte: sin faltantes esta decisión no cambia nada.
+    #   'completo' → no sale nada hasta que esté todo. Una sola guía.
+    #
+    # Lo que el navegador manda aquí es una PREFERENCIA, no dinero: no mueve un peso
+    # del total. Por eso se acepta tal cual, a diferencia del precio o del envío.
+    shipping_preference: str = 'partido'
 
 
 class Order(BaseModel):
@@ -336,6 +353,27 @@ class Order(BaseModel):
     label_url: str = ''                 # PDF de la guía
     label_provider: str = ''            # 'skydropx'
     label_error: str = ''               # por qué no se pudo comprar sola (si pasó)
+    # ⛔ POR QUÉ LA GUÍA NO SE COMPRÓ SOLA, cuando fue A PROPÓSITO y no un fallo.
+    # Son cosas distintas y se atienden distinto: un `label_error` se reintenta solo,
+    # un `label_hold` espera una decisión de Christián y no tiene caso reintentarlo.
+    #   'sin_empaque'            → lleva más piezas de las que caben en lo que hay
+    #   'sobre_tope'             → la guía se pasa del tope de gasto automático
+    #   'espera_pedido_completo' → el cliente pidió que todo llegue junto
+    label_hold: str = ''
+    label_lock: bool = False            # candado atómico: nunca dos guías del mismo pedido
+    label_intentos: int = 0             # cuántas veces falló la compra automática
+    label_ultimo_intento: str = ''
+    label_piezas: int = 0               # cuántas piezas se contaron para elegir empaque
+    label_empaque: str = ''             # en qué se mandó
+    label_precio_cotizado: float = 0    # lo que costaba cuando se pasó del tope
+    # Qué correos ya recibió quien compró. ⛔ ES EL CANDADO DE «NADIE RECIBE TRES
+    # CORREOS»: cada evento aparta su ranura en un solo paso condicionado (igual que el
+    # cupón y los puntos), así que dos webhooks simultáneos no mandan lo mismo dos
+    # veces. Ranuras: 'nuevo', 'pagado', 'enviado:<número de guía>'.
+    emails_sent: List[str] = Field(default_factory=list)
+    # La liga de pago de Mercado Pago. Con OXXO ESTA URL ES LA FICHA: si no se guarda,
+    # el cliente que cierra la pestaña no puede volver a verla nunca.
+    card_checkout_url: str = ''
     # Marketing: de dónde vino este cliente y si era su PRIMERA compra.
     # `first_order` es la pieza que hace honesto el costo por cliente: si un
     # cliente que ya compraba vuelve a comprar, esa venta NO es un cliente que
@@ -353,6 +391,10 @@ class Order(BaseModel):
     # ve ANTES de pagar y lo que el equipo ve en el Panel para salir a comprar.
     backorder: bool = False
     backorder_items: List[dict] = Field(default_factory=list)
+    # Qué eligió el cliente al pagar: 'partido' (lo de hoy sale ya) o 'completo'
+    # (espera a estar entero). Se respeta en el despacho: con 'completo' la guía
+    # automática NO se compra mientras falte mercancía. Ver OrderCreate.
+    shipping_preference: str = 'partido'
     # Cuántas piezas se APARTARON de verdad, por producto ({clave: piezas}). No es lo
     # mismo que lo pedido: en un pedido partido se aparta menos. Cancelar tiene que
     # devolver EXACTAMENTE esto y no la cantidad pedida, o cada cancelación le regala
@@ -409,6 +451,29 @@ class CajaEnvio(BaseModel):
     alto_cm: float
     peso_max_kg: float = 999.0     # hasta cuánta mercancía le cabe
     peso_caja_kg: float = 0.0      # lo que pesa vacía, con relleno
+
+
+class EmpaqueEnvio(BaseModel):
+    """Un empaque REAL de la bodega, medido por CUÁNTAS PIEZAS le caben.
+
+    ⛔ ES OTRA COSA QUE `CajaEnvio` y por eso no se reusa. La caja se elige por peso
+    calculado —que sirve para cotizar— y ésta se elige por cuántas piezas caben, que es
+    lo único que se puede saber de cierto cuando el catálogo no trae pesos reales. Es la
+    tabla que decide si el servidor compra la guía solo o le pregunta a Christián.
+
+    Hoy sólo existe un renglón: la bolsa stand-up de 12×15×1 cm con 4 piezas. El día que
+    haya cajas se capturan aquí, desde el Panel, sin desplegar nada.
+    """
+    nombre: str = 'empaque'
+    hasta_piezas: int              # cuántas piezas le caben. Sin esto no dice nada.
+    largo_cm: float
+    ancho_cm: float
+    alto_cm: float
+    peso_facturable_kg: float = 1.0    # con qué peso se cotiza (mínimo 1 kg)
+
+
+class EmpaquesUpdate(BaseModel):
+    empaques: List[EmpaqueEnvio] = []
 
 
 class CajasUpdate(BaseModel):
