@@ -1164,6 +1164,23 @@ COMMISSION_CAP = 0.50
 NO_DISCOUNT_CATEGORIES = {'suministros', 'accesorios'}
 
 
+def tasa_de_cupon(doc):
+    """El descuento que vale un cupón, TOPADO AL MÁXIMO DE LA CASA (40%).
+
+    ⛔ «El regalo debe estar topado en 40%» (Christián, 2026-07-31). El cupón GIFT del
+    admin se creaba con `min(0.50, …)`, así que era la única puerta por la que salía un
+    descuento arriba del techo de la casa — más alto incluso que el de la venta directa,
+    que sí se capó el 29-jul. Un regalo del 50% es medio producto regalado.
+
+    El tope se aplica AL USARLO, no sólo al crearlo, por dos razones: los cupones que ya
+    andan sueltos con 50% tienen que cobrar 40% (no se cancelan — el cliente ya tiene su
+    regalo, sólo vale menos), y el candado no depende de por dónde se creó el documento.
+
+    Encima de esto sigue mandando el tope de CADA producto (`_disc_of` → `commission_cap`)
+    y los insumos siguen fuera: el 40% es el techo, no un piso garantizado."""
+    return max(0.0, min(loyalty.MAX_DISCOUNT, float((doc or {}).get('discount_rate') or 0)))
+
+
 def es_hgh_neto(product_id, name):
     """Familia HGH (no el Fragment): precio NETO siempre — su margen no aguanta
     ningún descuento (Christian, 2026-07-22).
@@ -2736,7 +2753,9 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
             coupon = _c
     referrer, code_discount = ((None, 0.0) if coupon else await _resolve_code(payload.distributor_code))
     if coupon:
-        discount_rate = coupon['discount_rate']
+        # ⛔ TOPADO AL 40% AL COBRAR, no sólo al crearlo: los GIFT que ya andan sueltos
+        # con 50% valen 40% (Christián, 2026-07-31). Ver `tasa_de_cupon`.
+        discount_rate = tasa_de_cupon(coupon)
     elif referrer:
         discount_rate = code_discount
     else:
@@ -3914,7 +3933,9 @@ async def check_discount_code(code: str):
         # `min_order`: los cupones de recuperación de carrito exigen un monto mínimo.
         # Se devuelve para que el carrito lo diga ANTES, y no le cobre al cliente algo
         # distinto de lo que vio en pantalla.
-        return {'code': c, 'discount_rate': cdoc.get('discount_rate', 0),
+        # La MISMA cuenta que cobra el checkout (topada al 40%): si aquí se anunciara el
+        # 50% guardado, el carrito pintaría un descuento que la caja no va a dar.
+        return {'code': c, 'discount_rate': tasa_de_cupon(cdoc),
                 'min_order': float(cdoc.get('min_order') or 0)}
     dist, discount = await _resolve_code(code)
     if not dist:
@@ -7421,7 +7442,9 @@ async def admin_customer_detail(user_id: str, admin=Depends(get_current_admin)):
         'paid_count': len(paid),
         # Lo que este cliente debe: entregado o en camino, sin cobrar.
         'por_cobrar': sum(por_cobrar_de(o) for o in orders),
-        'coupons': [{'code': c['code'], 'discount_rate': c.get('discount_rate', 0),
+        # El descuento que de verdad va a cobrar (topado al 40%), no el guardado: la ficha
+        # no puede prometerle al admin un 50% que la caja ya no da.
+        'coupons': [{'code': c['code'], 'discount_rate': tasa_de_cupon(c),
                      'expires_at': c.get('expires_at'), 'used': c.get('used', False),
                      'active': c.get('active', False), 'note': c.get('note', '')} for c in coupons],
         'points_ledger': ledger[:50],
@@ -7429,7 +7452,7 @@ async def admin_customer_detail(user_id: str, admin=Depends(get_current_admin)):
 
 
 class CouponCreate(BaseModel):
-    discount_rate: float           # 0.05 .. 0.50
+    discount_rate: float           # 0.05 .. 0.40 (el techo de la casa)
     expires_days: int = 30
     note: str = ''
 
@@ -7440,7 +7463,11 @@ async def admin_send_coupon(user_id: str, payload: CouponCreate, admin=Depends(g
     u = await db.users.find_one({'id': user_id}, {'_id': 0, 'id': 1, 'name': 1})
     if not u:
         raise HTTPException(status_code=404, detail='Cliente no encontrado')
-    rate = max(0.05, min(0.50, payload.discount_rate))
+    # ⛔ EL REGALO TAMBIÉN SE TOPA EN 40% (Christián, 2026-07-31). Este `min` estaba en
+    # 0.50 y era la ÚNICA puerta que quedaba arriba del techo de la casa: la venta directa
+    # se capó el 29-jul y el checkout público nunca pasó de ahí. Se topa también al
+    # cobrarlo (`tasa_de_cupon`), para los que ya andan sueltos con 50%.
+    rate = max(0.05, min(loyalty.MAX_DISCOUNT, payload.discount_rate))
     code = 'GIFT-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
     while await db.discount_codes.find_one({'code': code}):
         code = 'GIFT-' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))

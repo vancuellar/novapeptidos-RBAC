@@ -417,6 +417,64 @@ def test_los_insumos_nunca_llevan_descuento_en_la_venta_directa(db):
     assert salida['discount'] == 0 and salida['total'] == 1200, salida
 
 
+# ==========================================================================
+#  El REGALO también se topa en 40% (Christián, 2026-07-31)
+# ==========================================================================
+# «El regalo debe estar topado en 40%.» El cupón GIFT del admin se creaba con
+# `min(0.50, …)` y era la ÚNICA puerta que quedaba arriba del techo de la casa: la venta
+# directa se capó el 29-jul y el checkout público nunca pasó de ahí. Se topa en las DOS
+# puntas —al crearlo y al cobrarlo— porque los cupones que ya andan sueltos con 50% no se
+# cancelan: el cliente se queda con su regalo, sólo que vale 40%.
+
+def test_pedir_un_regalo_de_50pct_CREA_uno_de_40pct(db):
+    import loyalty
+
+    db.cols['users'] = FakeCol([{'id': 'u1', 'name': 'Prueba'}])
+    salida = asyncio.run(server.admin_send_coupon(
+        'u1', server.CouponCreate(discount_rate=0.50, note='regalo'),
+        admin={'id': 'admin', 'role': 'admin'}))
+
+    assert salida['discount_rate'] == loyalty.MAX_DISCOUNT == 0.40, salida
+    guardado = db.cols['discount_codes'].docs[0]
+    assert guardado['discount_rate'] == 0.40, guardado
+    assert guardado['code'].startswith('GIFT-')
+    # Y el aviso al cliente no puede prometer un 50% que la caja no da.
+    assert '40%' in db.cols['notifications'].docs[0]['body']
+
+
+def test_un_regalo_normal_no_se_recorta(db):
+    """El candado tapa lo que se pasa del techo; no castiga al que regala menos."""
+    db.cols['users'] = FakeCol([{'id': 'u1', 'name': 'Prueba'}])
+    salida = asyncio.run(server.admin_send_coupon(
+        'u1', server.CouponCreate(discount_rate=0.25),
+        admin={'id': 'admin', 'role': 'admin'}))
+    assert salida['discount_rate'] == 0.25, salida
+
+
+def test_un_GIFT_viejo_de_50pct_QUE_YA_ANDA_SUELTO_cobra_40pct():
+    """Los cupones emitidos antes del tope no se cancelan: valen 40%.
+    El candado va al COBRAR, no sólo al crear."""
+    assert server.tasa_de_cupon({'discount_rate': 0.50}) == 0.40
+    assert server.tasa_de_cupon({'discount_rate': 0.60}) == 0.40
+    assert server.tasa_de_cupon({'discount_rate': 0.20}) == 0.20   # el chico no sube
+    assert server.tasa_de_cupon({}) == 0.0
+    assert server.tasa_de_cupon(None) == 0.0
+
+
+def test_el_checkout_y_el_carrito_leen_el_MISMO_cupon_topado():
+    """Las dos rutas que tocan un cupón usan `tasa_de_cupon`: si el carrito anunciara el
+    50% guardado y la caja cobrara 40%, el cliente pagaría algo distinto de lo que vio."""
+    src = open(server.__file__, encoding='utf-8').read()
+    checkout = src.split('async def create_order(')[1].split('\n@api_router')[0]
+    assert 'discount_rate = tasa_de_cupon(coupon)' in checkout, \
+        'el checkout volvió a leer el descuento del cupón sin topar'
+    publico = src.split('async def check_discount_code(')[1].split('\n@api_router')[0]
+    assert 'tasa_de_cupon(cdoc)' in publico, 'el validador público anuncia el rate crudo'
+    crear = src.split('async def admin_send_coupon(')[1].split('\n@api_router')[0]
+    assert 'min(0.50' not in crear, 'volvió el regalo del 50%'
+    assert 'min(loyalty.MAX_DISCOUNT' in crear
+
+
 # ---------- Pagado ≠ entregado (Christián, 2026-07-29) ----------
 # La venta de Alanís salió ENTREGADA y SIN PAGAR, y el tablero la contaba como
 # ingreso. Un reporte que dice que cobraste lo que no cobraste es peor que no tenerlo.
