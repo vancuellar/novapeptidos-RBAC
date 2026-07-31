@@ -5385,6 +5385,11 @@ def _detalle_de_pedido(o, dist_id=None, dist=None, es_admin=False):
         'delivered_at': o.get('delivered_at'),
         'eta': o.get('eta', ''),
         'my_commission': _my_amount(o, dist_id) if dist_id else None,
+        # El PDF de la guía, SÓLO para el admin: comprar guías es dinero de la casa y
+        # vive en el admin (igual que cotizar). Sin esto, una guía comprada quedaba sin
+        # forma de imprimirse desde la ficha — que es justo lo que hace falta para poder
+        # pegarla en el paquete y llevarlo al mostrador.
+        **({'label_url': o.get('label_url') or ''} if es_admin else {}),
         # Los datos de contacto sólo si quien pregunta puede verlos: el admin siempre,
         # el distribuidor sólo con su interruptor encendido (hoy, sólo María).
         **_contacto_del_cliente(o, dist, es_admin),
