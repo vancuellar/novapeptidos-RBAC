@@ -141,21 +141,52 @@ def gen_order_number():
     return 'EX-' + datetime.now().strftime('%Y%m%d') + '-' + str(random.randint(1000, 9999))
 
 
-# El prefijo de TODOS los códigos de descuento: quien atiende al cliente, y nadie más.
-# Es `emails.ATENCION_NOMBRE` ('Mónica Flores') escrito como se escribe un código.
+# El prefijo de la casa: quien atiende de cara al cliente. Es
+# `emails.ATENCION_NOMBRE` ('Mónica Flores') escrito como se escribe un código.
+#
+# ⛔ NO ES DE TODOS: ES DE QUIEN LO TRAIGA MARCADO EN SU FICHA (Christián,
+# 2026-07-31, la corrección del mismo día). La primera versión se lo puso a TODOS
+# los distribuidores y estuvo mal: la orden de privacidad hablaba de MARÍA y de
+# nadie más. Alanís y Javier vuelven a emitir con su propio nombre.
+#
+# El interruptor es `users.code_prefix`, una marca POR PERSONA. Si la ficha lo
+# trae, los códigos de ese distribuidor salen con él; si no, salen de su nombre,
+# como toda la vida. Una regla global es exactamente lo que hubo que deshacer.
 PREFIJO_CODIGO = 'MONICAF'
 
+# Lo único que cabe en un código. Fuera de aquí, nada.
+_CODIGO_OK = string.ascii_uppercase + string.digits
 
-def gen_distributor_code(name: str) -> str:
-    """El código ÚNICO (legacy) del distribuidor: MONICAF-NNNN.
 
-    ⛔ TAMPOCO SALE YA DEL NOMBRE (Christián, 2026-07-31). Era `MARI-3537`,
-    `ALAN-2292`, `JAVI-7116`: cuatro letras del nombre y a la vista del cliente.
+def prefijo_de(quien, largo: int = 6) -> str:
+    """El prefijo de los códigos de ESTE distribuidor.
+
+    `quien` es la ficha del distribuidor (dict) o —cuando todavía no existe,
+    porque apenas se está dando de alta— su nombre suelto.
+
+    La marca de la ficha (`code_prefix`) MANDA sobre el nombre. Así la orden del
+    31-jul («los clientes no pueden ver que el código de descuento es de María»)
+    tapa a María sin arrastrar a nadie: sólo su ficha trae `code_prefix`.
+
+    Lo pregunta el generador de las DOS familias de códigos —el AUTO por nivel y
+    el ÚNICO legacy—, que es la lección de la vez pasada: cambiar sólo uno deja
+    la mitad de la regla en pie y nadie lo nota."""
+    if isinstance(quien, dict):
+        marca = ''.join(c for c in str(quien.get('code_prefix') or '').upper()
+                        if c in _CODIGO_OK)[:12]
+        if marca:
+            return marca
+        quien = quien.get('name') or quien.get('email') or ''
+    return ''.join(c for c in str(quien or '').upper() if c in _CODIGO_OK)[:largo] or 'DIST'
+
+
+def gen_distributor_code(quien) -> str:
+    """El código ÚNICO (legacy) del distribuidor: PREFIJO-NNNN.
+
     Es el HERMANO OLVIDADO de `gen_discount_code` —vive en `users.distributor_code`,
-    no en `discount_codes`, y `_resolve_code` cae a él cuando el texto no está en la
-    colección—, así que cambiar sólo el otro habría dejado la mitad de la fuga en pie.
-    `name` se conserva en la firma por los ocho llamadores y NO SE USA a propósito."""
-    return PREFIJO_CODIGO + '-' + str(random.randint(1000, 9999))
+    no en `discount_codes`, y `_resolve_code` cae a él cuando el texto no está en
+    la colección—. `quien` puede ser la ficha o el nombre: ver `prefijo_de`."""
+    return prefijo_de(quien, 4) + '-' + str(random.randint(1000, 9999))
 
 
 async def resolve_distributor(code):
@@ -210,25 +241,20 @@ def gen_sku(name: str, presentation: str = '') -> str:
     return f'{comp}-{pr}' if pr else comp
 
 
-def gen_discount_code(name, pct):
-    """Código OPAQUE, no adivinable: MONICAF-PCT-XXXX (parte al azar). El % en el
+def gen_discount_code(quien, pct):
+    """Código OPAQUE, no adivinable: PREFIJO-PCT-XXXX (parte al azar). El % en el
     texto es informativo; el descuento real SIEMPRE sale del valor guardado.
 
-    ⛔ EL PREFIJO YA NO SALE DEL NOMBRE DEL DISTRIBUIDOR (Christián, 2026-07-31).
-    Antes era `MARIAN-15-R4YV`, `ALANIS-20-FRUK`, `JAVIER-25-RHV4`: el propio texto
-    del código le decía al cliente de quién era. Eso es la última rendija de la orden
-    del 31-jul —«los clientes no pueden ver que el código de descuento es de María»—,
-    la que no tapaban ni los correos ni las rutas, porque el código lo teclea el
-    cliente y lo ve completo. Ahora TODOS los distribuidores emiten con el mismo
-    prefijo, el de la atención de la casa (Mónica Flores): con uno solo para todos, el
-    texto ya no distingue a nadie, ni siquiera comparando dos códigos entre sí.
+    El PREFIJO sale de `prefijo_de(quien)`: la marca de la ficha si la trae
+    (María: `MONICAF-15-R4YV`), y si no, el nombre de siempre (`ALANIS-20-FRUK`,
+    `JAVIER-25-RHV4`). `quien` es la ficha completa, no el nombre suelto —eso es
+    lo que le permite ver la marca—; se acepta un texto sólo para el alta, cuando
+    la ficha todavía no existe.
 
-    `name` se conserva en la firma —lo mandan los dos llamadores— pero NO SE USA a
-    propósito: quitarlo invitaría a alguien a volver a meter un dato del distribuidor
-    aquí dentro. Lo vigila `test_privacidad_distribuidor.py`."""
-    allowed = string.ascii_uppercase + string.digits
-    rand = ''.join(random.choices(allowed, k=4))
-    return f'{PREFIJO_CODIGO}-{int(round((pct or 0) * 100))}-{rand}'
+    Lo vigila `test_privacidad_distribuidor.py`: el código de quien está marcado
+    no puede delatarlo."""
+    rand = ''.join(random.choices(_CODIGO_OK, k=4))
+    return f'{prefijo_de(quien, 6)}-{int(round((pct or 0) * 100))}-{rand}'
 
 
 async def _resolve_code(code):
@@ -4795,10 +4821,12 @@ def _code_projection(doc):
     }
 
 
-async def _new_code_string(name, rate):
-    code = gen_discount_code(name, rate)
+async def _new_code_string(dist, rate):
+    """Un texto de código libre para ese distribuidor. Recibe la FICHA COMPLETA,
+    no el nombre: es lo que deja a `prefijo_de` ver la marca `code_prefix`."""
+    code = gen_discount_code(dist, rate)
     while await db.discount_codes.find_one({'code': code}):
-        code = gen_discount_code(name, rate)
+        code = gen_discount_code(dist, rate)
     return code
 
 
@@ -4857,14 +4885,14 @@ async def _ensure_distributor_codes(dist, force_rotate=False):
             c = None
         if not c:
             doc = {'id': str(uuid.uuid4()), 'distributor_id': dist['id'],
-                   'code': await _new_code_string(dist.get('name'), rate),
+                   'code': await _new_code_string(dist, rate),
                    'discount_rate': rate, 'active': True, 'created_at': now,
                    'expires_at': new_exp, 'superseded_at': None}
             await db.discount_codes.insert_one(doc)
             out.append(doc)
         elif expired or not c.get('active', True):
             # Muerto: no hay nada que preservar, se reescribe en su sitio.
-            new_code = await _new_code_string(dist.get('name'), rate)
+            new_code = await _new_code_string(dist, rate)
             await db.discount_codes.update_one({'id': c['id']}, {'$set': {
                 'code': new_code, 'active': True, 'created_at': now,
                 'expires_at': new_exp, 'superseded_at': None}})
@@ -5153,10 +5181,10 @@ async def _rotar_codigo_unico(dist):
             'active': True, 'created_at': ahora, 'superseded_at': ahora, 'legacy': True,
             'expires_at': (datetime.now(timezone.utc)
                            + timedelta(days=CODE_TTL_DAYS)).isoformat()})
-    nuevo = gen_distributor_code(dist.get('name') or '')
+    nuevo = gen_distributor_code(dist)
     while (await db.users.find_one({'distributor_code': nuevo})
            or await db.discount_codes.find_one({'code': nuevo})):
-        nuevo = gen_distributor_code(dist.get('name') or '')
+        nuevo = gen_distributor_code(dist)
     await db.users.update_one({'id': dist['id']}, {'$set': {'distributor_code': nuevo}})
     return viejo, nuevo
 
@@ -5587,9 +5615,9 @@ async def resolve_distributor_application(app_id: str, payload: dict, admin=Depe
         result = {'already': True}
     elif existing:
         # Cliente existente: misma conversión que el botón "Hacer distribuidor".
-        code = gen_distributor_code(existing.get('name') or existing['email'])
+        code = gen_distributor_code(existing)
         while await db.users.find_one({'distributor_code': code}):
-            code = gen_distributor_code(existing.get('name') or existing['email'])
+            code = gen_distributor_code(existing)
         await db.users.update_one({'id': existing['id']}, {'$set': {
             'role': 'distributor', 'distributor_code': code, 'commission_rate': commission,
             'customer_discount_rate': discount, 'converted_from_customer_at': now_iso(),
@@ -5651,9 +5679,9 @@ async def convert_customer_to_distributor(user_id: str, payload: dict, admin=Dep
         raise HTTPException(status_code=400, detail='Una cuenta admin no puede ser distribuidor')
     if user.get('role') == 'distributor':
         raise HTTPException(status_code=400, detail='Esta cuenta ya es distribuidor')
-    code = gen_distributor_code(user.get('name') or user['email'])
+    code = gen_distributor_code(user)
     while await db.users.find_one({'distributor_code': code}):
-        code = gen_distributor_code(user.get('name') or user['email'])
+        code = gen_distributor_code(user)
     try:
         commission = float(payload.get('commission_rate', 0.25) or 0)
         discount = float(payload.get('customer_discount_rate', 0.10) or 0.10)

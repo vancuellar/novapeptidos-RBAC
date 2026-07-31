@@ -42,10 +42,13 @@ import emails
 import server
 
 
-# La distribuidora del caso real, con todo lo que la delata.
+# La distribuidora del caso real, con todo lo que la delata. `code_prefix` es la
+# marca de SU ficha: es lo que hace que sus códigos salgan con el prefijo de la
+# casa. Sin esa marca, saldrían con su nombre — que es lo correcto para todos los
+# demás distribuidores (Christián, 2026-07-31).
 DIST = {'id': 'u-maria-9f3a', 'name': 'Maria Neunfeld', 'email': 'maria@exygenlabs.com',
         'role': 'distributor', 'tier': 'junior0', 'distributor_code': 'MARI-3537',
-        'customer_discount_rate': 0.15}
+        'code_prefix': 'MONICAF', 'customer_discount_rate': 0.15}
 CLIENTE = {'id': 'u-cli', 'name': 'Cliente', 'email': 'cli@x.mx', 'role': 'user'}
 
 # Las cadenas que NUNCA pueden aparecer en algo que ve un cliente.
@@ -199,18 +202,21 @@ def test_un_codigo_inventado_no_dice_nada(como):
     sin_rastro(r.text, 'GET /discount-code (inventado)')
 
 
-def test_el_texto_del_codigo_no_delata_a_nadie():
+def test_el_texto_del_codigo_de_maria_no_la_delata():
     """La cuarta rendija, la que no tapaba ninguna ruta: el propio texto del código.
 
     El cliente lo teclea, así que lo ve entero. Mientras el prefijo salía del nombre
-    —`MARIAN-15-R4YV`— bastaba leerlo para saber de quién era. Se prueba con el mismo
-    filtro tosco que el resto del archivo (`sin_rastro`) y, además, que dos
-    distribuidores distintos produzcan códigos indistinguibles salvo por el azar: si
-    alguien devolviera el nombre al generador, esto truena aunque el nombre viniera
-    recortado o revuelto."""
-    mio = server.gen_discount_code(DIST['name'], 0.15)
+    —`MARIAN-15-R4YV`— bastaba leerlo para saber de quién era.
+
+    ⛔ ES SU FICHA LA QUE LO TAPA, NO UNA REGLA DE LA CASA (corrección del mismo
+    día): `DIST` trae `code_prefix`, y por eso su código sale `MONICAF-15-XXXX`.
+    A los demás distribuidores no les toca —Christián lo aclaró: la orden era
+    sobre María— y eso se fija en `test_core.py`. Aquí sólo se prueba lo que esta
+    ruta promete: el código de quien está tapado no puede delatarlo, ni siquiera
+    comparándolo con el de otra ficha tapada."""
+    mio = server.gen_discount_code(DIST, 0.15)
     sin_rastro(mio, 'gen_discount_code')
-    otro = server.gen_discount_code('Javier Zavala', 0.15)
+    otro = server.gen_discount_code({'name': 'Javier Zavala', 'code_prefix': 'MONICAF'}, 0.15)
     assert mio.rsplit('-', 1)[0] == otro.rsplit('-', 1)[0], \
         f'el prefijo todavía distingue al distribuidor: {mio} vs {otro}'
     assert mio.startswith(f'{server.PREFIJO_CODIGO}-15-')

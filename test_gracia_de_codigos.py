@@ -101,6 +101,11 @@ class FakeDB:
 # La distribuidora del caso real, con su código viejo circulando.
 MARIA = {'id': 'u-maria', 'name': 'Maria Neunfeld', 'email': 'maria@exygenlabs.com',
          'role': 'distributor', 'tier': 'junior0', 'commission_rate': 0.30,
+         # La marca de SU ficha: sólo ella emite con el prefijo de la casa. Los
+         # demás distribuidores siguen emitiendo con su nombre (Christián,
+         # 2026-07-31). La gracia de abajo funciona igual con o sin marca — lo que
+         # se prueba aquí es que el viejo no muere, no cómo se llama el nuevo.
+         'code_prefix': 'MONICAF',
          'distributor_code': 'MARI-3537', 'customer_discount_rate': 0.10}
 
 # El que ya anda en la calle: el que dos clientes usaron el 30-jul.
@@ -146,12 +151,30 @@ def test_el_viejo_conserva_su_caducidad_original(db):
     assert viejo['expires_at'] == VIEJO['expires_at']
 
 
-def test_nace_uno_nuevo_del_mismo_nivel_y_con_el_prefijo_de_la_casa(db):
+def test_nace_uno_nuevo_del_mismo_nivel_y_con_el_prefijo_de_su_ficha(db):
     vigentes = rota()
     nuevo = next(c for c in vigentes if round(c['discount_rate'], 4) == 0.15)
     assert nuevo['code'] != 'MARIAN-15-R4YV'
-    assert nuevo['code'].startswith('MONICAF-15-')
+    assert nuevo['code'].startswith('MONICAF-15-')     # ella SÍ trae `code_prefix`
     assert nuevo.get('superseded_at') is None
+
+
+def test_a_quien_no_trae_marca_le_nacen_con_SU_nombre(db):
+    """La corrección del 31-jul: el prefijo de la casa NO es de todos.
+
+    Alanís no trae `code_prefix`, así que rotarle los códigos le devuelve
+    `ALANIS-15-XXXX`. Si alguien vuelve a hacer la regla global —la primera
+    versión lo hizo y hubo que deshacerlo a mano en la base— esto truena."""
+    alanis = {'id': 'u-alanis', 'name': 'Alanis Fernanda Mendoza',
+              'email': 'alanis@x.mx', 'role': 'distributor', 'tier': 'junior0',
+              'commission_rate': 0.30, 'distributor_code': 'ALAN-2292',
+              'customer_discount_rate': 0.10}
+    db.cols['users'].docs.append(alanis)
+    vigentes = rota(alanis)
+    assert vigentes and all(c['code'].startswith('ALANIS-') for c in vigentes), \
+        [c['code'] for c in vigentes]
+    viejo, nuevo = asyncio.run(server._rotar_codigo_unico(alanis))
+    assert viejo == 'ALAN-2292' and nuevo.startswith('ALAN-'), nuevo
 
 
 def test_el_viejo_da_EL_MISMO_descuento_y_al_MISMO_distribuidor(db):
