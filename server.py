@@ -4884,6 +4884,74 @@ async def distributor_clients(dist=Depends(get_current_distributor)):
     return out
 
 
+@api_router.get('/cotizador/clientes')
+async def cotizador_clientes(quien=Depends(get_current_distributor)):
+    """Los clientes que puede autollenar quien está cotizando. Admin o distribuidor.
+
+    ⛔ EL CANDADO DE PRIVACIDAD VIVE AQUÍ, EN EL SERVIDOR, NO EN LA PANTALLA. Esconder
+    los campos en el navegador no esconde nada: la respuesta se lee en la consola con la
+    sesión abierta. Así que lo que no se puede ver, NO VIAJA.
+
+      · admin              → todos los clientes, con su contacto completo;
+      · distribuidor CON el interruptor (hoy sólo María) → SUS clientes, con contacto;
+      · distribuidor SIN el interruptor → SUS clientes, y sólo el NOMBRE.
+
+    En el último caso el autollenado rellena el nombre y deja lo demás en blanco, que es
+    exactamente lo que ese distribuidor puede saber de su cliente (regla de Christián del
+    2026-07-23, todavía vigente para todos menos los encendidos).
+
+    El «sólo SUS clientes» no depende del interruptor: se filtra por `referred_by` antes
+    de mirar ninguna otra cosa.
+    """
+    es_admin = quien.get('role') == 'admin'
+    abierto = es_admin or ve_datos_del_cliente(quien)
+
+    filtro = {} if es_admin else {'referred_by': quien['id']}
+    users = await db.users.find(filtro, {'_id': 0, 'password_hash': 0}).to_list(5000)
+    fuera = {'admin'} if es_admin else set()
+    gente = []
+    for u in users:
+        if u.get('role') in fuera:
+            continue
+        ficha = {'id': u['id'], 'name': u.get('name') or '', 'guest': False}
+        if abierto:
+            # `address` en los usuarios puede venir como texto suelto o como diccionario
+            # (según cómo se registró). Se aplana aquí para que la pantalla no adivine.
+            dom = u.get('address')
+            if isinstance(dom, dict):
+                dom = ', '.join(x for x in (dom.get('address'), dom.get('address_2'),
+                                            dom.get('city'), dom.get('state'),
+                                            dom.get('postal_code')) if x)
+            ficha.update({'email': u.get('email') or '', 'phone': u.get('phone') or '',
+                          'address': dom or ''})
+        gente.append(ficha)
+
+    # Los que compraron SIN cuenta también son clientes: sus datos viven en el pedido.
+    pedidos = await db.orders.find(
+        {} if es_admin else {'referred_by': quien['id']}, {'_id': 0}).to_list(10000)
+    con_cuenta = {(u.get('email') or '').strip().lower() for u in users}
+    vistos = set()
+    for o in pedidos:
+        c = o.get('customer') or {}
+        correo = (c.get('email') or '').strip().lower()
+        if not correo or correo in con_cuenta or correo in vistos or o.get('user_id'):
+            continue
+        vistos.add(correo)
+        ficha = {'id': f'invitado:{correo}', 'name': c.get('full_name') or '',
+                 'guest': True}
+        if abierto:
+            ficha.update({
+                'email': c.get('email') or '', 'phone': c.get('phone') or '',
+                'address': ', '.join(x for x in (
+                    c.get('address'), c.get('address_2'), c.get('city'),
+                    c.get('state'), c.get('postal_code')) if x),
+            })
+        gente.append(ficha)
+
+    gente.sort(key=lambda g: (g['name'] or '').lower())
+    return {'puede_ver_contacto': abierto, 'clientes': gente}
+
+
 def _id_de_cliente(order):
     """A QUÉ FICHA APUNTA EL NOMBRE DE ESTE PEDIDO.
 
@@ -4902,6 +4970,54 @@ async def _distributor_orders(dist):
     orders = await db.orders.find({'referred_by': dist['id']}, {'_id': 0}).to_list(10000)
     orders.sort(key=lambda o: o.get('created_at', ''), reverse=True)
     return orders
+
+
+# ⛔ QUIÉN VE LOS DATOS DE CONTACTO DEL CLIENTE — INTERRUPTOR POR PERSONA
+#
+# El 2026-07-23 Christián ordenó que un distribuidor NO viera «correo, teléfono,
+# domicilio, ni qué compuestos compró su cliente». El 2026-07-31 lo cambió, pero SÓLO
+# para María: ella atiende a sus clientes de verdad y necesita poder llamarles.
+#
+# Por eso esto es un INTERRUPTOR POR DISTRIBUIDOR y no una regla nueva para todos: los
+# demás siguen exactamente como el 23 de julio, y encender a otro es un clic del admin,
+# no un despliegue. Mismo patrón que `personal_discount_rate`.
+#
+# ⛔ LO QUE ESTE INTERRUPTOR NO AFLOJA, NUNCA:
+#   · el candado de «sólo SUS clientes» (`referred_by == dist['id']`), que vive en el
+#     servidor y decide a qué pedidos puede asomarse siquiera;
+#   · el margen de la casa: costo, ROI y lo que ganan los demás en la pirámide no
+#     viajan aunque el interruptor esté encendido;
+#   · el «ver como» del admin, que sigue siendo de sólo lectura.
+CAMPO_VE_CLIENTE = 've_datos_del_cliente'
+
+
+def ve_datos_del_cliente(dist) -> bool:
+    """¿A este distribuidor se le abrieron los datos de contacto de SUS clientes?"""
+    return bool((dist or {}).get(CAMPO_VE_CLIENTE))
+
+
+def _contacto_del_cliente(o, dist=None, es_admin=False) -> dict:
+    """Los datos de contacto del cliente, si quien pregunta puede verlos.
+
+    El admin siempre; el distribuidor sólo si tiene el interruptor encendido. Cuando no
+    puede, se devuelve el diccionario VACÍO en vez de las claves en blanco: así la
+    pantalla no puede «enseñar un campo vacío» y dar a entender que el dato no existe.
+    """
+    if not (es_admin or ve_datos_del_cliente(dist)):
+        return {}
+    c = o.get('customer') or {}
+    return {
+        'customer_full_name': c.get('full_name') or '',
+        'customer_email': c.get('email') or '',
+        'customer_phone': c.get('phone') or '',
+        'customer_address': c.get('address') or '',
+        'customer_address_2': c.get('address_2') or '',
+        'customer_city': c.get('city') or '',
+        'customer_state': c.get('state') or '',
+        'customer_postal_code': c.get('postal_code') or '',
+        'customer_country': c.get('country') or '',
+        'customer_notes': c.get('notes') or '',
+    }
 
 
 @api_router.get('/distributor/sales')
@@ -4936,12 +5052,17 @@ async def distributor_orders(dist=Depends(get_current_distributor)):
     pero nunca el margen interno del negocio.
     """
     orders = await _distributor_orders(dist)
+    abierto = ve_datos_del_cliente(dist)
     out = []
     for o in orders:
         c = o.get('customer') or {}
         # Privacidad (Christian 2026-07-23): NADA de correo, teléfono, domicilio,
         # ni qué compuestos compró su cliente. Solo lo necesario para dar
         # seguimiento: quién, cuánto, cómo pagó, en qué va el envío.
+        #
+        # ⛔ SALVO QUE TENGA EL INTERRUPTOR (Christián, 2026-07-31 — hoy sólo María).
+        # Ahí sí van los datos de contacto de SUS clientes, porque ella los atiende.
+        # El candado de «sólo sus pedidos» no se toca: lo aplica `_distributor_orders`.
         out.append({
             'order_number': o.get('order_number'),
             'created_at': o.get('created_at'),
@@ -4964,11 +5085,12 @@ async def distributor_orders(dist=Depends(get_current_distributor)):
             'shipped_at': o.get('shipped_at'),
             'delivered_at': o.get('delivered_at'),
             'eta': o.get('eta', ''),
+            **(_contacto_del_cliente(o, dist) if abierto else {}),
         })
     return out
 
 
-def _detalle_de_pedido(o, dist_id=None):
+def _detalle_de_pedido(o, dist_id=None, dist=None, es_admin=False):
     """El detalle de UN pedido para verlo en una ficha. `dist_id` = quién pregunta.
 
     Lleva lo que hace falta para responder "¿qué compró y qué pasó con su dinero?": los
@@ -5026,6 +5148,9 @@ def _detalle_de_pedido(o, dist_id=None):
         'delivered_at': o.get('delivered_at'),
         'eta': o.get('eta', ''),
         'my_commission': _my_amount(o, dist_id) if dist_id else None,
+        # Los datos de contacto sólo si quien pregunta puede verlos: el admin siempre,
+        # el distribuidor sólo con su interruptor encendido (hoy, sólo María).
+        **_contacto_del_cliente(o, dist, es_admin),
     }
 
 
@@ -5042,7 +5167,7 @@ async def distributor_order_detail(order_number: str, dist=Depends(get_current_d
         raise HTTPException(status_code=404, detail='Pedido no encontrado')
     if o.get('referred_by') != dist['id']:
         raise HTTPException(status_code=403, detail='Ese pedido no es tuyo')
-    return _detalle_de_pedido(o, dist['id'])
+    return _detalle_de_pedido(o, dist['id'], dist=dist)
 
 
 @api_router.put('/distributor/orders/{order_number}/shipping')
@@ -5078,7 +5203,7 @@ async def distributor_order_shipping(order_number: str, payload: DistributorShip
                                 tracking_url=payload.tracking_url)
     # El mismo camino del admin (mismo correo de rastreo al cliente), pero sin `status`.
     resultado = await _guardar_envio(o, envio, permitir_status=False)
-    return _detalle_de_pedido(resultado, dist['id'])
+    return _detalle_de_pedido(resultado, dist['id'], dist=dist)
 
 
 @api_router.get('/admin/orders/{order_number}/detalle')
@@ -5090,7 +5215,10 @@ async def admin_order_detail(order_number: str, admin=Depends(get_current_admin)
     o = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
     if not o:
         raise HTTPException(status_code=404, detail='Pedido no encontrado')
-    return _detalle_de_pedido(await _pedido_con_proveedores(o), o.get('referred_by'))
+    # `es_admin=True`: el admin ve los datos de contacto del cliente SIEMPRE, sin
+    # depender de ningún interruptor. El que se restringe es el distribuidor.
+    return _detalle_de_pedido(await _pedido_con_proveedores(o), o.get('referred_by'),
+                              es_admin=True)
 
 
 # ----------------- Protocolos: consumo y recompra -----------------
@@ -7304,6 +7432,40 @@ async def admin_set_personal_discount(user_id: str, payload: PersonalRate, admin
                      f'A partir de ahora tus compras llevan {round(rate * 100)}% de descuento, '
                      'sin necesidad de código.', link='/catalogo')
     return {'id': user_id, 'name': u.get('name'), 'personal_discount_rate': rate}
+
+
+class VeDatosCliente(BaseModel):
+    activo: bool
+
+
+@api_router.put('/admin/distributors/{user_id}/ve-datos-cliente')
+async def admin_set_ve_datos_cliente(user_id: str, payload: VeDatosCliente,
+                                     admin=Depends(get_current_admin)):
+    """Abre (o cierra) los datos de contacto de SUS clientes a UN distribuidor.
+
+    ⛔ POR QUÉ ES UN INTERRUPTOR Y NO UNA REGLA PARA TODOS. El 2026-07-23 Christián
+    ordenó que ningún distribuidor viera correo, teléfono ni domicilio de sus clientes.
+    El 2026-07-31 lo abrió para María —ella los atiende y necesita poder llamarles—
+    pero sólo para ella. Encender a otro es este clic, no un despliegue; y apagarlo
+    también, que es lo que hace que se pueda revertir sin tocar código.
+
+    Lo que este interruptor NO afloja: el candado de «sólo SUS clientes» (vive en el
+    servidor, no en la pantalla), el margen de la casa, y que el «ver como» del admin
+    siga siendo de sólo lectura.
+    """
+    u = await db.users.find_one({'id': user_id}, {'_id': 0, 'id': 1, 'name': 1, 'role': 1,
+                                                  'extra_roles': 1})
+    if not u:
+        raise HTTPException(status_code=404, detail='Usuario no encontrado')
+    roles = {u.get('role')} | set(u.get('extra_roles') or [])
+    if 'distributor' not in roles:
+        raise HTTPException(status_code=400,
+                            detail='Sólo aplica a distribuidores: el admin ya ve todo')
+    activo = bool(payload.activo)
+    await db.users.update_one({'id': user_id}, {'$set': {CAMPO_VE_CLIENTE: activo}})
+    logger.info('Privacidad: %s %s los datos de contacto de sus clientes para %s',
+                admin.get('email'), 'ABRIÓ' if activo else 'CERRÓ', u.get('name'))
+    return {'id': user_id, 'name': u.get('name'), CAMPO_VE_CLIENTE: activo}
 
 
 class GiftPoints(BaseModel):
