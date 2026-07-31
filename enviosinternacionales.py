@@ -48,6 +48,7 @@ segundo — el mismo de Skydropx, y por eso se conserva el mismo ritmo de consul
 import logging
 import os
 import time
+from urllib.parse import quote
 
 import requests
 
@@ -217,6 +218,28 @@ def etiqueta_por_rastreo(tracking_number: str) -> dict:
                         return guia
                 return guia
     return {}
+
+
+def rastrear(tracking_number: str, carrier_name: str = '') -> list:
+    """Los eventos de rastreo de una guía comprada AQUÍ. Espejo de `skydropx.rastrear`.
+
+    Misma ruta y mismo JSON —es la misma API con otro nombre—, así que la traducción
+    se reutiliza (`skydropx._eventos_del_json`) y lo único propio es el `_get`, que es
+    el que lleva las credenciales y el freno de peticiones de ESTA cuenta.
+
+    Igual que allá: nunca truena hacia arriba. Sin eventos, lista vacía.
+    """
+    tn = (tracking_number or '').strip()
+    if not tn or not enabled():
+        return []
+    ruta = f'/shipments/tracking?tracking_number={quote(tn)}'
+    if carrier_name:
+        ruta += f'&carrier_name={quote(carrier_name.strip().lower())}'
+    try:
+        return skydropx._eventos_del_json(_get(ruta))
+    except Exception as e:
+        logger.info('%s: rastreo %s sin eventos todavia (%s)', NOMBRE, tn, e)
+        return []
 
 
 def saldo() -> dict:

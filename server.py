@@ -78,6 +78,10 @@ import skydropx
 # (admin y distribuidor). Vive aparte porque trae sus propias rutas y su propio
 # candado de rol; ver etiquetas.py.
 import etiquetas
+# EL RASTREO DENTRO DE NUESTRA PÁGINA. La paquetería no se deja enmarcar
+# (`x-frame-options: SAMEORIGIN`), así que le pedimos los eventos a su API y los
+# pintamos nosotros. Vive aparte y sólo lee; ver rastreo.py.
+import rastreo
 from fastapi import Request
 
 
@@ -8487,6 +8491,8 @@ async def guardar_nota_de_cliente(client_id: str, payload: NotaDeCliente,
 app.include_router(api_router)
 # Las rutas del PDF de la guía traen su propio prefijo `/api` y sus propios candados.
 app.include_router(etiquetas.router)
+# El rastreo del pedido, público por número de pedido igual que la ficha.
+app.include_router(rastreo.router)
 
 
 app.add_middleware(

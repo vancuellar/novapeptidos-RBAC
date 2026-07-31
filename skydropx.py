@@ -31,6 +31,7 @@ llave de paquetería es un checkout que deja de vender.
 import logging
 import os
 import time
+from urllib.parse import quote
 
 import requests
 
@@ -209,6 +210,85 @@ def etiqueta_por_rastreo(tracking_number: str) -> dict:
                         return guia
                 return guia
     return {}
+
+
+# --------------------------------------------------------------- rastrear
+# ⛔ ORDEN DE CHRISTIÁN (2026-07-31): «quiero que el cliente rastree su pedido DENTRO de
+# exygenlabs.com, que vivan en nuestra página el mayor tiempo posible». Su primera idea
+# fue meter la página de FedEx en un marco (iframe); NO SE PUEDE, y no es cosa de
+# programarlo mejor: las paqueterías lo prohíben desde su servidor. Comprobado el
+# 2026-07-31 con `curl -I`:
+#
+#     https://www.fedex.com/wtrk/track/?trknbr=...
+#         x-frame-options: SAMEORIGIN
+#         content-security-policy: frame-ancestors 'self'
+#     https://rastreo3.estafeta.com/...
+#         x-frame-options: SAMEORIGIN
+#
+# Eso le dice al navegador «sólo FedEx puede enmarcarme»: dentro de exygenlabs.com el
+# marco sale EN BLANCO. La única salida honesta es la de este archivo: pedirle los
+# eventos a la API y pintarlos nosotros, con nuestra marca.
+#
+# La ruta está en su OpenAPI (`GET /shipments/tracking`) y devuelve los eventos que el
+# carrier reportó. Es la misma API en los dos proveedores —enviosinternacionales.com es
+# white-label de Skydropx—, así que la traducción del JSON vive AQUÍ y allá sólo se
+# cambia el `_get`. Un solo lugar que arreglar el día que cambie.
+def _eventos_del_json(data) -> list:
+    """Los eventos de rastreo, ya aplanados, de la respuesta cruda de la API.
+
+    Se acepta tanto `{'data': [...]}` como una lista pelona, y en cada fila tanto los
+    campos al ras como dentro de `attributes`: es JSON:API y el revendedor no siempre
+    contesta idéntico. Preferir lo de `attributes` y caer a la fila es más barato que
+    descubrir en vivo que un proveedor manda una forma y el otro la otra.
+    """
+    filas = data.get('data') if isinstance(data, dict) else data
+    if isinstance(filas, dict):        # un solo evento, sin lista
+        filas = [filas]
+    eventos = []
+    for fila in (filas or []):
+        if not isinstance(fila, dict):
+            continue
+        attrs = fila.get('attributes') if isinstance(fila.get('attributes'), dict) else {}
+        def campo(*nombres):
+            for n in nombres:
+                v = attrs.get(n) or fila.get(n)
+                if v:
+                    return str(v).strip()
+            return ''
+        descripcion = campo('event_description', 'description', 'status_description')
+        estado = campo('status', 'tracking_status', 'status_code')
+        fecha = campo('date', 'created_at', 'occurred_at', 'timestamp')
+        if not (descripcion or estado or fecha):
+            continue
+        eventos.append({'descripcion': descripcion,
+                        'lugar': campo('location', 'city', 'place'),
+                        'fecha': fecha,
+                        'estado': estado.lower()})
+    # Del más viejo al más nuevo: la línea de tiempo se lee hacia abajo. La API no
+    # promete orden, y ordenar por fecha de texto ISO funciona porque es ISO.
+    eventos.sort(key=lambda e: e['fecha'] or '')
+    return eventos
+
+
+def rastrear(tracking_number: str, carrier_name: str = '') -> list:
+    """Los eventos de rastreo de una guía. Lista vacía si no hay o si algo falla.
+
+    ⛔ NUNCA TRUENA HACIA ARRIBA. Que la paquetería no conteste no puede tumbar la
+    página del pedido: el cliente ya pagó y tiene derecho a ver su pedido aunque el
+    rastreo venga vacío. Un 404 aquí es lo NORMAL las primeras horas —la guía existe
+    pero el carrier todavía no reporta nada—, no una falla que valga la pena gritar.
+    """
+    tn = (tracking_number or '').strip()
+    if not tn or not enabled():
+        return []
+    ruta = f'/shipments/tracking?tracking_number={quote(tn)}'
+    if carrier_name:
+        ruta += f'&carrier_name={quote(carrier_name.strip().lower())}'
+    try:
+        return _eventos_del_json(_get(ruta))
+    except Exception as e:
+        logger.info('Rastreo %s: sin eventos todavia (%s)', tn, e)
+        return []
 
 
 # --------------------------------------------------------------- el saldo
