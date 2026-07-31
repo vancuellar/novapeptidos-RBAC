@@ -1,5 +1,5 @@
 from fastapi import FastAPI, APIRouter, Depends, HTTPException, Query, UploadFile, File
-from fastapi.responses import StreamingResponse, FileResponse, Response
+from fastapi.responses import StreamingResponse, FileResponse, Response, PlainTextResponse
 from starlette.middleware.cors import CORSMiddleware
 import os
 import base64
@@ -9,6 +9,10 @@ import random
 import string
 import re
 import json
+import io
+# `csv` a secas chocaría con el parámetro `csv=1` de /admin/envios/costo-real, que es
+# como se pide el export en ese formato. Se renombra el módulo, no el parámetro.
+import csv as csv_mod
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -66,6 +70,7 @@ import btcpay
 import mercadopago
 import nowpayments
 import envios
+import paqueterias
 import skydropx
 from fastapi import Request
 
@@ -1553,6 +1558,9 @@ async def admin_envios_config(admin=Depends(get_current_admin)):
     doc = await db[COLECCION_AJUSTES_ENVIO].find_one({'id': 'envios'}, {'_id': 0}) or {}
     return {
         'credenciales_puestas': skydropx.enabled(),
+        # Los DOS cotizadores y cuál está encendido. Las llaves nunca se devuelven:
+        # de ellas sólo se dice si están puestas (ver secretos.py).
+        'proveedores': paqueterias.encendidos(),
         'remitente': skydropx.remitente(),
         'remitente_completo': skydropx.remitente_configurado(),
         'remitente_origen': skydropx.origen_del_remitente(doc.get('remitente')),
@@ -1563,6 +1571,60 @@ async def admin_envios_config(admin=Depends(get_current_admin)):
         'cotiza_en_checkout': envios.COTIZAR_EN_CHECKOUT,
         'compra_guia_al_pagar': envios.COMPRAR_GUIA_AL_PAGAR,
     }
+
+
+@api_router.get('/admin/envios/costo-real')
+async def admin_costo_real_envio(csv: int = 0, admin=Depends(get_current_admin)):
+    """Lo que de VERDAD han costado las guías. Es lo que alimenta el piso de 5× del ROI.
+
+    ⛔ POR QUÉ EXISTE. El motor de precios medía el piso de 5× restando $250 de envío,
+    que NO es lo que cuesta una guía: son la tarifa plana de la política de cobro al
+    cliente. Una guía real anda en $139–$165 (medido en vivo el 2026-07-30). Con esta
+    ruta el motor deja de suponer: se exporta a `pricing-system/datos/envios_reales.csv`
+    y `actualizar_costo_envio.py` reescribe la regla con el dato de verdad.
+
+    ⛔ SÓLO ADMIN, y con razón: estos números son costos de la casa. Un costo en una ruta
+    pública es el margen del negocio publicado. Del cliente aquí no sale ni el nombre —
+    sólo pedido, ruta, peso y lo que costó la guía.
+    """
+    # Las guías REALMENTE compradas: un pedido con número de guía y un costo escrito.
+    pedidos = await db.orders.find(
+        {'tracking_number': {'$ne': ''}, 'shipping_cost': {'$gt': 0}},
+        {'_id': 0, 'order_number': 1, 'carrier': 1, 'shipping_service': 1,
+         'shipping_cost': 1, 'label_provider': 1, 'shipped_at': 1,
+         'shipping_quote': 1, 'customer': 1}).to_list(5000)
+    filas = []
+    for p in pedidos:
+        q = p.get('shipping_quote') or {}
+        filas.append({
+            'fecha': (p.get('shipped_at') or '')[:10],
+            'pedido': p.get('order_number') or '',
+            'proveedor': p.get('label_provider') or 'skydropx',
+            'paqueteria': p.get('carrier') or '',
+            'servicio': p.get('shipping_service') or q.get('service') or '',
+            'cp_origen': skydropx.cp_origen(),
+            'cp_destino': ((p.get('customer') or {}).get('postal_code') or ''),
+            'peso_kg': q.get('peso_kg') or (q.get('paquete') or {}).get('peso_kg') or '',
+            'costo_mxn': round(float(p.get('shipping_cost') or 0), 2),
+            'fuente': 'guia comprada',
+        })
+    costos = sorted(f['costo_mxn'] for f in filas)
+    resumen = {
+        'guias': len(costos),
+        'min_mxn': costos[0] if costos else None,
+        'max_mxn': costos[-1] if costos else None,
+        'promedio_mxn': round(sum(costos) / len(costos), 2) if costos else None,
+    }
+    if not csv:
+        return {'resumen': resumen, 'guias': filas}
+    # El CSV con las columnas EXACTAS que espera `pricing-system/datos/envios_reales.csv`.
+    columnas = ['fecha', 'pedido', 'proveedor', 'paqueteria', 'servicio', 'cp_origen',
+                'cp_destino', 'peso_kg', 'costo_mxn', 'fuente']
+    buf = io.StringIO()
+    w = csv_mod.DictWriter(buf, fieldnames=columnas)
+    w.writeheader()
+    w.writerows(filas)
+    return PlainTextResponse(buf.getvalue(), media_type='text/csv')
 
 
 @api_router.put('/admin/envios/remitente')
@@ -1633,17 +1695,23 @@ async def _paquete_real_del_pedido(order: dict) -> dict:
 
 @api_router.post('/admin/orders/{order_id}/cotizar-envio')
 async def admin_cotizar_envio(order_id: str, admin=Depends(get_current_admin)):
-    """Cuánto cuesta mandar ESTE pedido, de verdad, por cada paquetería.
+    """Cuánto cuesta mandar ESTE pedido, de verdad, en CADA proveedor y por paquetería.
 
-    Devuelve TODAS las tarifas con precio y días —no solo las tres que ve el
-    cliente— porque quien paga la guía es la casa y tiene derecho a ver la más
-    barata aunque tarde más. Guarda la cotización para que comprar sea un clic.
+    ⛔ DOBLE COTIZADOR (Christián, 2026-07-31). Se pregunta en Skydropx Y en
+    enviosinternacionales.com, se juntan todas las tarifas y se ordenan por precio: la
+    casa contrata la más barata, venga de quien venga. Si uno de los dos está apagado o
+    no contesta, se sigue con el otro exactamente como hasta hoy.
+
+    Devuelve TODAS las tarifas con precio y días —no solo las que ve el cliente— porque
+    quien paga la guía es la casa y tiene derecho a ver la más barata aunque tarde más.
+    Guarda la cotización para que comprar sea un clic.
     """
     order = await db.orders.find_one({'id': order_id}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail='Pedido no encontrado')
-    if not skydropx.enabled():
+    if not paqueterias.cuantos_activos():
         return {'enabled': False, 'options': [],
+                'proveedores': paqueterias.encendidos(),
                 'detail': 'Faltan SKYDROPX_CLIENT_ID y SKYDROPX_CLIENT_SECRET'}
     destino = _destino_del_pedido(order)
     cp = (destino.get('zip') or '').strip()
@@ -1652,32 +1720,47 @@ async def admin_cotizar_envio(order_id: str, admin=Depends(get_current_admin)):
     paquete = await _paquete_real_del_pedido(order)
     if not paquete['peso_kg']:
         return {'enabled': True, 'options': [], 'detail': 'El pedido no trae artículos'}
-    try:
-        cot = skydropx.cotizacion(destino, paquete,
-                                  espera_max=skydropx.ESPERA_MAX_GUIA_S, filtrar=False)
-    except Exception as e:
-        logger.exception('Skydropx: no se pudo cotizar el pedido %s', order.get('order_number'))
-        return {'enabled': True, 'options': [], 'detail': f'La paquetería no respondió: {e}'[:200]}
-    if not cot['opciones']:
+    comp = paqueterias.cotizar_en_todos(destino, paquete,
+                                        espera_max=skydropx.ESPERA_MAX_GUIA_S)
+    if not comp['opciones']:
+        # Nadie dio tarifa: se dice de cada proveedor por qué, en vez de un "no se pudo".
+        motivos = '; '.join(f"{p['nombre']}: {p['detalle']}"
+                            for p in comp['proveedores'] if p.get('detalle'))
         return {'enabled': True, 'options': [], 'paquete': paquete,
-                'detail': 'Sin tarifas para ese código postal'}
-    doc = await _guardar_cotizacion(cp, paquete, cot['opciones'])
-    # El id de la cotización de Skydropx se guarda con la nuestra: comprar la guía
-    # se hace contra el `rate_id` de ESA cotización y no de otra.
+                'proveedores': comp['proveedores'],
+                'detail': f'Sin tarifas para ese código postal. {motivos}'[:300]}
+    doc = await _guardar_cotizacion(cp, paquete, comp['opciones'])
+    # Los ids de cotización de CADA proveedor se guardan con la nuestra: la guía se
+    # compra contra el `rate_id` de ESA cotización y con ESE proveedor, no con el otro.
+    cots = comp.get('cotizaciones') or {}
     await db[COLECCION_COTIZACIONES].update_one(
-        {'id': doc['id']}, {'$set': {'order_id': order_id, 'skydropx_id': cot['id'],
-                                     'packages': cot.get('packages') or []}})
-    recomendada = min(cot['opciones'], key=lambda o: o['precio'])
+        {'id': doc['id']},
+        {'$set': {'order_id': order_id,
+                  'skydropx_id': (cots.get('skydropx') or {}).get('id', ''),
+                  'cotizaciones': cots,
+                  'packages': (cots.get('skydropx') or {}).get('packages') or []}})
+    recomendada = min(comp['opciones'], key=lambda o: o['precio'])
+    ahorro = paqueterias.ahorro(comp)
+    if ahorro['comparados'] > 1:
+        logger.info('Envio: doble cotizacion de %s — gana %s, se ahorran $%s',
+                    order.get('order_number'), ahorro['gana'], ahorro['ahorro_mxn'])
     return {
         'enabled': True,
         'quote_id': doc['id'],
         'paquete': paquete,
         'expires_at': doc['expires_at'],
         'remitente_completo': skydropx.remitente_configurado(),
-        'requiere_verificar_origen': cot.get('requiere_verificar_origen', False),
+        'requiere_verificar_origen': any(
+            (c or {}).get('requiere_verificar_origen') for c in cots.values()),
         'recomendada': recomendada['rate_id'],
+        # La comparación entre proveedores: cuántas tarifas dio cada uno, su mejor
+        # precio, y cuánto se ahorra por haber preguntado en dos lados.
+        'proveedores': comp['proveedores'],
+        'ahorro': ahorro,
         'options': [{'id': o['opcion_id'], 'carrier': o['paqueteria'],
                      'service': o['servicio'], 'days': o['dias'], 'price': o['precio'],
+                     'provider': o.get('proveedor', 'skydropx'),
+                     'provider_name': o.get('proveedor_nombre', 'Skydropx'),
                      'para_el_cliente': skydropx.permitida(o['paqueteria_id'])
                                         and skydropx.dentro_del_plazo(o['dias'])}
                     for o in doc['opciones']],
@@ -1699,7 +1782,7 @@ async def admin_comprar_guia(order_id: str, payload: ComprarGuiaRequest,
         raise HTTPException(status_code=404, detail='Pedido no encontrado')
     if order.get('tracking_number'):
         raise HTTPException(status_code=409, detail='Este pedido ya tiene guía')
-    if not skydropx.enabled():
+    if not paqueterias.cuantos_activos():
         raise HTTPException(status_code=400, detail='Faltan las credenciales de Skydropx')
     if not skydropx.remitente_configurado():
         raise HTTPException(status_code=400,
@@ -1720,11 +1803,14 @@ async def admin_comprar_guia(order_id: str, payload: ComprarGuiaRequest,
             numero_paquete = int(paquetes[0].get('package_number') or 1)
         except (TypeError, ValueError):
             numero_paquete = 1
+    # ⛔ CON EL PROVEEDOR QUE LA COTIZÓ. Un `rate_id` sólo vale en la casa que lo emitió:
+    # mandarlo al otro proveedor es un 404 en el mejor caso y una guía mal comprada en el
+    # peor. La etiqueta viaja pegada a la opción desde que se cotizó (ver paqueterias.py).
     try:
-        guia = skydropx.comprar_guia(opcion['rate_id'], _destino_del_pedido(order),
-                                     doc.get('paquete') or {}, numero_paquete)
+        guia = paqueterias.comprar_guia(opcion, _destino_del_pedido(order),
+                                        doc.get('paquete') or {}, numero_paquete)
     except Exception as e:
-        logger.exception('Skydropx: no se pudo comprar la guia de %s', order.get('order_number'))
+        logger.exception('Envio: no se pudo comprar la guia de %s', order.get('order_number'))
         await db.orders.update_one({'id': order_id}, {'$set': {'label_error': str(e)[:300]}})
         raise HTTPException(status_code=502, detail=f'La paquetería no dio la guía: {e}'[:200])
     numero = guia.get('tracking_number') or ''
@@ -1734,7 +1820,8 @@ async def admin_comprar_guia(order_id: str, payload: ComprarGuiaRequest,
         'tracking_number': numero,
         'tracking_url': guia.get('tracking_url') or build_tracking_url(carrier, numero),
         'label_url': guia.get('label_url') or '',
-        'label_provider': 'skydropx',
+        # Con quién se compró: es lo que después permite reclamarle a la casa correcta.
+        'label_provider': guia.get('proveedor') or opcion.get('proveedor') or 'skydropx',
         'label_error': '',
         'shipping_cost': opcion.get('precio') or 0,
         'shipping_service': opcion.get('servicio') or '',
@@ -1742,8 +1829,9 @@ async def admin_comprar_guia(order_id: str, payload: ComprarGuiaRequest,
         'status': 'enviado',
     }
     await db.orders.update_one({'id': order_id}, {'$set': update})
-    logger.info('Envio: guia comprada a mano para %s — %s %s por $%s',
-                order.get('order_number'), carrier, numero, update['shipping_cost'])
+    logger.info('Envio: guia comprada a mano para %s — %s %s por $%s (via %s)',
+                order.get('order_number'), carrier, numero, update['shipping_cost'],
+                update['label_provider'])
     fresco = await db.orders.find_one({'id': order_id}, {'_id': 0})
     await avisar_del_envio(fresco)
     return fresco
@@ -1786,9 +1874,10 @@ async def comprar_guia_del_pedido(order: dict) -> dict | None:
         return None
     if not order or order.get('tracking_number'):
         return None                     # ya tiene guía: no se compra dos veces
-    if not skydropx.enabled():
-        logger.info('Envio: no se compra guia de %s porque faltan las credenciales '
-                    'de Skydropx PRO (SKYDROPX_CLIENT_ID / SKYDROPX_CLIENT_SECRET)',
+    if not paqueterias.cuantos_activos():
+        logger.info('Envio: no se compra guia de %s porque ningun proveedor de '
+                    'paqueteria tiene credenciales (SKYDROPX_CLIENT_ID / '
+                    'SKYDROPX_CLIENT_SECRET, o los de enviosinternacionales)',
                     order.get('order_number'))
         return None
     if not skydropx.remitente_configurado():
@@ -1812,9 +1901,11 @@ async def comprar_guia_del_pedido(order: dict) -> dict | None:
     quote = order.get('shipping_quote') or {}
     paquete = quote.get('paquete') or envios.paquete_del_pedido(order.get('items') or [], {})
     try:
-        guia = skydropx.guia_para(destino, paquete, quote.get('service_code', ''))
+        # Doble cotizador: pregunta en Skydropx y en enviosinternacionales.com y compra
+        # la más barata de las permitidas. Con uno solo encendido se comporta como antes.
+        guia = paqueterias.guia_para(destino, paquete, quote.get('service_code', ''))
     except Exception as e:
-        logger.exception('Skydropx: no se pudo comprar la guia de %s', order.get('order_number'))
+        logger.exception('Envio: no se pudo comprar la guia de %s', order.get('order_number'))
         await db.orders.update_one({'id': order['id']}, {'$set': {'label_error': str(e)[:300]}})
         return None
     numero = guia.get('tracking_number') or ''
@@ -1823,15 +1914,16 @@ async def comprar_guia_del_pedido(order: dict) -> dict | None:
         'tracking_number': numero,
         'tracking_url': guia.get('tracking_url') or build_tracking_url(guia.get('carrier', ''), numero),
         'label_url': guia.get('label_url') or '',
-        'label_provider': 'skydropx',
+        'label_provider': guia.get('proveedor') or 'skydropx',
         'label_error': '',
         'shipping_cost': guia.get('costo') or quote.get('cost') or 0,
         'shipped_at': order.get('shipped_at') or now_iso(),
         'status': 'enviado',
     }
     await db.orders.update_one({'id': order['id']}, {'$set': update})
-    logger.info('Envio: guia comprada para %s — %s %s',
-                order.get('order_number'), update['carrier'], numero)
+    logger.info('Envio: guia comprada para %s — %s %s (via %s)',
+                order.get('order_number'), update['carrier'], numero,
+                update['label_provider'])
     # El cliente se entera por correo, no entrando a buscar. Se le manda el pedido ya
     # actualizado: con el de antes iría sin número de guía, que es justo lo que avisa.
     await avisar_del_envio(dict(order, **update))

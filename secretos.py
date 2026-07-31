@@ -43,6 +43,12 @@ PERMITIDAS = {
     # `SKYDROPX_API_KEY` era de la API anterior y ya no sirve para nada.
     'SKYDROPX_CLIENT_ID',
     'SKYDROPX_CLIENT_SECRET',
+    # El SEGUNDO cotizador de guías (enviosinternacionales.com, revendedor de Skydropx).
+    # Christián decidió el 2026-07-31 cotizar en los dos lados y contratar el más barato.
+    # ⛔ Mientras no se peguen, `enviosinternacionales.enabled()` es False y todo el sitio
+    # se comporta igual que hoy: se cotiza y se compra sólo con Skydropx.
+    'ENVIOSINT_CLIENT_ID',
+    'ENVIOSINT_CLIENT_SECRET',
 }
 
 
