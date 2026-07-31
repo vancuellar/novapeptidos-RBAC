@@ -1408,6 +1408,38 @@ def test_capturar_la_guia_A_MANO_tambien_le_avisa_al_cliente(db, monkeypatch):
     assert avisados == ['ABC123']
 
 
+def test_la_guia_capturada_SIN_paqueteria_la_deduce_el_servidor(db, monkeypatch):
+    """⛔ UNA GUÍA SIN PAQUETERÍA NO SE PUEDE RASTREAR (Christián, 2026-07-31).
+
+    La pantalla que captura guías ya adivina la paquetería mientras se teclea, pero
+    esta ruta se puede llamar sin pasar por ahí —el distribuidor, un script, la app de
+    mañana— y entonces el pedido queda con número y sin transportista: ni liga de
+    rastreo, ni eventos, ni forma de saber a quién preguntarle. El servidor la deduce
+    del propio número, que es exactamente lo que hace la pantalla (`guias.py`).
+    """
+    monkeypatch.setattr(server, 'avisar_del_envio', lambda o: _async_nada())
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    from models import OrderShippingUpdate
+    # 12 dígitos: FedEx y sólo FedEx. Sin `carrier` en el cuerpo, a propósito.
+    asyncio.run(server.update_order_shipping('o1', OrderShippingUpdate(
+        tracking_number='875122824121'), admin=_admin()))
+    guardado = asyncio.run(db.orders.find_one({'id': 'o1'}))
+    assert guardado['carrier'] == 'FedEx'
+    # Y con paquetería ya hay liga a dónde mandar al cliente.
+    assert guardado['tracking_url'].startswith('https://www.fedex.com/')
+
+
+def test_lo_que_SI_capturaron_a_mano_manda_sobre_la_deduccion(db, monkeypatch):
+    """La deducción sólo rellena huecos. Si quien captura eligió la paquetería —porque
+    sabe algo que el formato no dice— no se le corrige."""
+    monkeypatch.setattr(server, 'avisar_del_envio', lambda o: _async_nada())
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    from models import OrderShippingUpdate
+    asyncio.run(server.update_order_shipping('o1', OrderShippingUpdate(
+        carrier='DHL', tracking_number='875122824121'), admin=_admin()))
+    assert asyncio.run(db.orders.find_one({'id': 'o1'}))['carrier'] == 'DHL'
+
+
 def test_el_correo_del_rastreo_existe_en_los_TRES_idiomas():
     import emails
     for lang in ('es', 'en', 'pt'):

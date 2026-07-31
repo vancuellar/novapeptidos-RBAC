@@ -73,6 +73,26 @@ BRENDA = {
 SIN_GUIA = {'id': 'o-sin', 'order_number': 'EX-20260731-0001', 'status': 'pagado',
             'carrier': '', 'tracking_number': '', 'label_provider': ''}
 
+# ⛔ EL PEDIDO REAL DE AIDEE (2026-07-30), el que destapó el hueco. Guía de FedEx pero
+# `label_provider` VACÍO: esa guía se compró a mano, en el mostrador, fuera del sistema.
+# Como el rastreo decidía a quién preguntarle SÓLO por ese campo, se quedaba mudo.
+AIDEE = {
+    'id': 'o-aidee', 'order_number': 'EX-20260730-2906', 'status': 'enviado',
+    'carrier': 'FedEx', 'tracking_number': '875122824121',
+    'tracking_url': 'https://www.fedex.com/fedextrack/?trknbr=875122824121',
+    'shipped_at': '2026-07-30T22:31:11',
+    # Texto libre, capturado a mano: NO es una fecha.
+    'eta': '2 - 5 dias habiles',
+    'label_provider': '',
+    'customer': {'full_name': 'aidee liliana garcia hernandez'},
+}
+
+# Y el caso hermano: guía capturada a mano a la que NADIE le puso paquetería.
+SIN_PAQUETERIA = {
+    'id': 'o-nc', 'order_number': 'EX-20260731-0002', 'status': 'enviado',
+    'carrier': '', 'tracking_number': '875122824121', 'label_provider': '',
+}
+
 
 def _evento(estado, descripcion, lugar, fecha):
     return {'estado': estado, 'descripcion': descripcion, 'lugar': lugar, 'fecha': fecha}
@@ -90,6 +110,7 @@ EVENTOS = [
 class _Coll:
     def __init__(self, docs=()):
         self._docs = list(docs)
+        self.escrituras = []
 
     async def find_one(self, filtro=None, *a, **k):
         for d in self._docs:
@@ -97,11 +118,18 @@ class _Coll:
                 return dict(d)
         return None
 
+    async def update_one(self, filtro, cambio, *a, **k):
+        self.escrituras.append((filtro, cambio))
+        for d in self._docs:
+            if all(d.get(k2) == v for k2, v in (filtro or {}).items()):
+                d.update((cambio or {}).get('$set') or {})
+        return None
+
 
 class _FakeDB:
     def __init__(self):
         import copy
-        self.orders = _Coll(copy.deepcopy([BRENDA, SIN_GUIA]))
+        self.orders = _Coll(copy.deepcopy([BRENDA, SIN_GUIA, AIDEE, SIN_PAQUETERIA]))
 
     def __getattr__(self, nombre):
         return _Coll()
@@ -135,6 +163,13 @@ def mundo(monkeypatch):
     monkeypatch.setattr(rastreo, 'db', db)
     proveedores = {}
     monkeypatch.setattr(rastreo.paqueterias, 'modulo', lambda c: proveedores.get(c))
+    # ⛔ `encendidos()` también se finge. Es lo que recorre el rastreo cuando NO sabe
+    # con quién se compró la guía (el caso de Aidee); si se dejara el de verdad, en las
+    # pruebas contestaría «ninguno activo» —no hay credenciales— y el hueco que este
+    # archivo cuida quedaría sin probar. El orden es el mismo que en producción.
+    monkeypatch.setattr(rastreo.paqueterias, 'encendidos', lambda: [
+        {'clave': c, 'nombre': c, 'activo': bool(proveedores[c].enabled())}
+        for c in ('skydropx', 'enviosinternacionales') if c in proveedores])
 
     class Mundo:
         pass
@@ -169,7 +204,7 @@ def test_solo_salen_los_campos_de_la_lista_blanca(mundo):
     d = mundo.cliente.get('/api/orders/EX-20260730-5930/rastreo').json()
     assert set(d) == {'numero', 'paqueteria', 'rastreo', 'url_paqueteria', 'paso',
                       'incidencia', 'entrega_estimada', 'enviado_en', 'entregado_en',
-                      'eventos'}
+                      'eventos', 'detalle_disponible'}
 
 
 def test_si_sale_lo_que_el_cliente_si_debe_ver(mundo):
@@ -215,6 +250,97 @@ def test_se_le_pregunta_al_proveedor_que_compro_la_guia(mundo):
     mundo.cliente.get('/api/orders/EX-20260730-5930/rastreo')
     assert ei.preguntas == [('875164874865', 'FedEx')]
     assert sky.preguntas == []
+
+
+# =========================================================================
+#  2 bis. EL HUECO DE AIDEE: guía sin `label_provider`
+# =========================================================================
+def test_sin_saber_quien_vendio_la_guia_se_le_pregunta_a_TODOS(mundo):
+    """⛔ EL HUECO QUE ENCONTRÓ CHRISTIÁN (2026-07-31). El pedido de Aidee tenía guía de
+    FedEx y `label_provider` vacío —comprada a mano, fuera del sistema— y como el
+    rastreo decidía a quién preguntarle SÓLO por ese campo, no le preguntaba a nadie y
+    la línea de tiempo se quedaba sin eventos.
+
+    Ahora, sin proveedor, se le pregunta a todos los encendidos por número de guía.
+    """
+    sky, ei = _Paqueteria([]), _Paqueteria(EVENTOS)
+    mundo.proveedores['skydropx'], mundo.proveedores['enviosinternacionales'] = sky, ei
+    d = mundo.cliente.get('/api/orders/EX-20260730-2906/rastreo').json()
+    assert [e['estado'] for e in d['eventos']] == ['created', 'picked_up', 'in_transit']
+    # Se les preguntó a los dos: al primero no la conocía, el segundo sí.
+    assert sky.preguntas == [('875122824121', 'FedEx')]
+    assert ei.preguntas == [('875122824121', 'FedEx')]
+
+
+def test_el_pedido_se_repara_solo_la_primera_vez(mundo):
+    """Se aprende de la primera vez: si alguien contesta, queda escrito con quién era.
+    La próxima consulta es tiro directo y no vuelve a recorrer a todos."""
+    mundo.proveedores['skydropx'] = _Paqueteria([])
+    mundo.proveedores['enviosinternacionales'] = _Paqueteria(EVENTOS)
+    mundo.cliente.get('/api/orders/EX-20260730-2906/rastreo')
+    escrituras = mundo.db.orders.escrituras
+    assert escrituras, 'no se anotó con quién era la guía'
+    assert escrituras[0][1]['$set']['label_provider'] == 'enviosinternacionales'
+
+
+def test_con_proveedor_conocido_NO_se_molesta_a_los_demas(mundo):
+    """Saber con quién se compró vale una llamada menos. El de Brenda sí lo trae."""
+    sky, ei = _Paqueteria(EVENTOS), _Paqueteria(EVENTOS)
+    mundo.proveedores['skydropx'], mundo.proveedores['enviosinternacionales'] = sky, ei
+    mundo.cliente.get('/api/orders/EX-20260730-5930/rastreo')
+    assert ei.preguntas and sky.preguntas == []
+    # Y no se reescribe lo que ya estaba bien.
+    assert mundo.db.orders.escrituras == []
+
+
+def test_la_guia_que_NADIE_conoce_no_deja_la_pagina_rota(mundo):
+    """⛔ LA GUÍA DE AIDEE NO ESTÁ EN NINGUNA PLATAFORMA. Se compró directo en el
+    mostrador de FedEx (comprobado el 2026-07-31 preguntándole a las dos APIs), y del
+    sitio público de FedEx no se pueden sacar los eventos: bloquea a todo lo que no sea
+    un navegador de verdad.
+
+    Eso NO puede verse como una falla. La guía, la paquetería y la liga siguen ahí, y
+    la pantalla dice la verdad con `detalle_disponible: false`.
+    """
+    mundo.proveedores['skydropx'] = _Paqueteria([])
+    mundo.proveedores['enviosinternacionales'] = _Paqueteria([])
+    r = mundo.cliente.get('/api/orders/EX-20260730-2906/rastreo')
+    assert r.status_code == 200
+    d = r.json()
+    assert d['eventos'] == []
+    assert d['detalle_disponible'] is False
+    # Lo que el cliente SÍ necesita sigue completo.
+    assert d['rastreo'] == '875122824121'
+    assert d['paqueteria'] == 'FedEx'
+    assert d['url_paqueteria'].startswith('https://www.fedex.com/')
+    assert d['paso'] == 'transito'          # el pedido está 'enviado'
+    # Y no se anota un proveedor falso sólo por haber preguntado.
+    assert mundo.db.orders.escrituras == []
+
+
+def test_con_eventos_el_detalle_SI_esta_disponible(mundo):
+    mundo.proveedores['enviosinternacionales'] = _Paqueteria(EVENTOS)
+    d = mundo.cliente.get('/api/orders/EX-20260730-5930/rastreo').json()
+    assert d['detalle_disponible'] is True
+
+
+def test_la_paqueteria_se_deduce_del_numero_si_nadie_la_capturo(mundo):
+    """Una guía sin paquetería deja al cliente sin saber ni a quién preguntarle. Se
+    deduce del propio número (`guias.py`), que es lo mismo que hace la pantalla."""
+    mundo.proveedores['skydropx'] = _Paqueteria([])
+    d = mundo.cliente.get('/api/orders/EX-20260731-0002/rastreo').json()
+    assert d['paqueteria'] == 'FedEx'
+
+
+def test_la_vuelta_a_todos_los_proveedores_se_hace_UNA_vez(mundo):
+    """La caché es por GUÍA, no por proveedor: si no, cada recarga de un pedido sin
+    proveedor recorrería a TODAS las plataformas y se comería la cuota del despacho."""
+    sky = _Paqueteria([])
+    mundo.proveedores['skydropx'] = sky
+    mundo.proveedores['enviosinternacionales'] = _Paqueteria([])
+    for _ in range(15):
+        mundo.cliente.get('/api/orders/EX-20260730-2906/rastreo')
+    assert len(sky.preguntas) == 1
 
 
 # =========================================================================

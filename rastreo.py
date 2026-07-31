@@ -57,6 +57,7 @@ import time
 
 from fastapi import APIRouter, HTTPException
 
+import guias
 import paqueterias
 from database import db
 
@@ -167,32 +168,65 @@ def _guardar(clave: str, valor) -> None:
                     _CACHE.pop(k, None)
 
 
-def eventos_de(proveedor: str, tracking_number: str, carrier: str = '') -> list:
-    """Los eventos del carrier, de la caché o de la API. BLOQUEA: sale a la red.
-
-    ⛔ NUNCA TRUENA. Si la paquetería no contesta se devuelve lista vacía y la página
-    enseña la línea de tiempo con lo que la casa sí sabe. El cliente ya pagó: tiene
-    derecho a ver su pedido aunque FedEx tenga un mal día.
-    """
-    tn = (tracking_number or '').strip()
-    if not tn:
-        return []
-    clave = f'{proveedor or "skydropx"}|{tn}'
-    guardado = _guardado(clave)
-    if guardado is not None:
-        return guardado
-    mod = paqueterias.modulo(proveedor or 'skydropx')
+def _preguntarle_a(clave_proveedor: str, tn: str, carrier: str) -> list:
+    """Los eventos según UN proveedor. Lista vacía si está apagado o no la conoce."""
+    mod = paqueterias.modulo(clave_proveedor)
     if mod is None or not mod.enabled():
         return []
     try:
-        eventos = mod.rastrear(tn, carrier) or []
-    except Exception as e:            # cinturón: `rastrear` ya no debería dejar pasar nada
-        logger.warning('Rastreo: %s no pudo con la guia %s: %s', proveedor, tn, e)
-        eventos = []
-    # Se guarda incluso la lista vacía, y a propósito: el caso de «todavía no hay
-    # eventos» es justo el que más se recarga, y es el que más cuota gastaría.
-    _guardar(clave, eventos)
-    return eventos
+        return mod.rastrear(tn, carrier) or []
+    except Exception as e:        # cinturón: `rastrear` ya no debería dejar pasar nada
+        logger.warning('Rastreo: %s no pudo con la guia %s: %s', clave_proveedor, tn, e)
+        return []
+
+
+def eventos_de(proveedor: str, tracking_number: str, carrier: str = '') -> tuple:
+    """`(eventos, proveedor_que_contesto)`. De la caché o de la API. BLOQUEA: sale a la red.
+
+    ⛔ SIN `label_provider` NO SE RINDE (Christián, 2026-07-31: «el rastreo también debe
+    aplicar para Aidee y para todos los futuros clientes»). El pedido de Aidee tenía guía
+    de FedEx y `label_provider` VACÍO —esa guía se compró a mano, fuera del sistema— y
+    como esto decidía a quién preguntarle SÓLO por ese campo, se quedaba mudo.
+
+    Ahora, si no se sabe con quién se compró, se le pregunta a TODOS los proveedores
+    encendidos por número de guía. Gana el primero que conteste con eventos. Cuesta una
+    llamada de más una sola vez: en cuanto alguien contesta, se le escribe el
+    `label_provider` al pedido y la próxima vez es tiro directo (ver `rastreo_del_pedido`).
+
+    ⛔ Y SI NADIE LA CONOCE, SE ACEPTA. La guía de Aidee no está en Skydropx ni en
+    Envíos Internacionales: se compró directo en el mostrador de FedEx (comprobado el
+    2026-07-31 preguntándole a las dos APIs). No hay a quién más preguntarle —el sitio
+    público de FedEx bloquea a todo lo que no sea un navegador de verdad (503 de Akamai)—
+    así que la página lo dice honestamente en vez de fingir una falla.
+
+    ⛔ NUNCA TRUENA. El cliente ya pagó: tiene derecho a ver su pedido aunque la
+    paquetería tenga un mal día.
+    """
+    tn = (tracking_number or '').strip()
+    if not tn:
+        return [], ''
+    # La caché se guarda por GUÍA, no por proveedor: la misma guía da la misma respuesta
+    # venga de donde venga, y así el rastreo sin proveedor también aprovecha lo guardado.
+    guardado = _guardado(tn)
+    if guardado is not None:
+        return guardado
+    if proveedor:
+        resultado = (_preguntarle_a(proveedor, tn, carrier), proveedor)
+    else:
+        # Sin proveedor: se recorren los encendidos hasta que uno conteste.
+        resultado = ([], '')
+        for p in paqueterias.encendidos():
+            if not p['activo']:
+                continue
+            eventos = _preguntarle_a(p['clave'], tn, carrier)
+            if eventos:
+                resultado = (eventos, p['clave'])
+                break
+    # Se guarda incluso la respuesta vacía, y a propósito: el caso de «todavía no hay
+    # eventos» es justo el que más se recarga, y es el que más cuota gastaría. Y en el
+    # caso sin proveedor evita repetir la vuelta completa a todos los proveedores.
+    _guardar(tn, resultado)
+    return resultado
 
 
 def ficha_publica(order: dict, eventos: list) -> dict:
@@ -204,10 +238,14 @@ def ficha_publica(order: dict, eventos: list) -> dict:
     escribirlo aquí a mano. `label_provider`, `shipping_cost`, `referred_by` y compañía
     no están, y no pueden colarse solos.
     """
+    numero_guia = order.get('tracking_number') or ''
     return {
         'numero': order.get('order_number') or '',
-        'paqueteria': order.get('carrier') or '',
-        'rastreo': order.get('tracking_number') or '',
+        # Si nadie capturó la paquetería, se deduce del propio número de guía. Un
+        # pedido con guía pero sin paquetería deja al cliente sin saber ni a quién
+        # le está preguntando por su paquete.
+        'paqueteria': order.get('carrier') or guias.paqueteria_de(numero_guia),
+        'rastreo': numero_guia,
         # La liga al sitio de la paquetería va discreta, abajo de todo. No se esconde
         # —quien la quiera la tiene— pero deja de ser la protagonista.
         'url_paqueteria': order.get('tracking_url') or '',
@@ -217,6 +255,12 @@ def ficha_publica(order: dict, eventos: list) -> dict:
         'enviado_en': order.get('shipped_at') or '',
         'entregado_en': order.get('delivered_at') or '',
         'eventos': eventos,
+        # ⛔ LA DIFERENCIA ENTRE «NO HAY NADA QUE CONTAR» Y «NO PODEMOS CONTARLO».
+        # Hay guías que no se compraron por ninguna plataforma (la de Aidee se compró
+        # a mano en el mostrador) y de ésas NUNCA vamos a tener el detalle. La pantalla
+        # necesita saberlo para decir la verdad —«el detalle aún no está disponible»,
+        # con su guía y su liga— en vez de enseñar un hueco que parece una falla.
+        'detalle_disponible': bool(eventos),
     }
 
 
@@ -241,6 +285,19 @@ async def rastreo_del_pedido(order_number: str):
         # Todavía no hay guía: el pedido existe y va en camino de salir. No es 404 —el
         # pedido SÍ está— y la pantalla lo pinta como «preparando tu pedido».
         return ficha_publica(order, [])
-    eventos = await asyncio.to_thread(
-        eventos_de, order.get('label_provider') or '', numero, order.get('carrier') or '')
+    proveedor = order.get('label_provider') or ''
+    # Si falta la paquetería, se deduce del número para poder preguntar bien: la API
+    # quiere el nombre del carrier junto con la guía.
+    carrier = order.get('carrier') or guias.paqueteria_de(numero)
+    eventos, quien_contesto = await asyncio.to_thread(
+        eventos_de, proveedor, numero, carrier)
+    # ⛔ SE APRENDE DE LA PRIMERA VEZ. Si no sabíamos con quién se compró la guía y
+    # alguien contestó, queda escrito: la próxima consulta es tiro directo y no vuelve
+    # a recorrer a todos los proveedores. El pedido se repara solo, sin que nadie tenga
+    # que acordarse de hacerlo a mano.
+    if quien_contesto and not proveedor:
+        await db.orders.update_one({'id': order.get('id')},
+                                   {'$set': {'label_provider': quien_contesto}})
+        logger.info('Rastreo: el pedido %s era de %s; queda anotado',
+                    order.get('order_number'), quien_contesto)
     return ficha_publica(order, eventos)

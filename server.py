@@ -86,6 +86,9 @@ import skydropx
 # (admin y distribuidor). Vive aparte porque trae sus propias rutas y su propio
 # candado de rol; ver etiquetas.py.
 import etiquetas
+# De que paqueteria es un numero de guia. Gemelo de la deteccion de la pantalla
+# (src/lib/paqueteria.js); ver guias.py.
+import guias
 # EL RASTREO DENTRO DE NUESTRA PÁGINA. La paquetería no se deja enmarcar
 # (`x-frame-options: SAMEORIGIN`), así que le pedimos los eventos a su API y los
 # pintamos nosotros. Vive aparte y sólo lee; ver rastreo.py.
@@ -4158,6 +4161,19 @@ async def _guardar_envio(order: dict, payload: OrderShippingUpdate, *,
             update[field] = value.strip()
     carrier = update.get('carrier', order.get('carrier', ''))
     number = update.get('tracking_number', order.get('tracking_number', ''))
+    # ⛔ UNA GUÍA SIN PAQUETERÍA NO SE PUEDE RASTREAR (Christián, 2026-07-31). La
+    # pantalla que captura guías ya la adivina mientras se teclea, pero esta ruta se
+    # puede llamar sin pasar por ahí —el distribuidor, un script, la app de mañana— y
+    # entonces el pedido queda con número y sin transportista: ni liga de rastreo, ni
+    # eventos, ni forma de saber a quién preguntarle. Se deduce del propio número
+    # (`guias.py`, el gemelo de la detección de la pantalla). Lo que SÍ venga capturado
+    # manda siempre: esto sólo rellena el hueco.
+    if number and not carrier:
+        carrier = guias.paqueteria_de(number)
+        if carrier:
+            update['carrier'] = carrier
+            logger.info('Envio: la guia %s no traia paqueteria; se dedujo %s',
+                        number, carrier)
     if not update.get('tracking_url') and number:
         auto = build_tracking_url(carrier, number)
         if auto:
