@@ -206,12 +206,19 @@ def test_repurchase_threshold_is_the_documented_one():
 def test_distributor_code_is_alphanumeric_and_prefixed():
     code = gen_distributor_code('Farmacia Ñandú 3000')
     prefix, _, digits = code.partition('-')
-    assert prefix.isalnum() and len(prefix) <= 4
+    assert prefix == 'MONICAF' and prefix.isalnum()
     assert digits.isdigit() and len(digits) == 4
 
 
-def test_distributor_code_falls_back_when_the_name_has_no_letters():
-    assert gen_distributor_code('!!! ???').startswith('DIST-')
+def test_el_codigo_unico_tampoco_lleva_el_nombre():
+    """El hermano olvidado del `gen_discount_code`: vive en `users.distributor_code`
+    y `_resolve_code` cae a él. Era `MARI-3537` / `ALAN-2292` / `JAVI-7116`."""
+    for nombre in ('!!! ???', 'Maria Neunfeld', 'Alanis Fernanda Mendoza',
+                   'Javier Rojo Mortera', 'Farmacia Ñandú 3000'):
+        code = gen_distributor_code(nombre)
+        assert code.startswith('MONICAF-'), code
+        for delator in ('MARI', 'ALAN', 'JAVI', 'FARM'):
+            assert delator not in code
 
 
 def test_distributor_rollup_excludes_cancelled_orders():
@@ -838,9 +845,9 @@ from server import gen_discount_code
 def test_discount_code_is_opaque_with_random_suffix():
     import re
     c = gen_discount_code('Maria Lopez', 0.25)
-    assert re.fullmatch(r'MARIAL-25-[A-Z0-9]{4}', c), c   # PREFIJO-PCT-XXXX opaco
+    assert re.fullmatch(r'MONICAF-25-[A-Z0-9]{4}', c), c   # MONICAF-PCT-XXXX opaco
     parts = c.split('-')
-    assert parts[0] == 'MARIAL' and parts[1] == '25' and len(parts[2]) == 4
+    assert parts[0] == 'MONICAF' and parts[1] == '25' and len(parts[2]) == 4
 
 
 def test_discount_codes_differ_each_time():
@@ -849,8 +856,23 @@ def test_discount_codes_differ_each_time():
     assert a != b                            # el sufijo al azar los hace únicos
 
 
-def test_discount_code_falls_back_prefix_when_no_letters():
-    assert gen_discount_code('!!!', 0.20).startswith('DIST-20-')
+def test_el_codigo_nunca_lleva_el_nombre_del_distribuidor():
+    """La orden del 31-jul, en una prueba: ni un pedazo del nombre en el texto.
+
+    Dos distribuidores distintos tienen que producir el MISMO prefijo. Si algún día
+    alguien devuelve el nombre al generador, aquí truena: no basta con que 'MARIA' no
+    aparezca, es que los dos códigos tienen que ser indistinguibles salvo por el azar."""
+    a = gen_discount_code('Maria Neunfeld', 0.15)
+    b = gen_discount_code('Javier Zavala', 0.15)
+    assert a.rsplit('-', 1)[0] == b.rsplit('-', 1)[0] == 'MONICAF-15'
+    for delator in ('MARIA', 'MARIAN', 'NEUNFELD', 'JAVIER', 'ZAVALA', 'ALANIS'):
+        assert delator not in a and delator not in b
+
+
+def test_discount_code_prefix_does_not_depend_on_the_name():
+    # Sin nombre, con basura o con acentos: siempre el mismo prefijo de la casa.
+    for nombre in ('!!!', None, '', 'Mónica', 'Alanis Guerra'):
+        assert gen_discount_code(nombre, 0.20).startswith('MONICAF-20-')
 
 
 # ---------- Niveles de descuento auto por comisión ----------

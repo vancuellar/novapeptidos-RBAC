@@ -130,16 +130,37 @@ def gen_order_number():
     return 'EX-' + datetime.now().strftime('%Y%m%d') + '-' + str(random.randint(1000, 9999))
 
 
+# El prefijo de TODOS los códigos de descuento: quien atiende al cliente, y nadie más.
+# Es `emails.ATENCION_NOMBRE` ('Mónica Flores') escrito como se escribe un código.
+PREFIJO_CODIGO = 'MONICAF'
+
+
 def gen_distributor_code(name: str) -> str:
-    base = ''.join(c for c in name.upper() if c.isalnum())[:4] or 'DIST'
-    return base + '-' + str(random.randint(1000, 9999))
+    """El código ÚNICO (legacy) del distribuidor: MONICAF-NNNN.
+
+    ⛔ TAMPOCO SALE YA DEL NOMBRE (Christián, 2026-07-31). Era `MARI-3537`,
+    `ALAN-2292`, `JAVI-7116`: cuatro letras del nombre y a la vista del cliente.
+    Es el HERMANO OLVIDADO de `gen_discount_code` —vive en `users.distributor_code`,
+    no en `discount_codes`, y `_resolve_code` cae a él cuando el texto no está en la
+    colección—, así que cambiar sólo el otro habría dejado la mitad de la fuga en pie.
+    `name` se conserva en la firma por los ocho llamadores y NO SE USA a propósito."""
+    return PREFIJO_CODIGO + '-' + str(random.randint(1000, 9999))
 
 
 async def resolve_distributor(code):
-    """Devuelve el distribuidor (dict) para un codigo dado, o None."""
+    """Devuelve el distribuidor (dict) para un codigo dado, o None.
+
+    ⛔ MIRA LAS DOS COLECCIONES (2026-07-31). Sólo consultaba
+    `users.distributor_code`, o sea el código ÚNICO legacy. Un registro con `?ref=`
+    de uno de los códigos AUTO —o de un legacy jubilado por la rotación a
+    `MONICAF`— no vinculaba al cliente con nadie: la venta entraba huérfana y sin
+    comisión, callada. `_resolve_code` busca primero en `discount_codes` y cae a
+    `users`, que es EL MISMO orden que usa el checkout: así el enlace de referido y
+    la caja no pueden volver a contestar cosas distintas al mismo texto."""
     if not code:
         return None
-    return await db.users.find_one({'distributor_code': code, 'role': 'distributor'}, {'_id': 0, 'password_hash': 0})
+    dist, _ = await _resolve_code(code)
+    return dist
 
 
 # ----------------- Códigos de descuento (auto-generados por nivel) -----------------
@@ -179,12 +200,24 @@ def gen_sku(name: str, presentation: str = '') -> str:
 
 
 def gen_discount_code(name, pct):
-    """Código OPAQUE, no adivinable: PREFIJO-PCT-XXXX (parte al azar). El % en el
-    texto es informativo; el descuento real SIEMPRE sale del valor guardado."""
+    """Código OPAQUE, no adivinable: MONICAF-PCT-XXXX (parte al azar). El % en el
+    texto es informativo; el descuento real SIEMPRE sale del valor guardado.
+
+    ⛔ EL PREFIJO YA NO SALE DEL NOMBRE DEL DISTRIBUIDOR (Christián, 2026-07-31).
+    Antes era `MARIAN-15-R4YV`, `ALANIS-20-FRUK`, `JAVIER-25-RHV4`: el propio texto
+    del código le decía al cliente de quién era. Eso es la última rendija de la orden
+    del 31-jul —«los clientes no pueden ver que el código de descuento es de María»—,
+    la que no tapaban ni los correos ni las rutas, porque el código lo teclea el
+    cliente y lo ve completo. Ahora TODOS los distribuidores emiten con el mismo
+    prefijo, el de la atención de la casa (Mónica Flores): con uno solo para todos, el
+    texto ya no distingue a nadie, ni siquiera comparando dos códigos entre sí.
+
+    `name` se conserva en la firma —lo mandan los dos llamadores— pero NO SE USA a
+    propósito: quitarlo invitaría a alguien a volver a meter un dato del distribuidor
+    aquí dentro. Lo vigila `test_privacidad_distribuidor.py`."""
     allowed = string.ascii_uppercase + string.digits
-    base = ''.join(c for c in (name or '').upper() if c in allowed)[:6] or 'DIST'
     rand = ''.join(random.choices(allowed, k=4))
-    return f'{base}-{int(round((pct or 0) * 100))}-{rand}'
+    return f'{PREFIJO_CODIGO}-{int(round((pct or 0) * 100))}-{rand}'
 
 
 async def _resolve_code(code):
@@ -4534,41 +4567,85 @@ async def _new_code_string(name, rate):
     return code
 
 
+async def _codigos_jubilados(dist_id):
+    """Los códigos que YA NO SE REPARTEN pero todavía cobran: rotados hace poco y
+    aún dentro de su caducidad. Ordenados por cuál se muere primero."""
+    ahora = now_iso()
+    docs = await db.discount_codes.find({'distributor_id': dist_id, 'active': True,
+                                         'superseded_at': {'$ne': None}}).to_list(300)
+    vivos = [d for d in docs if d.get('superseded_at')
+             and (not d.get('expires_at') or d['expires_at'] >= ahora)]
+    vivos.sort(key=lambda d: d.get('expires_at') or '')
+    return vivos
+
+
 async def _ensure_distributor_codes(dist, force_rotate=False):
     """Mantiene el set de códigos AUTO del distribuidor: uno por cada nivel de
     descuento de su comisión (15%, 20%… hasta 5% debajo de su comisión). Crea los
-    que falten, ROTA los caducados (nuevo texto, el viejo muere), y desactiva los
-    que ya no correspondan a su nivel. Devuelve los códigos vigentes ordenados."""
+    que falten, ROTA los caducados, y desactiva los que ya no correspondan a su
+    nivel. Devuelve los códigos VIGENTES —los que hay que repartir— ordenados.
+
+    ⛔ ROTAR YA NO MATA AL VIEJO (Christián, 2026-07-31). Antes esto reescribía el
+    texto DENTRO del mismo documento: en cuanto alguien pulsaba «rotar», el código
+    que los clientes ya traían en la mano dejaba de existir y se quedaban sin su
+    descuento sin que nadie les avisara. Christián lo preguntó justo antes de la
+    rotación a `MONICAF`: «¿los códigos que María ya repartió siguen funcionando?».
+    Ahora el viejo se JUBILA —`superseded_at`, sigue `active` y conserva SU
+    caducidad original— y el nuevo nace a su lado. Los dos resuelven al MISMO
+    distribuidor y con el MISMO porcentaje (`_resolve_code` busca por texto exacto y
+    la atribución sale de `distributor_id`), así que durante la gracia no se pierde
+    ni una comisión. El periodo de gracia no se inventa: es lo que le quedaba de
+    vida al código viejo, hasta 90 días (`CODE_TTL_DAYS`).
+
+    Un código MUERTO —caducado o desactivado— sí se reescribe en su sitio: ahí no
+    hay gracia que preservar, y guardar basura sólo llena la colección."""
     rate_basis = pyramid.effective_rate(dist)
     tiers = pyramid.discount_tiers_de(dist)
     tierset = {round(r, 4) for r in tiers}
     existing = await db.discount_codes.find({'distributor_id': dist['id']}).to_list(300)
+    now = now_iso()
     by_rate = {}
     for c in existing:
+        if c.get('superseded_at'):
+            continue          # jubilado: sigue cobrando, pero ya no es EL código del nivel
         by_rate.setdefault(round(c.get('discount_rate', 0), 4), c)
-    now = now_iso()
     new_exp = (datetime.now(timezone.utc) + timedelta(days=CODE_TTL_DAYS)).isoformat()
     out = []
     for rate in tiers:
         c = by_rate.get(round(rate, 4))
         expired = bool(c and c.get('expires_at') and c['expires_at'] < now)
+        if c is not None and force_rotate and not expired and c.get('active', True):
+            # Está VIVO y lo mandan rotar: se jubila (conserva su caducidad) y abajo
+            # nace el nuevo. Es todo el periodo de gracia, en dos líneas.
+            await db.discount_codes.update_one({'id': c['id']},
+                                               {'$set': {'superseded_at': now}})
+            c = None
         if not c:
             doc = {'id': str(uuid.uuid4()), 'distributor_id': dist['id'],
                    'code': await _new_code_string(dist.get('name'), rate),
-                   'discount_rate': rate, 'active': True, 'created_at': now, 'expires_at': new_exp}
+                   'discount_rate': rate, 'active': True, 'created_at': now,
+                   'expires_at': new_exp, 'superseded_at': None}
             await db.discount_codes.insert_one(doc)
             out.append(doc)
-        elif force_rotate or expired or not c.get('active', True):
+        elif expired or not c.get('active', True):
+            # Muerto: no hay nada que preservar, se reescribe en su sitio.
             new_code = await _new_code_string(dist.get('name'), rate)
             await db.discount_codes.update_one({'id': c['id']}, {'$set': {
-                'code': new_code, 'active': True, 'created_at': now, 'expires_at': new_exp}})
-            c.update({'code': new_code, 'active': True, 'created_at': now, 'expires_at': new_exp})
+                'code': new_code, 'active': True, 'created_at': now,
+                'expires_at': new_exp, 'superseded_at': None}})
+            c.update({'code': new_code, 'active': True, 'created_at': now,
+                      'expires_at': new_exp, 'superseded_at': None})
             out.append(c)
         else:
             out.append(c)
     # Desactiva códigos de niveles que ya no aplican (p.ej. tras cambiar de nivel).
+    # ⛔ SALVO LOS JUBILADOS: su razón de existir es sobrevivir hasta su caducidad, y
+    # su nivel casi nunca sigue en `tierset` (el legacy del 10% no está en ningún
+    # escalón). Sin esta salvedad, la primera lectura de `/distributor/codes`
+    # apagaría el periodo de gracia recién concedido.
     for c in existing:
-        if round(c.get('discount_rate', 0), 4) not in tierset and c.get('active', True):
+        if (round(c.get('discount_rate', 0), 4) not in tierset
+                and c.get('active', True) and not c.get('superseded_at')):
             await db.discount_codes.update_one({'id': c['id']}, {'$set': {'active': False}})
     out.sort(key=lambda c: c.get('discount_rate', 0))
     return out
@@ -4594,12 +4671,19 @@ async def list_discount_codes(dist=Depends(get_current_distributor)):
 
     Esta ruta CREA códigos (`_ensure_distributor_codes`), no sólo los lee: por eso
     el candado del acuerdo va aquí y no únicamente en `/rotate`. Sin firmar, no se
-    emite ni un código nuevo."""
+    emite ni un código nuevo.
+
+    `previos` son los que ya NO se reparten pero SIGUEN COBRANDO hasta su caducidad
+    (ver el periodo de gracia en `_ensure_distributor_codes`). Van aparte y no
+    revueltos con los vigentes: el distribuidor tiene que saber cuáles seguir dando
+    y cuáles nada más va a ver llegar."""
     await _exigir_acuerdo(dist)
     codes = await _ensure_distributor_codes(dist)
+    previos = await _codigos_jubilados(dist['id'])
     return {'max_discount': pyramid.effective_rate(dist),
             'rotate_days': CODE_TTL_DAYS,
-            'codes': [_code_projection(c) for c in codes]}
+            'codes': [_code_projection(c) for c in codes],
+            'previos': [_code_projection(c) for c in previos]}
 
 
 @api_router.get('/distributor/quote-caps')
@@ -4793,10 +4877,81 @@ async def distributor_quote_email(payload: QuoteEmailRequest,
 
 @api_router.post('/distributor/codes/rotate')
 async def rotate_discount_codes(dist=Depends(get_current_distributor)):
-    """Renueva YA todos los códigos (nuevos textos). Los viejos dejan de servir."""
+    """Renueva YA todos los códigos (nuevos textos).
+
+    ⛔ LOS VIEJOS NO MUEREN (Christián, 2026-07-31). Siguen cobrando —con su mismo
+    descuento y atribuyendo al mismo distribuidor— hasta su caducidad natural, y
+    salen en `previos` con la fecha en que se apagan solos. Antes esta ruta los
+    mataba en el acto y dejaba sin descuento a quien ya traía el código en la
+    mano."""
     await _exigir_acuerdo(dist)
     codes = await _ensure_distributor_codes(dist, force_rotate=True)
-    return {'rotated': True, 'codes': [_code_projection(c) for c in codes]}
+    previos = await _codigos_jubilados(dist['id'])
+    return {'rotated': True,
+            'codes': [_code_projection(c) for c in codes],
+            'previos': [_code_projection(c) for c in previos]}
+
+
+async def _rotar_codigo_unico(dist):
+    """Cambia el código ÚNICO (legacy) del distribuidor SIN matar el viejo.
+
+    El legacy vive en UN SOLO campo del usuario (`users.distributor_code`), así que
+    por construcción no admite dos textos a la vez: sobrescribirlo mata en el acto el
+    que los clientes traen en la mano. La salida es MUDARLO DE CASA — se copia a
+    `discount_codes` como jubilado, con su mismo descuento y su caducidad de 90
+    días— y sólo entonces se escribe el nuevo en el usuario. `_resolve_code` busca
+    primero en `discount_codes`, así que el texto viejo sigue cobrando igual y
+    atribuyendo al mismo distribuidor; `resolve_distributor` cae por el mismo camino,
+    de modo que el enlace `?ref=` viejo tampoco se rompe.
+
+    Devuelve (viejo, nuevo), o None si no había código único que rotar."""
+    viejo = (dist.get('distributor_code') or '').strip().upper()
+    if not viejo:
+        return None
+    ahora = now_iso()
+    if not await db.discount_codes.find_one({'code': viejo}):
+        await db.discount_codes.insert_one({
+            'id': str(uuid.uuid4()), 'distributor_id': dist['id'], 'code': viejo,
+            # El legacy da el `customer_discount_rate` de la ficha: el mismo que daba
+            # ayer. `_resolve_code` lo vuelve a acotar a la comisión del nivel.
+            'discount_rate': float(dist.get('customer_discount_rate') or 0),
+            'active': True, 'created_at': ahora, 'superseded_at': ahora, 'legacy': True,
+            'expires_at': (datetime.now(timezone.utc)
+                           + timedelta(days=CODE_TTL_DAYS)).isoformat()})
+    nuevo = gen_distributor_code(dist.get('name') or '')
+    while (await db.users.find_one({'distributor_code': nuevo})
+           or await db.discount_codes.find_one({'code': nuevo})):
+        nuevo = gen_distributor_code(dist.get('name') or '')
+    await db.users.update_one({'id': dist['id']}, {'$set': {'distributor_code': nuevo}})
+    return viejo, nuevo
+
+
+@api_router.post('/admin/distributors/{dist_id}/rotate-codes')
+async def admin_rotate_distributor_codes(dist_id: str, admin=Depends(get_current_admin)):
+    """Rota TODOS los códigos de un distribuidor al prefijo de la casa, con gracia.
+
+    Existe porque la rotación del 2026-07-31 —quitarle el nombre del distribuidor al
+    texto del código— tenía que alcanzar las DOS familias, y el distribuidor sólo
+    manda sobre una: `/distributor/codes/rotate` renueva los AUTO, pero el código
+    ÚNICO legacy (`MARI-3537`, `ALAN-2292`, `JAVI-7116`) vive en su ficha y no había
+    ninguna ruta que lo tocara. Sin esto, la mitad de la fuga seguía en pie.
+
+    No mata nada: los viejos de las dos familias quedan vivos hasta su caducidad (ver
+    `_ensure_distributor_codes` y `_rotar_codigo_unico`). El acuerdo NO se exige aquí
+    —el candado del acuerdo frena lo que crea obligaciones nuevas al distribuidor, y
+    esto es una orden de la casa sobre su propia privacidad."""
+    dist = await db.users.find_one({'id': dist_id, 'role': 'distributor'},
+                                   {'_id': 0, 'password_hash': 0})
+    if not dist:
+        raise HTTPException(status_code=404, detail='Distribuidor no encontrado')
+    unico = await _rotar_codigo_unico(dist)
+    fresh = await db.users.find_one({'id': dist_id}, {'_id': 0, 'password_hash': 0})
+    codes = await _ensure_distributor_codes(fresh, force_rotate=True)
+    previos = await _codigos_jubilados(dist_id)
+    return {'rotated': True, 'name': fresh.get('name'),
+            'codigo_unico': {'antes': unico[0], 'ahora': unico[1]} if unico else None,
+            'codes': [_code_projection(c) for c in codes],
+            'previos': [_code_projection(c) for c in previos]}
 
 
 # ----------------- Acuerdo de Distribuidor: texto, firma y copia -----------------

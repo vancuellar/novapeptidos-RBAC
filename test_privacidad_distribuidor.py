@@ -15,7 +15,10 @@ salvo abriendo la consola del navegador:
      comisiones pegados;
   3. el mismo pedido en `/orders/me` y en `/orders/{numero}` —esta última SIN
      SESIÓN, la más expuesta de todas;
-  4. y el texto del propio código (`MARIAN-15-XXXX`), que se decidió aparte.
+  4. y el texto del propio código, que era la rendija que quedaba abierta:
+     `MARIAN-15-R4YV`, `ALANIS-20-FRUK`, `JAVIER-25-RHV4` traían el nombre pegado y
+     el cliente los ve completos porque los teclea él. Desde el 2026-07-31 TODOS
+     salen con el mismo prefijo, el de la atención de la casa: `MONICAF-15-R4YV`.
 
 Las pruebas leen el SOBRE COMPLETO —el JSON o el HTML como texto plano— y truenan
 si aparece el nombre, el correo o el id. Es tosco a propósito: así no depende de
@@ -48,7 +51,7 @@ CLIENTE = {'id': 'u-cli', 'name': 'Cliente', 'email': 'cli@x.mx', 'role': 'user'
 # Las cadenas que NUNCA pueden aparecer en algo que ve un cliente.
 LA_DELATAN = ('Maria Neunfeld', 'maria@exygenlabs.com', 'u-maria-9f3a')
 
-CODIGO = 'MARIAN-15-R4YV'
+CODIGO = 'MONICAF-15-R4YV'
 
 PRODUCTO = {'id': 'p-reta', 'sku': 'RETA-20MG', 'slug': 'retatrutida-20-mg',
             'name': 'Retatrutida 20 mg', 'category': 'metabolicos',
@@ -191,6 +194,23 @@ def test_un_codigo_inventado_no_dice_nada(como):
     r = como(None).get(RUTA_CODIGO + 'NOEXISTE-99-XXXX')
     assert r.status_code == 404
     sin_rastro(r.text, 'GET /discount-code (inventado)')
+
+
+def test_el_texto_del_codigo_no_delata_a_nadie():
+    """La cuarta rendija, la que no tapaba ninguna ruta: el propio texto del código.
+
+    El cliente lo teclea, así que lo ve entero. Mientras el prefijo salía del nombre
+    —`MARIAN-15-R4YV`— bastaba leerlo para saber de quién era. Se prueba con el mismo
+    filtro tosco que el resto del archivo (`sin_rastro`) y, además, que dos
+    distribuidores distintos produzcan códigos indistinguibles salvo por el azar: si
+    alguien devolviera el nombre al generador, esto truena aunque el nombre viniera
+    recortado o revuelto."""
+    mio = server.gen_discount_code(DIST['name'], 0.15)
+    sin_rastro(mio, 'gen_discount_code')
+    otro = server.gen_discount_code('Javier Zavala', 0.15)
+    assert mio.rsplit('-', 1)[0] == otro.rsplit('-', 1)[0], \
+        f'el prefijo todavía distingue al distribuidor: {mio} vs {otro}'
+    assert mio.startswith(f'{server.PREFIJO_CODIGO}-15-')
 
 
 # =============================================================================
