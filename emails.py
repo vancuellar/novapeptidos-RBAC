@@ -1209,8 +1209,10 @@ def _quote_email_html(copy, quote):
         qty = int(ln.get('quantity', 1) or 1)
         unit = float(ln.get('unit_price', 0) or 0)
         lista = float(ln.get('list_price', 0) or 0)
-        antes = (f'<span class="em-muted" style="color:{MUTED};font-size:11px;'
-                 f'text-decoration:line-through;">&nbsp;{_money(lista)}</span>'
+        # El espacio va FUERA del tachado: dentro, la raya se come la separación y
+        # el precio nuevo y el viejo se leen pegados ("$2,549 MXN c/u$2,999 MXN").
+        antes = (f'&nbsp;&nbsp;<span class="em-muted" style="color:{MUTED};font-size:11px;'
+                 f'text-decoration:line-through;">{_money(lista)}</span>'
                  if lista > unit else '')
         rows.append(
             f'<tr>'
