@@ -172,11 +172,22 @@ def revisar_sitio(fallas, tiempos):
         if not m:
             fallas.append(f'la portada no referencia {etiqueta} principal')
             continue
-        c, cuerpo, _ = _traer(SITIO + m.group(0), quiero_texto=False)
-        if c != 200:
-            fallas.append(f'{etiqueta} ({m.group(0)}) contesta {c or "nada"} — el sitio sale en blanco')
-        elif len(cuerpo) < minimo:
-            fallas.append(f'{etiqueta} pesa {len(cuerpo)} bytes: viene cortado')
+        # Se reintenta una vez. Cloudflare no estrena version en TODOS sus
+        # bordes a la vez: durante unos segundos, justo tras un despliegue, un
+        # borde puede traer el index.html nuevo y todavia no su bundle. Eso dura
+        # segundos y no es una caida; sin este reintento cada despliegue dejaba
+        # una mancha falsa en la bitacora y ensuciaba el % de disponibilidad.
+        for intento in (1, 2):
+            c, cuerpo, _ = _traer(SITIO + m.group(0), quiero_texto=False)
+            if c == 200 and len(cuerpo) >= minimo:
+                break
+            if intento == 1:
+                time.sleep(5)
+                continue
+            if c != 200:
+                fallas.append(f'{etiqueta} ({m.group(0)}) contesta {c or "nada"} — el sitio sale en blanco')
+            else:
+                fallas.append(f'{etiqueta} pesa {len(cuerpo)} bytes: viene cortado')
 
 
 def revisar():
