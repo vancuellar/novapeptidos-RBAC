@@ -309,6 +309,61 @@ def test_guia_para_no_compra_dos_veces_si_lo_llaman_dos_veces(dos, con_remitente
 
 
 # ==========================================================================
+#  4.bis  COMPRAR LA GUÍA NO LE MUEVE UN PESO AL CLIENTE
+# ==========================================================================
+def test_comprar_la_guia_no_le_cobra_nada_al_cliente(dos, con_remitente, monkeypatch):
+    """⛔ ORDEN DE CHRISTIÁN (2026-07-31, por el pedido de Brenda): «a Brenda NO se le
+    cobra ni se le manda ningún costo de envío — lo absorbe la casa por completo».
+
+    Lo que compra la casa y lo que paga el cliente son DOS cuentas distintas y no se
+    tocan: la guía escribe `shipping_cost` (lo que le cuesta a la casa) y NUNCA
+    `shipping` (lo que pagó el cliente) ni `total`. Sin esta prueba, alguien podría
+    "arreglar" el pedido sumándole el envío real y cobrarle de más a una clienta a la
+    que ya se le prometió envío gratis.
+    """
+    import asyncio
+    import server
+    from test_envios import FakeDB
+
+    pedido = {'id': 'o-b', 'order_number': 'EX-20260730-5930', 'status': 'confirmado',
+              'shipping': 0.0, 'total': 4827.0, 'shipping_absorbed': 250.0,
+              'customer': {'full_name': 'Brenda', 'postal_code': '76807',
+                           'address': 'Calle 1', 'city': 'San Juan del Rio',
+                           'state': 'Queretaro', 'phone': '4425217088',
+                           'email': 'b@ejemplo.mx'},
+              'items': [{'product_id': 'p1', 'quantity': 1, 'name': 'Retatrutida'}]}
+
+    fake = FakeDB()
+    asyncio.run(fake.orders.insert_one(dict(pedido)))
+    monkeypatch.setattr(server, 'db', fake)
+    monkeypatch.setattr(server, '_catalogo_de', lambda items: _async({}))
+    monkeypatch.setattr(server, 'avisar_del_envio', lambda o: _async(True))
+
+    cot = asyncio.run(server.admin_cotizar_envio('o-b', admin={'email': 'a@x.mx'}))
+    opcion = next(o for o in cot['options'] if o['para_el_cliente'])
+
+    class Payload:
+        option_id = opcion['id']
+
+    asyncio.run(server.admin_comprar_guia('o-b', Payload(), admin={'email': 'a@x.mx'}))
+    fresco = asyncio.run(fake.orders.find_one({'id': 'o-b'}))
+
+    # Lo del CLIENTE, intacto:
+    assert fresco['shipping'] == 0.0, 'se le cobró envío a la clienta'
+    assert fresco['total'] == 4827.0, 'le cambió el total'
+    # Lo de la CASA, escrito:
+    assert fresco['shipping_cost'] > 0
+    assert fresco['tracking_number']
+
+
+def _async(valor):
+    """Envuelve un valor en algo que se pueda `await`ear, para sustituir funciones async."""
+    async def _f():
+        return valor
+    return _f()
+
+
+# ==========================================================================
 #  5. LA GUÍA SIEMPRE TRAE NÚMERO DE RASTREO
 # ==========================================================================
 def test_la_compra_devuelve_numero_de_rastreo(dos, con_remitente):
