@@ -20,14 +20,21 @@
 #      api-azul   ->  127.0.0.1:8001
 #      api-verde  ->  127.0.0.1:8002
 #
-#  Solo UNO recibe trafico a la vez. Quien decide cual es Caddy, con una linea
-#  en /etc/caddy/exygen-color.caddy. El despliegue levanta el color que esta
-#  apagado, espera a que este SANO de verdad, y solo entonces mueve a Caddy
-#  (recarga en caliente: no se pierde ni una peticion en vuelo). El color viejo
-#  se apaga despues, pasado un periodo de gracia.
+#  Solo UNO recibe trafico a la vez, y quien lo decide es LA PUERTA: el
+#  servicio "puerta", un nginx diminuto que escucha en el 8010 (y en el 8000 de
+#  siempre) y manda todo al color activo. El despliegue levanta el color
+#  apagado, espera a que este SANO de verdad, y entonces reescribe una linea de
+#  la puerta y le manda HUP. nginx aplica la configuracion nueva sin cerrar el
+#  puerto: no se pierde ni una peticion. El color viejo se apaga despues,
+#  pasado un periodo de gracia.
 #
-#  Los dos servicios llevan "profiles" para que un "docker compose up -d" a
-#  secas NO los levante a los dos de golpe. Se manejan siempre por deploy.sh.
+#  POR QUE UN NGINX Y NO RECARGAR CADDY: se midio. "systemctl reload caddy"
+#  tumba conexiones sueltas (14 de 358 peticiones en 15 recargas). El HUP de
+#  nginx no tumbo ninguna (600 peticiones, 20 recargas). Caddy sigue siendo la
+#  entrada publica, pero apunta al 8010 y NO se toca en los despliegues.
+#
+#  Los tres servicios llevan "profiles" para que un "docker compose up -d" a
+#  secas NO los recree de golpe. Se manejan siempre por deploy.sh.
 # ---------------------------------------------------------------------------
 
 # Los dos colores son EL MISMO contenedor. Se describe una sola vez aqui para
@@ -118,6 +125,34 @@ services:
     profiles: ["colores"]
     ports:
       - "127.0.0.1:8002:8000"
+
+  # LA PUERTA. Lo unico que hace es mandar el trafico al color que toca. Su
+  # configuracion (/opt/exygen/puerta/default.conf) la escribe deploy.sh y el
+  # cambio de color se aplica con "docker kill -s HUP": nginx cambia de
+  # configuracion SIN cerrar el puerto, asi que no se cae ni una peticion.
+  #
+  # "network_mode: host" a proposito: tiene que hablar con 127.0.0.1:8001 y
+  # 127.0.0.1:8002, que son puertos del HOST (los colores se publican solo en
+  # loopback, nunca hacia afuera). Con red propia no los alcanzaria.
+  puerta:
+    image: nginx:1.27-alpine
+    profiles: ["colores"]
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - /opt/exygen/puerta:/etc/nginx/conf.d:ro
+    healthcheck:
+      # La imagen de nginx no trae curl, pero si el wget de busybox.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8010/api/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   mongodata:

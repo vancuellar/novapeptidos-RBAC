@@ -59,16 +59,37 @@ Ahora hay **dos contenedores gemelos** y solo uno recibe trafico:
 | azul | `api-azul` | `127.0.0.1:8001` |
 | verde | `api-verde` | `127.0.0.1:8002` |
 
-Quien reparte es **Caddy**, y a que color reparte lo dice **una sola linea** en
-`/etc/caddy/exygen-color.caddy` (`reverse_proxy 127.0.0.1:8001`). Cambiar de
-color = reescribir esa linea + `systemctl reload caddy`. La recarga de Caddy es
-**en caliente**: no cierra el puerto, las peticiones que ya estaban dentro
-terminan contra el color viejo y las nuevas entran al color nuevo. **No se
-pierde ninguna.**
+Quien reparte es **la puerta**: el servicio `puerta`, un nginx diminuto que
+escucha en `127.0.0.1:8010` (y en el `8000` de siempre) y manda todo a **un**
+color. A cual, lo dice **una sola linea** en `/opt/exygen/puerta/default.conf`:
 
-`/etc/caddy/Caddyfile` lo escribe `deploy.sh` — no se edita a mano. Ademas del
-sitio publico publica el atajo de siempre, `http://127.0.0.1:8000`, que Caddy
-manda al color que este sirviendo: todo lo que apuntaba al 8000 sigue funcionando.
+```
+upstream exygen_color {
+    server 127.0.0.1:8001;   # azul
+```
+
+Cambiar de color = reescribir esa linea + `docker kill -s HUP` a nginx. nginx
+aplica la configuracion nueva **sin cerrar el puerto**: las peticiones que ya
+estaban dentro terminan contra el color viejo y las nuevas entran al nuevo.
+**No se pierde ninguna.**
+
+El camino completo es:
+
+```
+internet -> Caddy (443, TLS) -> puerta/nginx (8010) -> color activo (8001 u 8002)
+```
+
+**Por que un nginx y no recargar Caddy.** Se intento primero con Caddy:
+reescribir su upstream y `systemctl reload caddy`. Medido con un bucle de
+peticiones desde fuera, **esa recarga pierde conexiones**: 15 recargas
+seguidas tumbaron 14 peticiones de 358, y 3 de 438 en una tanda mas espaciada
+(fallan durante el handshake, `curl` devuelve `000`). El `HUP` de nginx no
+tumbo ninguna: 600 peticiones con 20 recargas de por medio, **cero fallos**.
+Por eso **Caddy ya no se toca nunca en un despliegue**: apunta al 8010 de una
+vez por todas y se olvida.
+
+`/etc/caddy/Caddyfile` y `/opt/exygen/puerta/default.conf` los escribe
+`deploy.sh` — no se editan a mano.
 
 ### Que hace `deploy.sh`, en orden
 
@@ -76,27 +97,31 @@ manda al color que este sirviendo: todo lo que apuntaba al 8000 sigue funcionand
    Si otro agente esta desplegando, este espera su turno en vez de pisarlo.
 2. **Guarda a donde volver.** Etiqueta la imagen que esta sirviendo como
    `app-api:anterior` y apunta commit y color en `.despliegue-anterior`.
-3. `git pull --ff-only origin main`.
-4. `docker compose build` del **color que esta apagado**.
-5. **Prueba de humo 1 — `import server` dentro de la imagen nueva.**
+3. **Comprueba la puerta.** Que el nginx este arriba y que Caddy le apunte.
+   En condiciones normales esto no hace nada; solo actuo la primera vez.
+4. `git pull --ff-only origin main`.
+5. `docker compose build` del **color que esta apagado**.
+6. **Prueba de humo 1 — `import server` dentro de la imagen nueva.**
    Es la que habria evitado la caida del 30 de julio de 2026 (un
    `import meta_capi` sin `meta_capi.py`).
-6. **Prueba de humo 2 — arranca la imagen nueva de verdad** en un contenedor
+7. **Prueba de humo 2 — arranca la imagen nueva de verdad** en un contenedor
    efimero, en el puerto 8099 y en la red del mongo, y le pide `/api/`
    hasta que conteste 200.
-7. **Levanta el color apagado** con la version nueva. El color que esta
+8. **Levanta el color apagado** con la version nueva. El color que esta
    vendiendo no se toca.
-8. **Espera a que el color nuevo este sano de verdad**: 200 en su puerto **y**
+9. **Espera a que el color nuevo este sano de verdad**: 200 en su puerto **y**
    `healthy` en docker. Si no llega, se planta ahi y no mueve nada.
-9. **EL CAMBIO:** reescribe la linea del color y recarga Caddy. Aqui es donde
-   antes se perdian peticiones y ahora no se pierde ninguna.
-10. Verifica `https://api.exygenlabs.com/api/`. Si no contesta, **devuelve el
+10. **EL CAMBIO:** reescribe la linea de la puerta y le manda `HUP` a nginx.
+    Aqui es donde antes se perdian peticiones y ahora no se pierde ninguna.
+11. Verifica `https://api.exygenlabs.com/api/`. Si no contesta, **devuelve el
     trafico solo** al color anterior (que sigue encendido: es instantaneo).
-11. **Periodo de gracia** (15 s por omision, `GRACIA=` lo cambia) y recien
+12. **Periodo de gracia** (15 s por omision, `GRACIA=` lo cambia) y recien
     entonces apaga el color viejo. Su contenedor **no se borra**: queda
     guardado, apagado, listo para la marcha atras.
+13. Vuelve a comprobar la API publica **despues** de apagar el viejo. Si el
+    cambio de puerta no hubiera surtido efecto, se veria justo aqui.
 
-**Lo importante:** los pasos 5 a 8 corren con el color viejo vendiendo. Si la
+**Lo importante:** los pasos 6 a 9 corren con el color viejo vendiendo. Si la
 version nueva esta rota, el script se planta y **no toca el trafico**.
 
 ### La marcha atras
@@ -121,12 +146,13 @@ Bitacora de cada despliegue: `/var/log/exygen-deploy.log`.
 ### Lo que NO hay que usar
 
 - `docker compose up -d --build` a pelo. Ese era el metodo viejo: apaga lo que
-  funciona antes de saber si lo nuevo sirve. Ademas los dos colores llevan
-  `profiles: ["colores"]` justamente para que un `docker compose up -d` a secas
-  **no** los levante a los dos de golpe.
-- Editar `/etc/caddy/Caddyfile` a mano: lo reescribe `deploy.sh`. Si hay que
-  cambiar algo de la puerta de entrada, se cambia en `caddyfile_deseado()`
-  dentro de `deploy.sh` y se commitea.
+  funciona antes de saber si lo nuevo sirve. Ademas los colores y la puerta
+  llevan `profiles: ["colores"]` justamente para que un `docker compose up -d`
+  a secas **no** los recree de golpe.
+- Editar `/etc/caddy/Caddyfile` o `/opt/exygen/puerta/default.conf` a mano: los
+  reescribe `deploy.sh`. Si hay que cambiar algo de la entrada, se cambia en
+  `caddyfile_deseado()` o `puerta_conf_deseada()` dentro de `deploy.sh` y se
+  commitea.
 - `deploy-exygen-backend.sh` (carpeta padre) **crea una instancia nueva desde
   cero**. No sirve para actualizar y no hay que tocarlo.
 

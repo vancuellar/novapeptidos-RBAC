@@ -32,16 +32,21 @@
 #
 #      api-azul  -> 127.0.0.1:8001        api-verde -> 127.0.0.1:8002
 #
-#  y Caddy (la puerta de entrada, api.exygenlabs.com) apunta a UNO de los dos
-#  con una sola linea en /etc/caddy/exygen-color.caddy. El despliegue:
+#  y delante de ellos LA PUERTA: un nginx diminuto (servicio "puerta") que
+#  escucha en el 8010 (y en el 8000 de siempre) y manda todo a UNO de los dos.
+#  El despliegue:
 #
 #      1. levanta el color APAGADO con la imagen nueva
 #      2. espera a que conteste 200 y a que docker lo declare "healthy"
-#      3. reescribe esa linea y recarga Caddy  <- el cambio de trafico
+#      3. reescribe una linea de la puerta y le manda HUP  <- el cambio
 #      4. pasado un periodo de gracia, apaga el color viejo
 #
-#  La recarga de Caddy es en caliente: las peticiones en vuelo terminan en el
-#  color viejo y las nuevas entran al color nuevo. No se pierde ninguna.
+#  POR QUE UN NGINX Y NO RECARGAR CADDY. Se probo primero con Caddy: reescribir
+#  su upstream y "systemctl reload caddy". Medido con un bucle de peticiones,
+#  ESA RECARGA PIERDE conexiones: 15 recargas seguidas tumbaron 14 peticiones
+#  de 358 (y 3 de 438 en una tanda mas espaciada). Recargar nginx con HUP no
+#  pierde ninguna: 600 peticiones y 20 recargas, cero fallos. Por eso Caddy ya
+#  no se toca nunca en un despliegue: apunta al 8010 y se olvida.
 #
 #  USO
 #  ---
@@ -65,18 +70,25 @@ IMAGEN_ANTERIOR="app-api:anterior"
 PUERTO_AZUL="8001"
 PUERTO_VERDE="8002"
 
+# La puerta: el nginx que decide a que color va todo.
+SERVICIO_PUERTA="puerta"
+PUERTA_DIR="/opt/exygen/puerta"
+PUERTA_CONF="${PUERTA_DIR}/default.conf"
+PUERTO_PUERTA="8010"
+PUERTO_LOCAL="8000"
+
 # El contenedor del esquema viejo (un solo "api" en el 8000). Solo existe hasta
 # el primer despliegue con azul/verde; a partir de ahi esta funcion sobra.
 CONTENEDOR_LEGADO="app-api-1"
 
 PUERTO_HUMO="8099"
 CONTENEDOR_HUMO="exygen-prueba-de-humo"
-PUERTO_LOCAL="8000"
+URL_PUERTA="http://127.0.0.1:${PUERTO_PUERTA}/api/"
 URL_LOCAL="http://127.0.0.1:${PUERTO_LOCAL}/api/"
 URL_PUBLICA="https://api.exygenlabs.com/api/"
 
 CADDYFILE="/etc/caddy/Caddyfile"
-CADDY_COLOR="/etc/caddy/exygen-color.caddy"
+CADDY_COLOR="/etc/caddy/exygen-color.caddy"   # del esquema anterior; ya no se usa
 
 ESTADO="${APP_DIR}/.despliegue-anterior"
 BITACORA="/var/log/exygen-deploy.log"
@@ -86,8 +98,8 @@ CERROJO="/var/lock/exygen-deploy.lock"
 # Sirve para que las peticiones lentas que ya estaban dentro terminen en paz.
 GRACIA="${GRACIA:-15}"
 
-# Los dos colores llevan "profiles" en el compose para que un "docker compose
-# up -d" a secas no los levante a los dos. Aqui si los queremos ver siempre.
+# Los colores y la puerta llevan "profiles" en el compose para que un
+# "docker compose up -d" a secas no los recree de golpe. Aqui si los queremos.
 export COMPOSE_PROFILES="colores"
 
 # ---------------------------------------------------------------- presentacion
@@ -129,7 +141,7 @@ cd "$APP_DIR"
 # ============================================================================
 #  UN DESPLIEGUE A LA VEZ
 #  Varios agentes despliegan al dia y a veces a la misma hora. Dos despliegues
-#  cruzados se pisarian el color y dejarian a Caddy apuntando a un contenedor
+#  cruzados se pisarian el color y dejarian la puerta apuntando a un contenedor
 #  que el otro acaba de apagar. Con este cerrojo, el segundo espera su turno.
 # ============================================================================
 tomar_cerrojo() {
@@ -149,13 +161,18 @@ url_de() { echo "http://127.0.0.1:$(puerto_de "$1")/api/"; }
 el_otro() { [ "${1:-}" = "azul" ] && echo "verde" || echo "azul"; }
 
 # QUIEN ESTA SIRVIENDO. La verdad no la tiene un archivo de estado nuestro: la
-# tiene Caddy, porque Caddy es quien reparte el trafico de verdad. Se lee de
-# ahi para que no puedan discrepar.
+# tiene la puerta, porque la puerta es quien reparte el trafico de verdad.
 color_activo() {
   local p=""
-  # El "|| true" del final no es adorno: el script corre con "pipefail" y este
-  # archivo no existe todavia el primer dia. Sin el, leerlo aborta el despliegue.
-  p="$(grep -o '127\.0\.0\.1:[0-9][0-9]*' "$CADDY_COLOR" 2>/dev/null | head -1 | cut -d: -f2 || true)"
+  # El "|| true" del final no es adorno: el script corre con "pipefail" y estos
+  # archivos no existen el primer dia. Sin el, leerlos aborta el despliegue.
+  if [ -f "$PUERTA_CONF" ]; then
+    p="$(grep -o 'server 127\.0\.0\.1:[0-9][0-9]*' "$PUERTA_CONF" 2>/dev/null | head -1 | cut -d: -f2 || true)"
+  fi
+  if [ -z "$p" ] && [ -f "$CADDY_COLOR" ]; then
+    # Rastro del esquema intermedio (Caddy apuntando directo al color).
+    p="$(grep -o '127\.0\.0\.1:[0-9][0-9]*' "$CADDY_COLOR" 2>/dev/null | head -1 | cut -d: -f2 || true)"
+  fi
   case "$p" in
     "$PUERTO_AZUL")  echo azul  ;;
     "$PUERTO_VERDE") echo verde ;;
@@ -164,11 +181,13 @@ color_activo() {
 }
 
 contenedor_de() { docker compose ps -a -q "$(servicio_de "$1")" 2>/dev/null | head -1 || true; }
+contenedor_puerta() { docker compose ps -a -q "$SERVICIO_PUERTA" 2>/dev/null | head -1 || true; }
 
-esta_corriendo() {
-  local id; id="$(contenedor_de "$1")"
-  [ -n "$id" ] && [ "$(docker inspect "$id" --format '{{.State.Running}}' 2>/dev/null)" = "true" ]
+corriendo_id() {
+  [ -n "${1:-}" ] && [ "$(docker inspect "$1" --format '{{.State.Running}}' 2>/dev/null || echo false)" = "true" ]
 }
+
+esta_corriendo() { corriendo_id "$(contenedor_de "$1")"; }
 
 salud_de() {
   local id; id="$(contenedor_de "$1")"
@@ -247,90 +266,176 @@ esperar_sano() {
 }
 
 # ============================================================================
-#  EL CONMUTADOR — Caddy
-#  Cambiar de color es reescribir UNA linea y recargar. La recarga de Caddy es
-#  en caliente: no cierra el puerto, no corta conexiones y las peticiones que
-#  ya estaban dentro terminan contra el color viejo.
+#  LA PUERTA — el conmutador
+#
+#  Es un nginx de 50 MB con una sola responsabilidad: decir a que color va el
+#  trafico. Cambiar de color es reescribir una linea y mandarle HUP. nginx
+#  aplica la configuracion nueva SIN cerrar el puerto: las conexiones que ya
+#  estaban dentro terminan contra el color viejo y las nuevas entran al nuevo.
+#  Medido: 600 peticiones con 20 recargas de por medio, cero fallos.
 # ============================================================================
 
-# El 8000 es el puerto de toda la vida. Mientras siga ahi el contenedor del
-# esquema viejo no se lo podemos dar a Caddy; en cuanto se apague, si.
-puerto_8000_ocupado_por_otro() {
+# El 8000 es el puerto de toda la vida. Mientras lo tenga otro (Caddy, o el
+# contenedor del esquema viejo) la puerta no puede escucharlo; en cuanto quede
+# libre, se lo queda y todo lo que apuntaba al 8000 sigue funcionando.
+puerto_8000_ajeno() {
   local linea
-  linea="$(ss -ltnp 2>/dev/null | grep -E '127\.0\.0\.1:8000' || true)"
-  [ -n "$linea" ] && ! echo "$linea" | grep -q 'caddy'
+  # Se mira la COLUMNA de la direccion local, no el renglon entero: quien tenga
+  # el 8000 puede tenerlo como "127.0.0.1:8000" o como "*:8000" (Caddy lo abria
+  # asi), y equivocarse aqui significa que nginx no arranca por choque de puerto.
+  linea="$(ss -ltnp 2>/dev/null | awk '$4 ~ /:8000$/' || true)"
+  [ -n "$linea" ] && ! echo "$linea" | grep -q 'nginx'
 }
 
-caddyfile_deseado() {
-  cat <<'ARRIBA'
+puerta_conf_deseada() {
+  local color="$1" puerto; puerto="$(puerto_de "$color")"
+  cat <<CABEZA
 # ============================================================================
-#  Caddy — la puerta de entrada de Exygen.   LO ESCRIBE deploy.sh, no se edita
-#  a mano (el siguiente despliegue lo volveria a escribir).
+#  LA PUERTA DE EXYGEN  —  LO ESCRIBE deploy.sh, no se edita a mano.
 #
-#  Aqui NO dice a que contenedor va el trafico. Eso vive en una sola linea, en
-#  /etc/caddy/exygen-color.caddy, y dice "azul" (8001) o "verde" (8002).
-#  Cambiar de color = reescribir esa linea + "systemctl reload caddy".
+#  La linea que importa es la de aqui abajo: dice que color esta sirviendo.
+#  Cambiarla y mandarle HUP a nginx es TODO el cambio de version, y no se
+#  pierde ni una peticion. Los colores viven en el 8001 (azul) y el 8002
+#  (verde); esta puerta escucha en el 8010 (y en el 8000 de siempre).
+# ============================================================================
+
+upstream exygen_color {
+    server 127.0.0.1:${puerto};   # ${color}
+    keepalive 32;
+}
+
+server {
+    listen 127.0.0.1:${PUERTO_PUERTA};
+CABEZA
+  if ! puerto_8000_ajeno; then
+    echo "    listen 127.0.0.1:${PUERTO_LOCAL};"
+  fi
+  cat <<'CUERPO'
+    server_name _;
+
+    # Caddy no le pone tope al tamano de subida y nginx si (1 MB). Sin esto,
+    # subir un COA o una ficha en PDF por el panel empezaria a fallar.
+    client_max_body_size 100m;
+
+    location / {
+        proxy_pass http://exygen_color;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+
+        # Las cabeceras ya vienen puestas por Caddy: se pasan TAL CUAL. Si aqui
+        # se pusiera "$scheme" la API creeria que todo llega por http.
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-For $http_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        proxy_set_header X-Forwarded-Host $http_x_forwarded_host;
+
+        # Los videos de tutoriales se sirven por trozos (Range) y los PDF pueden
+        # pesar: sin buffering nginx los pasa de largo en vez de acumularlos.
+        proxy_buffering off;
+
+        # Caddy no corta por tiempo; nginx corta a los 60 s por omision.
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}
+CUERPO
+}
+
+# Deja la puerta apuntando al color que se le diga. Si la configuracion no
+# cambia y nginx ya esta corriendo, no hace nada (ni siquiera recarga).
+apuntar_puerta_a() {
+  local color="$1" previo="" nuevo id
+  mkdir -p "$PUERTA_DIR"
+  nuevo="$(puerta_conf_deseada "$color")"
+  [ -f "$PUERTA_CONF" ] && previo="$(cat "$PUERTA_CONF")"
+
+  id="$(contenedor_puerta)"
+
+  if [ "$previo" = "$nuevo" ] && corriendo_id "$id"; then
+    return 0
+  fi
+
+  printf '%s\n' "$nuevo" > "$PUERTA_CONF"
+
+  if ! corriendo_id "$id"; then
+    gris "Levantando la puerta (nginx)."
+    docker compose up -d --no-deps "$SERVICIO_PUERTA" >/dev/null
+    esperar_200 "$URL_PUERTA" 40 || { rojo "La puerta no contesta en $URL_PUERTA."; return 1; }
+    return 0
+  fi
+
+  if ! docker exec "$id" nginx -t >/dev/null 2>&1; then
+    rojo "nginx rechaza la configuracion de la puerta. La dejo como estaba:"
+    docker exec "$id" nginx -t 2>&1 | tail -8
+    [ -n "$previo" ] && printf '%s' "$previo" > "$PUERTA_CONF"
+    return 1
+  fi
+
+  # HUP: nginx arranca procesos nuevos con la configuracion nueva y jubila a los
+  # viejos cuando terminan lo que tenian entre manos. El puerto no se cierra.
+  docker kill -s HUP "$id" >/dev/null
+  esperar_200 "$URL_PUERTA" 20 || { rojo "La puerta dejo de contestar tras el HUP."; return 1; }
+  return 0
+}
+
+# ============================================================================
+#  CADDY — se toca UNA vez en la vida y nunca mas.
+#  Apunta a la puerta y se olvida. Recargar Caddy pierde conexiones (medido),
+#  asi que un despliegue no lo toca jamas: esta funcion no hace nada si el
+#  archivo ya dice lo que tiene que decir.
+# ============================================================================
+caddyfile_deseado() {
+  cat <<FIN
+# ============================================================================
+#  Caddy — la entrada publica de Exygen.
+#
+#  NO dice a que contenedor va el trafico, y por eso NO se recarga nunca en un
+#  despliegue: manda todo a la puerta (nginx, 127.0.0.1:${PUERTO_PUERTA}) y es la
+#  puerta la que elige color. Recargar Caddy pierde conexiones sueltas; nginx
+#  recargado con HUP no pierde ninguna. Ver deploy.sh.
 # ============================================================================
 
 api.exygenlabs.com, chat.exygenlabs.com {
-	import /etc/caddy/exygen-color.caddy
+	reverse_proxy 127.0.0.1:${PUERTO_PUERTA}
 }
-ARRIBA
-  if ! puerto_8000_ocupado_por_otro; then
-    cat <<'ABAJO'
-
-# El atajo de siempre. Los contenedores ya no escuchan en el 8000 (ahora son el
-# 8001 y el 8002), pero quien pregunte por 127.0.0.1:8000 —scripts, revisiones,
-# el propio deploy.sh— tiene que seguir hablando con la API. Caddy se lo pasa
-# al color que este sirviendo, igual que al trafico publico.
-http://127.0.0.1:8000 {
-	import /etc/caddy/exygen-color.caddy
-}
-ABAJO
-  fi
+FIN
 }
 
-# Deja el Caddyfile como lo queremos. Solo escribe si cambio algo, y valida
-# ANTES de recargar: una configuracion mala rechazada es un susto; aplicada,
-# es la tienda caida.
-asegurar_caddyfile() {
+asegurar_caddy() {
   local nuevo; nuevo="$(caddyfile_deseado)"
   if [ -f "$CADDYFILE" ] && [ "$(cat "$CADDYFILE")" = "$nuevo" ]; then
-    return 0
+    return 0    # lo normal: no se toca nada
   fi
-  if [ -f "$CADDYFILE" ] && [ ! -f "${CADDYFILE}.antes-de-los-colores" ]; then
-    cp "$CADDYFILE" "${CADDYFILE}.antes-de-los-colores"
-    gris "Copia del Caddyfile original en ${CADDYFILE}.antes-de-los-colores"
-  fi
-  printf '%s\n' "$nuevo" > "$CADDYFILE"
-  return 0
-}
 
-apuntar_caddy_a() {
-  local color="$1" puerto; puerto="$(puerto_de "$color")"
-  cat > "$CADDY_COLOR" <<FIN
-# Color que esta sirviendo AHORA MISMO. Lo escribe deploy.sh. Una sola linea.
-#   azul = 8001      verde = 8002
-reverse_proxy 127.0.0.1:${puerto}
-FIN
-  asegurar_caddyfile
+  paso "Caddy todavia no apunta a la puerta: se cambia UNA vez"
+  if [ -f "$CADDYFILE" ] && [ ! -f "${CADDYFILE}.antes-de-la-puerta" ]; then
+    cp "$CADDYFILE" "${CADDYFILE}.antes-de-la-puerta"
+    gris "Copia del Caddyfile anterior en ${CADDYFILE}.antes-de-la-puerta"
+  fi
+  local respaldo; respaldo="$(cat "$CADDYFILE" 2>/dev/null || echo '')"
+  printf '%s\n' "$nuevo" > "$CADDYFILE"
   if ! caddy validate --config "$CADDYFILE" >/dev/null 2>&1; then
-    rojo "Caddy rechaza la configuracion. NO la aplico. Detalle:"
-    caddy validate --config "$CADDYFILE" 2>&1 | tail -15
+    rojo "Caddy rechaza la configuracion nueva. La dejo como estaba:"
+    caddy validate --config "$CADDYFILE" 2>&1 | tail -10
+    [ -n "$respaldo" ] && printf '%s' "$respaldo" > "$CADDYFILE"
     return 1
   fi
   systemctl reload caddy
+  gris "Caddy ya manda todo a la puerta. No se volvera a tocar en los despliegues."
+  # El archivo del esquema intermedio ya no lo importa nadie.
+  rm -f "$CADDY_COLOR"
   return 0
 }
 
-# Solo se usa en el estreno de los colores: si el cambio sale mal cuando todavia
-# existe el contenedor del esquema viejo, se devuelve el Caddyfile original (el
-# que apunta directo al 8000) y la tienda vuelve a estar como estaba.
-volver_caddy_al_legado() {
-  [ -f "${CADDYFILE}.antes-de-los-colores" ] || return 1
-  cp "${CADDYFILE}.antes-de-los-colores" "$CADDYFILE"
-  caddy validate --config "$CADDYFILE" >/dev/null 2>&1 || return 1
-  systemctl reload caddy
+# La entrada completa, en el orden que no deja huecos:
+#   1. la puerta (nginx) existe y sirve el color que toca — escucha el 8010
+#   2. Caddy pasa a apuntar al 8010 (una sola vez en la historia) y suelta el 8000
+#   3. la puerta se queda tambien con el 8000, que acaba de quedar libre
+asegurar_la_entrada() {
+  local color="$1"
+  apuntar_puerta_a "$color" || return 1
+  asegurar_caddy || return 1
+  apuntar_puerta_a "$color" || return 1
   return 0
 }
 
@@ -402,13 +507,12 @@ apagar_el_viejo() {
 
   # El contenedor del esquema viejo (un solo "api" en el 8000) sobra en cuanto
   # hay colores. Se comprueba SIEMPRE, no solo el primer dia: si por lo que sea
-  # sigue vivo, se queda con el 8000 y Caddy no puede publicar el atajo local.
+  # sigue vivo, se queda con el 8000 y la puerta no puede publicarlo.
   if legado_vivo; then
     gris "Quitando el contenedor del esquema viejo ($CONTENEDOR_LEGADO): ya no sirve trafico."
     docker rm -f "$CONTENEDOR_LEGADO" >/dev/null 2>&1 || true
-    # Ya libero el 8000: ahora Caddy si puede quedarse con el atajo local.
-    apuntar_caddy_a "$(color_activo)" \
-      || rojo "No pude publicar el atajo 127.0.0.1:8000 (la tienda no se entera; revisa Caddy)."
+    apuntar_puerta_a "$(color_activo)" \
+      || rojo "No pude publicar el atajo 127.0.0.1:8000 (la tienda no se entera; revisa la puerta)."
   fi
 }
 
@@ -459,7 +563,7 @@ rollback() {
   verde "  El color $anterior esta sano."
 
   paso "Cambiando el trafico a $anterior"
-  apuntar_caddy_a "$anterior" || morir "No pude recargar Caddy. El trafico sigue en $activo."
+  apuntar_puerta_a "$anterior" || morir "No pude cambiar la puerta. El trafico sigue en $activo."
 
   if esperar_200 "$URL_PUBLICA" 30; then
     verde "  $URL_PUBLICA -> 200 (sirviendo $anterior)"
@@ -469,6 +573,10 @@ rollback() {
 
   apagar_el_viejo "$activo"
 
+  if ! esperar_200 "$URL_PUBLICA" 20; then
+    morir "Despues de apagar el color $activo la tienda dejo de contestar. Enciendelo otra vez: sudo docker compose start $(servicio_de "$activo")"
+  fi
+
   verde "Marcha atras lista: ahora sirve el color $anterior (commit ${commit:0:7})."
   apuntar "ROLLBACK OK a ${commit:0:7} (color $anterior)"
 }
@@ -476,7 +584,7 @@ rollback() {
 # ============================================================================
 estado() {
   paso "Estado actual"
-  docker compose ps
+  docker compose ps || true
   echo ""
   local activo; activo="$(color_activo)"
   if [ -n "$activo" ]; then
@@ -488,15 +596,15 @@ estado() {
   echo ""
   gris "Commit desplegado: $(git -C "$APP_DIR" log --oneline -1 || true)"
   echo ""
-  local codigo_local codigo_publico
-  codigo_local="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$URL_LOCAL" || echo 000)"
-  codigo_publico="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL_PUBLICA" || echo 000)"
-  echo "  $URL_LOCAL   -> $codigo_local"
-  echo "  $URL_PUBLICA -> $codigo_publico"
+  local codigo
+  for u in "$URL_LOCAL" "$URL_PUERTA" "$URL_PUBLICA"; do
+    codigo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$u" || echo 000)"
+    printf '  %-38s -> %s\n' "$u" "$codigo"
+  done
   for c in azul verde; do
     if [ -n "$(contenedor_de "$c")" ]; then
-      local cod; cod="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$(url_de "$c")" || echo 000)"
-      echo "  color $c ($(url_de "$c")) -> $cod   [$(salud_de "$c")]"
+      codigo="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$(url_de "$c")" || echo 000)"
+      printf '  color %-5s %-26s -> %s   [%s]\n' "$c" "$(url_de "$c")" "$codigo" "$(salud_de "$c")"
     fi
   done
   if [ -f "$ESTADO" ]; then
@@ -531,6 +639,11 @@ desplegar() {
   # -- 0. Guardar a donde volver, ANTES de tocar nada.
   paso "Guardando la version actual por si hay que volver"
   guardar_marcha_atras
+
+  # -- 0b. La puerta. Si ya estaba puesta (lo normal) esto no hace nada.
+  if [ -n "$viejo" ]; then
+    asegurar_la_entrada "$viejo" || morir "No pude dejar lista la puerta de entrada. No se toco nada mas."
+  fi
 
   # -- 1. Traer el codigo.
   if [ "$con_pull" = "si" ]; then
@@ -592,49 +705,49 @@ desplegar() {
   fi
   verde "  El color $nuevo contesta 200 y docker lo declara sano."
 
-  # -- 5. EL CAMBIO. Una linea y una recarga en caliente de Caddy. Aqui es
-  #       donde antes se perdian peticiones y ahora no se pierde ninguna.
+  # -- 5. EL CAMBIO. Una linea en la puerta y un HUP a nginx. Aqui es donde
+  #       antes se perdian peticiones y ahora no se pierde ninguna.
   paso "Cambiando el trafico al color $nuevo"
-  if ! apuntar_caddy_a "$nuevo"; then
+  if [ -z "$viejo" ]; then
+    # Estreno: la puerta todavia no existia y Caddy apuntaba a otro lado.
+    asegurar_la_entrada "$nuevo" || {
+      docker compose stop -t 5 "$(servicio_de "$nuevo")" >/dev/null 2>&1 || true
+      morir "No pude dejar lista la puerta. El trafico NUNCA se movio."
+    }
+  elif ! apuntar_puerta_a "$nuevo"; then
     docker compose stop -t 5 "$(servicio_de "$nuevo")" >/dev/null 2>&1 || true
-    morir "No pude recargar Caddy. El trafico NUNCA se movio: la tienda sigue con la version anterior."
+    morir "No pude cambiar la puerta. El trafico NUNCA se movio: la tienda sigue con la version anterior."
   fi
-  verde "  Caddy ya reparte al color $nuevo."
+  verde "  La puerta ya manda todo al color $nuevo."
 
   # -- 6. Verificacion. Si esto falla, marcha atras sola (y es instantanea:
   #       el color viejo todavia esta encendido).
-  paso "Verificando por la puerta de entrada"
+  paso "Verificando por la entrada publica"
   if ! esperar_200 "$URL_PUBLICA" 40; then
-    rojo "La API publica NO contesta despues del cambio. Devuelvo el trafico a donde estaba."
-    if [ -n "$viejo" ]; then
-      if apuntar_caddy_a "$viejo"; then
-        docker compose stop -t 5 "$(servicio_de "$nuevo")" >/dev/null 2>&1 || true
-        morir "Se cambio el trafico, la puerta publica no contesto, y el trafico volvio solo al color $viejo."
-      fi
-    else
-      # Estreno de los colores: el contenedor del esquema viejo sigue vivo en el
-      # 8000, asi que basta con devolver el Caddyfile de antes.
-      if volver_caddy_al_legado; then
-        docker compose stop -t 5 "$(servicio_de "$nuevo")" >/dev/null 2>&1 || true
-        morir "Se cambio el trafico, la puerta publica no contesto, y Caddy volvio al contenedor de siempre."
-      fi
+    rojo "La API publica NO contesta despues del cambio. Devuelvo el trafico al color $viejo."
+    if [ -n "$viejo" ] && apuntar_puerta_a "$viejo"; then
+      docker compose stop -t 5 "$(servicio_de "$nuevo")" >/dev/null 2>&1 || true
+      morir "Se cambio el trafico, la entrada publica no contesto, y el trafico volvio solo al color $viejo."
     fi
-    morir "Se cambio el trafico y la puerta publica no contesta. Revisa Caddy: sudo systemctl status caddy"
+    morir "Se cambio el trafico y la entrada publica no contesta. Revisa: sudo systemctl status caddy"
   fi
   verde "  $URL_PUBLICA -> 200"
-
-  local codigo_local
-  codigo_local="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL_LOCAL" || echo 000)"
-  [ "$codigo_local" = "200" ] && verde "  $URL_LOCAL -> 200" \
-                              || gris  "  $URL_LOCAL -> $codigo_local (el atajo local se publica al apagar el esquema viejo)"
 
   # -- 7. Y AHORA si, apagar el color viejo.
   paso "Apagando el color anterior"
   apagar_el_viejo "$viejo"
 
+  # -- 8. Y comprobar que apagarlo no rompio nada (o sea: que el cambio de la
+  #       puerta se aplico de verdad y no seguiamos comiendo del color viejo).
+  if ! esperar_200 "$URL_PUBLICA" 20; then
+    rojo "Despues de apagar el color $viejo la tienda dejo de contestar. Marcha atras."
+    rollback || true
+    morir "Se apago el color viejo y la tienda dejo de contestar. Se intento la marcha atras."
+  fi
+  local codigo_local
   codigo_local="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL_LOCAL" || echo 000)"
-  gris "  $URL_LOCAL -> $codigo_local"
-  gris "  Salud del color $nuevo: $(salud_de "$nuevo")"
+  verde "  $URL_PUBLICA -> 200   |   $URL_LOCAL -> $codigo_local"
+  gris  "  Salud del color $nuevo: $(salud_de "$nuevo")"
 
   echo ""
   verde "############################################################"
@@ -651,7 +764,7 @@ case "${1:-}" in
   --estado)    estado ;;
   --sin-pull)  desplegar "no" ;;
   --help|-h)
-    sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,62p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   "")          desplegar "si" ;;
   *)           morir "Opcion desconocida: $1  (usa --help)" ;;
