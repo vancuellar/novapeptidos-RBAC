@@ -39,7 +39,7 @@ def _p(name, slug, category, sd, desc, presentation, purity, price, stock, img,
     }
 
 
-DISCLAIMER = ' Solo para uso en investigacion (RUO). No apto para consumo humano ni animal.'
+DISCLAIMER = ' Solo para uso en investigacion (RUO), en laboratorio y ensayos in vitro.'
 
 PRODUCTS = [
     _p('BPC-157 5 mg', 'bpc-157-5mg', 'recuperacion-tejidos',
