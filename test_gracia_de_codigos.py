@@ -253,3 +253,87 @@ def test_rotar_nunca_reescribe_el_texto_de_un_codigo_vivo(db):
     rota()
     despues = {c['code'] for c in codigos(db) if c['active']}
     assert antes <= despues, f'se perdieron textos vivos: {sorted(antes - despues)}'
+
+
+# ==========================================================================
+#  4. JUBILAR DE VERDAD: los ocho MONICAF de Alanís y Javier
+# ==========================================================================
+#  Christián, 2026-07-31: «Jubila los códigos MONICAF de Javier y Alanís.»
+#  Ojo con la palabra: hasta hoy «jubilado» en esta casa quería decir «ya no se
+#  reparte pero SIGUE COBRANDO» (`superseded_at` a solas). Lo que él pidió ahora
+#  es que DEJEN DE SERVIR, y eso son las dos marcas juntas. Lo que se prueba aquí
+#  es la diferencia entre las dos cosas, que es justo donde se puede confundir
+#  quien venga después.
+JUBILADO = {'id': 'c-monicaf', 'distributor_id': 'u-alanis',
+            'code': 'MONICAF-15-UTNG', 'discount_rate': 0.15,
+            'active': False, 'superseded_at': '2026-07-31T23:00:00',
+            'retired_at': '2026-07-31T23:00:00',
+            'created_at': '2026-07-31T20:38:29', 'expires_at': '2026-10-29T20:38:29'}
+
+SUYO = {'id': 'c-alanis15', 'distributor_id': 'u-alanis', 'code': 'ALANIS-15-MBET',
+        'discount_rate': 0.15, 'active': True, 'superseded_at': None,
+        'created_at': '2026-07-23T17:55:53', 'expires_at': '2026-10-21T17:55:53'}
+
+ALANIS = {'id': 'u-alanis', 'name': 'Alanis Fernanda Mendoza',
+          'email': 'alexfermc@hotmail.com', 'role': 'distributor', 'tier': 'junior0',
+          'commission_rate': 0.30, 'distributor_code': 'ALAN-2292',
+          'customer_discount_rate': 0.10}
+
+
+@pytest.fixture()
+def db_alanis(monkeypatch):
+    fake = FakeDB()
+    fake.cols['users'] = FakeCol([ALANIS])
+    fake.cols['discount_codes'] = FakeCol([SUYO, JUBILADO])
+    monkeypatch.setattr(server, 'db', fake)
+    return fake
+
+
+def test_un_codigo_jubilado_deja_de_dar_descuento(db_alanis):
+    """La prueba de que la orden se cumplió: el checkout resuelve por
+    `_resolve_code`, y `_resolve_code` sólo mira los activos."""
+    dist, tasa = asyncio.run(server._resolve_code('MONICAF-15-UTNG'))
+    assert dist is None and tasa == 0.0
+
+
+def test_jubilar_uno_no_toca_el_que_lleva_su_nombre(db_alanis):
+    dist, tasa = asyncio.run(server._resolve_code('ALANIS-15-MBET'))
+    assert dist and dist['id'] == 'u-alanis' and tasa == 0.15
+
+
+def test_un_codigo_jubilado_no_resucita_al_leer_sus_codigos(db_alanis):
+    """⛔ EL CANDADO QUE JUSTIFICA PONER `superseded_at` ADEMÁS DE `active: False`.
+
+    `_ensure_distributor_codes` REESCRIBE EN SU SITIO los documentos muertos de un
+    nivel que sí aplica —«no hay gracia que preservar»— y los devuelve con texto
+    nuevo y `active: True`. El 15% es un nivel vigente de Alanís, así que un
+    `MONICAF-15-UTNG` apagado sólo con `active: False` volvía a la vida en la
+    primera lectura de `/distributor/codes`, con otro texto y el mismo renglón.
+    Con la marca de jubilado puesta, ese barrido lo salta."""
+    asyncio.run(server._ensure_distributor_codes(ALANIS))
+    doc = next(c for c in codigos(db_alanis) if c['id'] == 'c-monicaf')
+    assert doc['code'] == 'MONICAF-15-UTNG', 'le reescribieron el texto encima'
+    assert doc['active'] is False, 'revivió'
+
+
+def test_el_jubilado_de_verdad_no_sale_como_uno_que_todavia_cobra(db_alanis):
+    """`_codigos_jubilados` es la lista de «ya no se reparte pero SÍ cobra». Éste ya
+    no cobra: enseñárselo al distribuidor ahí sería decirle que sirve."""
+    previos = asyncio.run(server._codigos_jubilados('u-alanis'))
+    assert 'MONICAF-15-UTNG' not in [c['code'] for c in previos]
+
+
+def test_la_lista_de_jubilar_no_toca_ni_un_codigo_de_maria():
+    """El permiso es por TEXTO EXACTO, no `startswith('MONICAF-')`. María pidió el
+    prefijo de la casa y los suyos son de verdad: un barrido por prefijo le habría
+    apagado los cuatro."""
+    import jubilar_codigos_monicaf as j
+    de_maria = {'MONICAF-7451', 'MONICAF-15-Q5QK', 'MONICAF-20-GY5G',
+                'MONICAF-25-0ZA7', 'MONICAF-30-IMGI'}
+    todos = {c for lista in j.A_JUBILAR.values() for c in lista}
+    assert len(todos) == 8, todos
+    assert not (todos & de_maria)
+    assert 'marianeunfeld0@gmail.com' not in j.A_JUBILAR
+    # Y tampoco los que llevan su nombre: ésos son los que se reparten.
+    assert not any(c.startswith(('ALANIS-', 'JAVIER-', 'ALAN-', 'JAVI-', 'MARIAN-', 'MARI-'))
+                   for c in todos)
