@@ -201,9 +201,13 @@ def avisar(asunto, cuerpo_html):
     datos = json.dumps({
         'from': remitente, 'to': [para], 'subject': asunto, 'html': cuerpo_html,
     }).encode()
+    # El User-Agent NO es adorno: Resend esta detras de Cloudflare y bloquea el
+    # que urllib pone por omision ("Python-urllib/3.10") con un 403 y el codigo
+    # 1010. Con esto pasa. Costo de averiguarlo: un rato el 2026-07-31.
     pet = urllib.request.Request(
         'https://api.resend.com/emails', data=datos, method='POST',
-        headers={'Authorization': f'Bearer {llave}', 'Content-Type': 'application/json'})
+        headers={'Authorization': f'Bearer {llave}', 'Content-Type': 'application/json',
+                 'User-Agent': 'ExygenVigilante/1.0'})
     try:
         with urllib.request.urlopen(pet, timeout=25) as r:
             return r.status in (200, 201)
