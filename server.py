@@ -1244,16 +1244,52 @@ def vista_publica_de_producto(doc):
 # vender las presentaciones chicas — que son la puerta de entrada del cliente
 # nuevo — el envio se regala solo a partir de cierto monto. Abajo de eso se cobra.
 # El umbral es el mismo que el de las ofertas de carrito abandonado, a proposito.
-SHIPPING_FLAT = 250          # lo que de verdad cuesta el envio nacional
-# REGLA DE CHRISTIAN: el envio va por cuenta de la casa SOLO mientras no pase del 10% de
-# la compra. Arriba de eso se cobra. Por eso el umbral se DERIVA del costo del envio en vez
-# de escribirse a mano: si algun dia el envio sube a $300, el umbral sube solo a $3,000 y la
-# regla se sigue cumpliendo. Escrito a mano se desalineaba en silencio (2026-07-27).
-# El 10% vive en UN solo lugar (`envios.py`), donde también vive la regla que lo
+def _pesos_de_entorno(nombre: str, por_omision: int) -> int:
+    """Un número de envío que se puede mover sin desplegar código.
+
+    Vive en el `.env` del servidor. Si viene vacío o con basura, manda el valor de
+    aquí: un envío mal capturado en una variable de entorno no puede dejar el sitio
+    cobrando $0 ni $99,000."""
+    crudo = (os.environ.get(nombre) or '').strip()
+    if not crudo:
+        return por_omision
+    try:
+        valor = int(float(crudo))
+    except (TypeError, ValueError):
+        logger.warning('%s trae basura (%r): se usa el valor de fabrica %s',
+                       nombre, crudo, por_omision)
+        return por_omision
+    if valor < 0:
+        logger.warning('%s viene en negativo (%s): se usa el valor de fabrica %s',
+                       nombre, valor, por_omision)
+        return por_omision
+    return valor
+
+
+# LO QUE SE LE COBRA al pedido que NO llega a la compra minima. Es un PRECIO, no un
+# costo. Configurable desde el .env del servidor (SHIPPING_FLAT) para que Christian
+# pueda moverlo sin desplegar: el 2026-07-31 dijo «creo que Certified cobra $250 flat;
+# si es cierto, nosotros debemos cobrar menos, quizas $200 o $219». Eso fue un QUIZAS,
+# no una orden: hasta que el decida, se queda en $250.
+SHIPPING_FLAT = _pesos_de_entorno('SHIPPING_FLAT', 250)
+
+# LO QUE LA GUIA LE CUESTA A LA CASA cuando no hay cotizacion real de Skydropx. Es un
+# COSTO, no un precio, y por eso se separo de `SHIPPING_FLAT` el 2026-07-31: contra
+# este numero se mide el 5%, y mezclarlo con la tarifa que se cobra hacia que bajar el
+# precio al cliente moviera solo —y en silencio— el punto donde el envio sale gratis.
+COSTO_GUIA_ESTIMADO = _pesos_de_entorno('COSTO_GUIA_ESTIMADO', 250)
+
+# El tope vive en UN solo lugar (`envios.py`), donde también vive la regla que lo
 # usa contra el costo real de Skydropx. Escrito dos veces se desalinea en silencio,
 # que es exactamente lo que pasó el 2026-07-27.
 TOPE_ENVIO_SOBRE_COMPRA = envios.TOPE_ENVIO_SOBRE_COMPRA
-FREE_SHIPPING_FROM = int(SHIPPING_FLAT / TOPE_ENVIO_SOBRE_COMPRA)   # 250 / 10% = 2,500
+
+# LA COMPRA MINIMA, EN PESOS. Antes se derivaba (`SHIPPING_FLAT / TOPE` = 250 / 10% =
+# 2,500). Ya no: el 2026-07-31 el tope bajo al 5% y esa cuenta habria movido la minima
+# sola de $2,500 a $5,000 sin que nadie lo pidiera. Christian la dicto en pesos —
+# «el ticket supere los $2,500 de compra minima»— y en pesos se queda. Sigue amarrada
+# al cupon de carrito abandonado (`recovery.MIN_FOR_OFFER`), a proposito.
+FREE_SHIPPING_FROM = _pesos_de_entorno('FREE_SHIPPING_FROM', envios.COMPRA_MINIMA_ENVIO_GRATIS)
 
 
 # ✅ SE COBRA ENVIO OTRA VEZ: $250 PAREJO (Christian, 2026-07-28, en sus palabras:
@@ -1264,11 +1300,20 @@ FREE_SHIPPING_FROM = int(SHIPPING_FLAT / TOPE_ENVIO_SOBRE_COMPRA)   # 250 / 10% 
 # de "2-5 dias" del sitio; las que si la cumplen andan en $139-$165. Cobrando $250
 # alcanza para pagar la express y todavia queda margen.
 #
-# Y arriba de $2,500 va gratis, con el tope del 10% que ya esta en envios.py: la casa
-# absorbe hasta el 10% de la compra y el cliente paga la diferencia.
+# Y arriba de $2,500 se activa el beneficio, con el tope que vive en envios.py: la casa
+# absorbe la guia hasta el 5% de la compra (era 10% hasta el 2026-07-31) y el cliente
+# paga la diferencia. Con una guia de $250 eso quiere decir gratis-gratis desde $5,000,
+# y entre $2,500 y $5,000 un cobro parcial que baja solo conforme sube el ticket.
 #
-# Contra la competencia: Certified cobra $250 SIEMPRE, sin excepcion. Nosotros
-# empatamos abajo de $2,500 y le ganamos arriba.
+# ⚠️ CONTRA LA COMPETENCIA, CON LO QUE DE VERDAD ESTA COMPROBADO (2026-07-31):
+#   · Exoma: $200 fijos, gratis desde $2,000. VERIFICADO en exomapeptides.mx/envios.
+#   · Certified: NO PUBLICA su costo de envio. Su shipping-policy y su FAQ no traen
+#     ni un importe; solo aparece al llegar al checkout con producto en el carrito.
+# Aqui decia "Certified cobra $250 SIEMPRE, sin excepcion". Esa linea NO tenia fuente
+# y coincidia al peso con nuestro propio SHIPPING_FLAT — o sea que muy probablemente
+# alguien escribio nuestro numero como si fuera de ellos. No se usa para decidir nada
+# hasta que haya evidencia. Y bajarle a Exoma NO aplica: rige el trinquete (solo
+# bajamos si baja Certified).
 COBRAR_ENVIO = True
 
 
@@ -1279,18 +1324,20 @@ def shipping_for(merchandise_paid, costo_real=None):
     el precio de lista: si no, un codigo grande dejaria el envio gratis cobrando
     mucho menos. Primero el ROI.
 
-    ⛔ LA REGLA DEL 10% VIVE EN UN SOLO SITIO: `envios.cobro_de_envio_al_cliente`.
-    Esta funcion solo le pone el costo por omision (la tarifa plana) y el umbral. Antes
-    tenia su propia cuenta —"gratis arriba de $2,500"— que NUNCA miraba lo que la guia
-    costaba de verdad: con un envio real de $500, un pedido de $2,600 salia gratis y la
-    casa absorbia el 19%. Palabras de Christian: «si una compra por 2,500 genera un
-    costo de envio de $500 ni en pedo lo pago».
+    ⛔ LA REGLA VIVE EN UN SOLO SITIO: `envios.cobro_de_envio_al_cliente`. Esta
+    funcion solo le pone los tres numeros de la casa: lo que la guia CUESTA, la compra
+    minima y lo que se COBRA de tarifa plana abajo de esa minima. Antes tenia su propia
+    cuenta —"gratis arriba de $2,500"— que NUNCA miraba lo que la guia costaba de
+    verdad: con un envio real de $500, un pedido de $2,600 salia gratis y la casa
+    absorbia el 19%. Palabras de Christian: «si una compra por 2,500 genera un costo de
+    envio de $500 ni en pedo lo pago».
 
-    `costo_real` es lo que cuesta ESA guia. Si no se pasa, se asume la tarifa plana.
-
-    OJO: hoy no la llama nadie para cobrar — ver COBRAR_ENVIO arriba."""
-    costo = SHIPPING_FLAT if costo_real is None else costo_real
-    return envios.cobro_de_envio_al_cliente(costo, merchandise_paid, FREE_SHIPPING_FROM)
+    `costo_real` es lo que cuesta ESA guia (la cotizacion de Skydropx). Si no se pasa,
+    se asume el costo estimado de la casa — que NO es lo mismo que la tarifa que se
+    cobra, aunque hoy los dos valgan $250."""
+    costo = COSTO_GUIA_ESTIMADO if costo_real is None else costo_real
+    return envios.cobro_de_envio_al_cliente(costo, merchandise_paid, FREE_SHIPPING_FROM,
+                                            tarifa_plana=SHIPPING_FLAT)
 
 
 # ==========================================================================
@@ -1557,7 +1604,7 @@ async def admin_guardar_cajas(payload: CajasUpdate, admin=Depends(get_current_ad
 # peso y código postal, con TODAS las paqueterías que Skydropx alcance.
 #
 # ⛔ ESTO NO CAMBIA UN PESO DE LO QUE PAGA EL CLIENTE. El cliente sigue con sus $250
-# parejos y su envío gratis arriba de $2,500 con tope del 10% (`COBRAR_ENVIO` /
+# parejos y su envío gratis arriba de $2,500 con tope del 5% (`COBRAR_ENVIO` /
 # `envios.cobro_de_envio_al_cliente`). Aquí solo se decide qué le cuesta A LA CASA.
 def _destino_del_pedido(order: dict) -> dict:
     c = (order or {}).get('customer') or {}
@@ -2652,16 +2699,16 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # `shipping_quote.get('cost') or 0` y con el cobro apagado la cotizacion viene
     # vacia, asi que TODO pedido guardaba costo $0 y absorbido $0 — un pedido de $179
     # se llevaba $250 de envio (el 140%) y no aparecia en ningun reporte. (2026-07-28)
-    costo_guia = float(shipping_quote.get('cost') or SHIPPING_FLAT)
+    costo_guia = float(shipping_quote.get('cost') or COSTO_GUIA_ESTIMADO)
     envio_absorbido = envios.envio_que_absorbe_la_casa(costo_guia, shipping)
     fuera_de_tope = envios.absorcion_fuera_de_tope(costo_guia, paid_merchandise, shipping)
     if fuera_de_tope > 0:
-        # No bloquea la venta —el dueño decidió no cobrar envío— pero deja constancia:
-        # la regla de la casa es absorber como máximo el 10% de la compra.
+        # No bloquea la venta —el dueño manda— pero deja constancia: la regla de la
+        # casa es absorber como máximo el 5% de la compra (era 10% hasta 2026-07-31).
         logger.warning(
             'ENVIO FUERA DE TOPE: la casa absorbe $%.0f de guia en una compra de $%.0f '
-            '(tope 10%% = $%.0f, se pasa por $%.0f).',
-            envio_absorbido, paid_merchandise,
+            '(tope %.0f%% = $%.0f, se pasa por $%.0f).',
+            envio_absorbido, paid_merchandise, TOPE_ENVIO_SOBRE_COMPRA * 100,
             envios.tope_que_absorbe_la_casa(paid_merchandise), fuera_de_tope)
     # `discount_rate` es el descuento CONCEDIDO: con el máximo (40%) el pedido no
     # genera puntos. Ver la regla en loyalty.py.
@@ -2744,7 +2791,7 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         # Lo que la casa se comió del envío. Sin este número nadie sabe cuánto
         # cuesta de verdad la promesa de "envío gratis".
         shipping_absorbed=envio_absorbido,
-        # Lo que se pasó del tope del 10% en ESTE pedido. Cero cuando se respeta.
+        # Lo que se pasó del tope del 5% en ESTE pedido. Cero cuando se respeta.
         shipping_over_cap=fuera_de_tope,
         total=total,
         referred_by=referrer['id'] if referrer else None,
@@ -2911,14 +2958,23 @@ async def payments_config():
     envío (para que el carrito enseñe el mismo número que se cobra).
 
     `shipping_charged` es la llave que manda: con ella apagada el sitio no pinta
-    ningún cargo de envío. Los otros dos números siguen viajando porque describen
-    la regla dormida, no lo que se cobra hoy."""
+    ningún cargo de envío. Los otros números siguen viajando porque describen
+    la regla dormida, no lo que se cobra hoy.
+
+    Desde el 2026-07-31 viajan también el tope (5%) y el costo estimado de la guía:
+    sin ellos el carrito no puede pintar el cobro PARCIAL que hay entre la compra
+    mínima y el punto donde el envío sale gratis de verdad — y un carrito que enseña
+    $0 donde la caja cobra $100 ya costó dinero antes. El número final lo sigue
+    poniendo el servidor al crear el pedido; esto es sólo para que la pantalla no
+    mienta mientras tanto."""
     return {'crypto_enabled': crypto_enabled(),
             'card_enabled': mercadopago.enabled(),
             'oxxo_enabled': mercadopago.enabled(),   # viaja por la misma pasarela
             'shipping_charged': COBRAR_ENVIO,
             'shipping_flat': SHIPPING_FLAT,
             'free_shipping_from': FREE_SHIPPING_FROM,
+            'shipping_cap_rate': TOPE_ENVIO_SOBRE_COMPRA,
+            'shipping_cost_estimate': COSTO_GUIA_ESTIMADO,
             # Cotización real por CP y peso (Skydropx). Apagada: el checkout ni
             # pregunta y la pantalla se ve EXACTAMENTE como hoy.
             'shipping_quote_enabled': envio_se_cotiza()}

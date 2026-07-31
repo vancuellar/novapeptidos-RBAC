@@ -1279,7 +1279,15 @@ def test_envio_se_cobra_en_pedidos_chicos():
 
 
 def test_envio_gratis_desde_el_umbral():
-    assert shipping_for(FREE_SHIPPING_FROM) == 0
+    """⚠️ OJO CON LO QUE "GRATIS" QUIERE DECIR DESDE EL 2026-07-31.
+
+    La compra mínima ($2,500) ya no regala el envío: PRENDE el beneficio. De ahí en
+    adelante la casa absorbe la guía hasta el 5% de lo que el cliente pagó y él pone
+    la diferencia. Con una guía de $250, el 5% no la tapa hasta los $5,000 — así que
+    entre $2,500 y $5,000 el cobro es parcial y baja solo conforme sube el ticket."""
+    assert shipping_for(FREE_SHIPPING_FROM) == 125       # antes: 0
+    assert shipping_for(3000) == 100
+    assert shipping_for(5000) == 0                       # aquí sí, gratis de verdad
     assert shipping_for(10000) == 0
 
 
@@ -1700,20 +1708,30 @@ def test_descontar_y_devolver_inventario_buscan_igual():
         'el checkout descuenta otra vez además de la reserva: las piezas bajan al doble'
 
 
-def test_el_envio_gratis_nunca_pasa_del_10_por_ciento_de_la_compra():
-    """Regla de Christian: la casa regala el envío SOLO mientras no pase del 10% de la
-    compra. Por eso el umbral se deriva del costo del envío y no se escribe a mano."""
-    from server import FREE_SHIPPING_FROM, SHIPPING_FLAT, TOPE_ENVIO_SOBRE_COMPRA, shipping_for
+def test_la_casa_nunca_absorbe_mas_del_tope_de_la_compra():
+    """Regla de Christián: la casa se come la guía SOLO hasta el 5% de la compra.
 
-    assert SHIPPING_FLAT / FREE_SHIPPING_FROM <= TOPE_ENVIO_SOBRE_COMPRA + 1e-9, \
-        'en el umbral, el envío ya se come más del 10% de la compra'
-    # justo abajo del umbral se COBRA; justo arriba, no
+    Esta prueba es el candado de la política entera: por mucho que suba el ticket, no
+    puede existir un pedido donde la casa absorba más de su tope. Antes se escribía al
+    revés —"en el umbral el envío tiene que caber en el tope"— y esa forma amarraba la
+    compra mínima al costo de la guía: al bajar el tope al 5%, la mínima se habría ido
+    sola de $2,500 a $5,000. Christián dictó la mínima en pesos, así que ahora se
+    vigila lo que de verdad importa, que es cuánto pone la casa."""
+    import envios
+    from server import (COSTO_GUIA_ESTIMADO, FREE_SHIPPING_FROM, SHIPPING_FLAT,
+                        TOPE_ENVIO_SOBRE_COMPRA, shipping_for)
+
+    # Primero la compra mínima: abajo se cobra la tarifa plana, punto.
     assert shipping_for(FREE_SHIPPING_FROM - 1) == SHIPPING_FLAT
-    assert shipping_for(FREE_SHIPPING_FROM) == 0
-    # y en cualquier pedido con envío gratis, el envío pesa 10% o menos
-    for compra in (FREE_SHIPPING_FROM, FREE_SHIPPING_FROM * 2, 50000):
-        assert shipping_for(compra) == 0
-        assert SHIPPING_FLAT / compra <= TOPE_ENVIO_SOBRE_COMPRA + 1e-9
+    assert shipping_for(0) == SHIPPING_FLAT
+    # De la mínima para arriba, lo que la casa pone nunca pasa de su tope.
+    for compra in (FREE_SHIPPING_FROM, 3000, 4000, 5000, FREE_SHIPPING_FROM * 4, 50000):
+        cobrado = shipping_for(compra)
+        absorbido = envios.envio_que_absorbe_la_casa(COSTO_GUIA_ESTIMADO, cobrado)
+        assert absorbido <= compra * TOPE_ENVIO_SOBRE_COMPRA + 1e-9, \
+            f'en una compra de ${compra:,} la casa absorbe ${absorbido:,.0f}: pasa del tope'
+    # Y donde el tope ya tapa la guía completa, el cliente no paga nada.
+    assert shipping_for(COSTO_GUIA_ESTIMADO / TOPE_ENVIO_SOBRE_COMPRA) == 0
 
 
 # --------------------------------------------------------------------------
@@ -1725,12 +1743,16 @@ def test_el_envio_gratis_nunca_pasa_del_10_por_ciento_de_la_compra():
 
 def test_el_pedido_cobra_250_parejo():
     """Christian, 2026-07-28: "$250 parejo y pagamos un poco más por envío express".
-    Abajo de $2,500 se cobran $250; arriba va gratis con el tope del 10%."""
+    Abajo de $2,500 se cobran $250; arriba entra el tope del 5%.
+
+    ⛔ EL FLAT NO SE MUEVE SIN ORDEN DE CHRISTIÁN. El 2026-07-31 dijo «quizás $200 o
+    $219» — un quizás no es una decisión. El día que decida se cambia en el .env."""
     from server import COBRAR_ENVIO, SHIPPING_FLAT, shipping_for
     assert COBRAR_ENVIO is True, 'el pedido dejó de cobrar envío sin que nadie lo pidiera'
     assert SHIPPING_FLAT == 250
-    assert shipping_for(1000) == 250        # pedido chico: paga
-    assert shipping_for(3000) == 0          # arriba de $2,500: gratis, cabe en el 10%
+    assert shipping_for(1000) == 250        # pedido chico: paga la tarifa plana
+    assert shipping_for(3000) == 100        # arriba de $2,500: la casa pone su 5% ($150)
+    assert shipping_for(5000) == 0          # aquí el 5% ya tapa la guía completa
 
 
 def test_el_cobro_del_pedido_respeta_el_interruptor():
@@ -1762,7 +1784,8 @@ def test_el_sitio_se_entera_de_que_no_se_cobra_envio():
 def test_la_regla_de_envio_sigue_viva_para_el_dia_que_se_reactive():
     from server import shipping_for, SHIPPING_FLAT, FREE_SHIPPING_FROM
     assert shipping_for(FREE_SHIPPING_FROM - 1) == SHIPPING_FLAT
-    assert shipping_for(FREE_SHIPPING_FROM) == 0
+    # Cruzar la mínima ya no vale $0: vale que la casa empiece a poner su 5%.
+    assert 0 < shipping_for(FREE_SHIPPING_FROM) < SHIPPING_FLAT
 
 
 # --------------------------------------------------------------------------

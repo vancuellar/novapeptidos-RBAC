@@ -255,32 +255,70 @@ def paquete_del_pedido(items, pflags: dict | None = None) -> dict:
 
 
 # ------------------------------------------------- quién paga el envío
-TOPE_ENVIO_SOBRE_COMPRA = 0.10
-
-# ✅ DECIDIDO POR CHRISTIAN el 2026-07-28, en sus palabras:
-# "En un pedido de más de 2.5k pesos donde el envío pasa del 10%, el cliente paga
-#  la diferencia y la casa absorbe hasta el 10% del costo del envío máximo."
+# ⛔ LA POLÍTICA DE ENVÍO, DICTADA POR CHRISTIÁN EL 2026-07-31, EN SUS PALABRAS:
 #
-# O sea: en un pedido de $3,000 con envío de $600, la casa pone $300 (su 10%) y el
-# cliente paga los otros $300. La casa NUNCA absorbe más del 10% de la compra, y el
-# cliente nunca paga el envío completo si ya pasó de $2,500.
+#   «La política de envío será gratis siempre y cuando el ticket supere los $2,500
+#    de compra mínima y/o no sea mayor a 5% del total de la compra. Primero se debe
+#    cumplir la compra mínima. De otra manera, se cobra un flat fee.»
+#
+# Son DOS candados y van EN ESTE ORDEN, que es lo que él subrayó:
+#
+#   1º LA COMPRA MÍNIMA ($2,500). Sin ella no hay beneficio de ningún tipo: el
+#      pedido paga su tarifa plana y ya. Un pedido de $879 nunca lleva envío gratis
+#      por barata que salga la guía.
+#   2º EL 5%. Cumplida la mínima, la casa absorbe la guía SOLO hasta el 5% de lo que
+#      el cliente pagó de mercancía. Si la guía cuesta más, el excedente lo paga él.
+#
+# ⚠️ LO QUE ESTO SIGNIFICA EN LA CAJA, para que nadie se sorprenda: el tope bajó de
+# 10% a 5% este mismo día. Con una guía de $250, el 5% no alcanza a taparla hasta los
+# $5,000 de compra. O sea que entre $2,500 y $5,000 el cliente ya NO paga $0 sino la
+# diferencia (en $3,000 son $100; en $4,000 son $50). Arriba de $5,000, gratis de
+# verdad. Es exactamente la regla que pidió el dueño y es la que protege el margen.
+TOPE_ENVIO_SOBRE_COMPRA = 0.05
+
+# LA COMPRA MÍNIMA, EN PESOS Y ESCRITA A MANO A PROPÓSITO.
+#
+# Hasta hoy el umbral se DERIVABA del costo de la guía (`SHIPPING_FLAT / TOPE` en
+# server.py, o sea 250 / 10% = 2,500). Esa cuenta era elegante mientras el tope fue
+# del 10%, pero con el 5% habría movido la mínima sola de $2,500 a $5,000 sin que
+# nadie lo pidiera — y Christián dictó la mínima en pesos, no como una consecuencia
+# del tope. Por eso ahora son dos números independientes: cambiar uno no mueve al
+# otro en silencio.
+COMPRA_MINIMA_ENVIO_GRATIS = 2500
+
+# ✅ DECIDIDO POR CHRISTIAN el 2026-07-28 y RATIFICADO el 2026-07-31, en sus palabras:
+# "En un pedido de más de 2.5k pesos donde el envío pasa del [tope], el cliente paga
+#  la diferencia y la casa absorbe hasta el [tope] del costo del envío máximo."
+#
+# O sea: en un pedido de $3,000 con envío de $600, la casa pone $150 (su 5%) y el
+# cliente paga los otros $450. La casa NUNCA absorbe más del tope de la compra, y el
+# cliente nunca paga el envío completo si ya pasó de la compra mínima.
 #
 # Para cambiarlo: esta línea, nada más. No hay otro lugar donde se decida.
 CLIENTE_PAGA_EL_ENVIO_COMPLETO_AL_PASAR_EL_TOPE = False
 
 
 def cobro_de_envio_al_cliente(costo_envio: float, mercancia_pagada: float,
-                              envio_gratis_desde: float) -> float:
+                              envio_gratis_desde: float,
+                              tarifa_plana: float | None = None) -> float:
     """Cuánto de la guía se le cobra al cliente. Devuelve pesos, nunca negativos.
 
-    Tres casos, en este orden:
+    Tres casos, EN ESTE ORDEN — el orden es la regla, no un detalle:
 
-      1. Compra chica (abajo del umbral): paga su envío completo. Absorber $250 en
-         un pedido de $879 se come el 28% del ingreso.
-      2. Compra grande y envío barato (≤ 10% de lo que pagó): GRATIS, la casa lo
+      1. PRIMERO LA COMPRA MÍNIMA. Abajo del umbral el pedido paga su tarifa plana
+         (o, si no se le pasa ninguna, la guía completa). Absorber $250 en un pedido
+         de $879 se come el 28% del ingreso. Aquí el 5% ni se mira: Christián fue
+         explícito en que la mínima se cumple primero.
+      2. Compra grande y envío barato (≤ 5% de lo que pagó): GRATIS, la casa lo
          absorbe. Es la promesa que se le hace al cliente.
-      3. Compra grande y envío caro (> 10%): ver la constante de arriba. Hoy paga
-         el envío completo. ⚠️ Falta la definición de Christian.
+      3. Compra grande y envío caro (> 5%): la casa absorbe su 5% y el cliente paga
+         la diferencia. (La regla contraria —que pague todo— se prende con la
+         constante de arriba.)
+
+    `tarifa_plana` es lo que se COBRA abajo de la mínima cuando eso es un precio de
+    la casa y no el costo de la guía. Se dejó opcional a propósito: el camino de
+    Skydropx no la pasa porque ahí, abajo de la mínima, el cliente paga la guía real
+    que se cotizó, que es justo lo que cuesta.
 
     Se mide sobre lo que el cliente PAGA de mercancía (ya con descuento y ya con
     los puntos aplicados), no sobre el precio de lista: si no, un código grande
@@ -297,7 +335,15 @@ def cobro_de_envio_al_cliente(costo_envio: float, mercancia_pagada: float,
     if costo <= 0:
         return 0.0
     if mercancia < float(envio_gratis_desde or 0):
-        return round(costo)
+        if tarifa_plana is None:
+            return round(costo)
+        try:
+            plana = float(tarifa_plana)
+        except (TypeError, ValueError):
+            plana = -1.0
+        # Una tarifa en negativo o con basura NO puede dejar el envío regalado: se
+        # cae al costo de la guía, que es el número que protege a la casa.
+        return round(plana) if plana >= 0 else round(costo)
     tope = mercancia * TOPE_ENVIO_SOBRE_COMPRA
     if costo <= tope:
         return 0.0
@@ -309,10 +355,10 @@ def cobro_de_envio_al_cliente(costo_envio: float, mercancia_pagada: float,
 def tope_que_absorbe_la_casa(mercancia_pagada: float) -> float:
     """El MÁXIMO de envío que la casa está dispuesta a comerse en un pedido.
 
-    Es el 10% de lo que el cliente pagó de mercancía, y ni un peso más. Palabras de
-    Christian: «si una compra por 2,500 genera un costo de envío de $500 ni en pedo
-    lo pago». Un pedido de $179 tiene un tope de $17.90 — por eso nunca puede llevar
-    envío gratis.
+    Es el 5% de lo que el cliente pagó de mercancía, y ni un peso más (era 10% hasta
+    el 2026-07-31). Palabras de Christian: «si una compra por 2,500 genera un costo de
+    envío de $500 ni en pedo lo pago». Un pedido de $179 tiene un tope de $8.95 — por
+    eso nunca puede llevar envío gratis.
     """
     try:
         mercancia = max(0.0, float(mercancia_pagada or 0))
@@ -325,10 +371,11 @@ def envio_que_absorbe_la_casa(costo_envio: float, cobrado_al_cliente: float) -> 
     """Lo que la guía le cuesta a la casa DESPUÉS de lo que pagó el cliente.
 
     El espejo de `cobro_de_envio_al_cliente`. Existe porque el número que duele no
-    es el que se cobra sino el que NO se cobra: hoy el checkout no cobra envío
-    (`COBRAR_ENVIO = False` en server.py, decisión de Christian), así que la casa
-    absorbe el 100% de cada guía y en el pedido eso se guardaba como $0 — un pedido
-    de $179 se llevaba $250 de envío, el 140%, y no aparecía en ningún reporte.
+    es el que se cobra sino el que NO se cobra. Nació cuando el checkout no cobraba
+    envío: la casa absorbía el 100% de cada guía y en el pedido eso se guardaba como
+    $0 — un pedido de $179 se llevaba $250 de envío, el 140%, y no aparecía en ningún
+    reporte. Hoy el cobro está prendido, pero cada pedido con envío gratis sigue
+    dejando aquí lo que la casa se comió, que es lo que hay que poder sumar.
     """
     try:
         costo = max(0.0, float(costo_envio or 0))
@@ -343,7 +390,7 @@ def envio_que_absorbe_la_casa(costo_envio: float, cobrado_al_cliente: float) -> 
 
 def absorcion_fuera_de_tope(costo_envio: float, mercancia_pagada: float,
                             cobrado_al_cliente: float) -> float:
-    """Cuánto se pasó la casa del tope del 10% en ESTE pedido. 0 si respetó la regla.
+    """Cuánto se pasó la casa del tope del 5% en ESTE pedido. 0 si respetó la regla.
 
     No decide nada: mide. Sirve para que un envío que se traga el pedido se vea en
     la orden y en la bitácora en vez de desaparecer, mientras el cobro siga apagado.

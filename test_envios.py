@@ -7,7 +7,7 @@ Lo que cuidan, en orden de cuánto duele si se rompe:
      casa: creerle un precio al navegador ya costó dinero (2026-07-27).
   2. Que solo se le enseñen las paqueterías permitidas (Estafeta y Paquetexpress)
      y solo las que cumplen el plazo, aunque la API devuelva veintitantas.
-  3. La regla del 10% y su tope.
+  3. La política de envío: compra mínima primero, tope del 5% después.
   4. Que la guía se compre sola con los CUATRO métodos de pago.
   5. Que sin credenciales y sin remitente nada reviente — y que sin remitente NO
      se compre.
@@ -439,36 +439,91 @@ def test_media_cotizacion_no_se_le_enseña_al_cliente(monkeypatch, con_llave):
 
 
 # ==========================================================================
-#  3. La regla del 10% y su tope
+#  3. La regla del 5% y su tope
+#
+#  ⛔ POLÍTICA NUEVA (Christián, 2026-07-31), en sus palabras: «gratis siempre y
+#  cuando el ticket supere los $2,500 de compra mínima y/o [el envío] no sea mayor a
+#  5% del total de la compra. Primero se debe cumplir la compra mínima.»
+#
+#  Son DOS candados y el orden importa: la mínima manda, y sólo después se mira el 5%.
+#  El tope venía siendo del 10% desde el 2026-07-28.
 # ==========================================================================
+def test_el_tope_bajo_del_10_al_5_por_ciento():
+    """El número que decide todo. Escrito aquí para que nadie lo mueva de callado."""
+    assert envios.TOPE_ENVIO_SOBRE_COMPRA == 0.05
+
+
+def test_la_compra_minima_se_escribe_en_pesos_y_NO_se_deriva_del_tope():
+    """Antes el umbral era `SHIPPING_FLAT / TOPE` (250 / 10% = 2,500). Con el 5% esa
+    cuenta lo habría movido solo a $5,000 sin que nadie lo pidiera. Christián lo dictó
+    en pesos, así que en pesos vive."""
+    assert envios.COMPRA_MINIMA_ENVIO_GRATIS == 2500
+    assert server.FREE_SHIPPING_FROM == 2500
+
+
 def test_compra_chica_paga_su_envio_completo():
     # $879 de mercancía con $250 de envío: absorberlo se come el 28% del ingreso.
     assert envios.cobro_de_envio_al_cliente(250, 879, 2500) == 250
 
 
+def test_PRIMERO_la_compra_minima_por_barato_que_salga_el_envio():
+    """El orden que subrayó Christián. Una guía de $5 en un pedido de $500 es el 1%
+    —cabe de sobra en el 5%— y AUN ASÍ se cobra: no llegó a la compra mínima."""
+    assert envios.cobro_de_envio_al_cliente(5, 500, 2500) == 5
+
+
 def test_compra_grande_con_envio_barato_va_gratis():
-    # $3,000 y el envío cuesta $250 → es el 8.3%, cabe en el 10%: lo absorbe la casa.
-    assert envios.cobro_de_envio_al_cliente(250, 3000, 2500) == 0
+    # $3,000 y una guía de $120 → es el 4%, cabe en el 5%: lo absorbe la casa.
+    assert envios.cobro_de_envio_al_cliente(120, 3000, 2500) == 0
+    # Y con la guía de $250 de siempre, el 5% no la tapa hasta los $5,000.
+    assert envios.cobro_de_envio_al_cliente(250, 5000, 2500) == 0
 
 
-def test_el_tope_del_10_por_ciento_es_exacto():
-    assert envios.cobro_de_envio_al_cliente(300, 3000, 2500) == 0      # justo el 10%
-    assert envios.cobro_de_envio_al_cliente(301, 3000, 2500) > 0       # un peso más, ya no
+def test_el_tope_del_5_por_ciento_es_exacto():
+    assert envios.cobro_de_envio_al_cliente(150, 3000, 2500) == 0      # justo el 5%
+    assert envios.cobro_de_envio_al_cliente(151, 3000, 2500) > 0       # un peso más, ya no
+
+
+def test_entre_la_minima_y_el_5_por_ciento_el_cobro_es_PARCIAL():
+    """⚠️ LA CONSECUENCIA QUE HAY QUE TENER PRESENTE. Con una guía de $250, bajar el
+    tope al 5% mueve el "gratis de verdad" de $2,500 a $5,000. En medio no se cobra
+    todo ni nada: se cobra la diferencia, y baja sola conforme sube el ticket."""
+    assert envios.cobro_de_envio_al_cliente(250, 2500, 2500) == 125    # casa: 125
+    assert envios.cobro_de_envio_al_cliente(250, 3000, 2500) == 100    # casa: 150
+    assert envios.cobro_de_envio_al_cliente(250, 4000, 2500) == 50     # casa: 200
+    assert envios.cobro_de_envio_al_cliente(250, 5000, 2500) == 0      # casa: 250
 
 
 def test_arriba_del_tope_el_cliente_paga_SOLO_la_diferencia():
-    """DECIDIDO por Christian el 2026-07-28: "el cliente paga la diferencia y la
-    casa absorbe hasta el 10% del costo del envío máximo". Pedido de $3,000 con
-    envío de $600: la casa pone $300 (su 10%) y el cliente paga los otros $300."""
+    """DECIDIDO por Christian el 2026-07-28 y ratificado el 2026-07-31: "el cliente
+    paga la diferencia y la casa absorbe hasta el [tope] del costo del envío máximo".
+    Pedido de $3,000 con envío de $600: la casa pone $150 (su 5%) y el cliente $450."""
     assert envios.CLIENTE_PAGA_EL_ENVIO_COMPLETO_AL_PASAR_EL_TOPE is False
-    assert envios.cobro_de_envio_al_cliente(600, 3000, 2500) == 300
+    assert envios.cobro_de_envio_al_cliente(600, 3000, 2500) == 450
 
 
-def test_la_casa_nunca_absorbe_mas_del_10_por_ciento():
+def test_la_casa_nunca_absorbe_mas_del_5_por_ciento():
     """Es el otro lado de la misma regla: por cara que salga la guía, la casa se
-    queda topada en el 10% de la compra."""
-    assert envios.cobro_de_envio_al_cliente(2000, 3000, 2500) == 1700   # casa: 300
-    assert envios.cobro_de_envio_al_cliente(310, 3000, 2500) == 10      # casa: 300
+    queda topada en el 5% de la compra."""
+    assert envios.cobro_de_envio_al_cliente(2000, 3000, 2500) == 1850   # casa: 150
+    assert envios.cobro_de_envio_al_cliente(160, 3000, 2500) == 10      # casa: 150
+
+
+def test_la_tarifa_plana_es_un_PRECIO_y_solo_manda_abajo_de_la_minima():
+    """`tarifa_plana` existe porque lo que se COBRA abajo de la mínima no tiene por qué
+    ser lo que la guía CUESTA. Sin ella (el camino de Skydropx) el cliente paga la
+    guía real, que es justo lo que se cotizó."""
+    # Abajo de la mínima manda la tarifa, no el costo.
+    assert envios.cobro_de_envio_al_cliente(400, 879, 2500, tarifa_plana=219) == 219
+    assert envios.cobro_de_envio_al_cliente(80, 879, 2500, tarifa_plana=219) == 219
+    # Arriba de la mínima la tarifa no pinta nada: ahí manda el 5% contra el costo real.
+    assert envios.cobro_de_envio_al_cliente(120, 3000, 2500, tarifa_plana=219) == 0
+    assert envios.cobro_de_envio_al_cliente(250, 3000, 2500, tarifa_plana=219) == 100
+    # Sin tarifa: el comportamiento de siempre, se cobra la guía completa.
+    assert envios.cobro_de_envio_al_cliente(400, 879, 2500) == 400
+    # Y una tarifa con basura no puede dejar el envío en un número raro.
+    assert envios.cobro_de_envio_al_cliente(400, 879, 2500, tarifa_plana='x') == 400
+    assert envios.cobro_de_envio_al_cliente(400, 879, 2500, tarifa_plana=-9) == 400
 
 
 def test_la_otra_definicion_se_prende_cambiando_una_sola_linea(monkeypatch):
@@ -489,7 +544,7 @@ def test_la_regla_no_revienta_con_basura():
     assert envios.cobro_de_envio_al_cliente(-50, 5000, 2500) == 0
 
 
-def test_el_10_por_ciento_vive_en_un_solo_lugar():
+def test_el_tope_vive_en_un_solo_lugar():
     """Escrito dos veces se desalinea en silencio — ya pasó el 2026-07-27."""
     assert server.TOPE_ENVIO_SOBRE_COMPRA is envios.TOPE_ENVIO_SOBRE_COMPRA
 
@@ -915,46 +970,82 @@ def test_la_url_por_omision_es_la_de_skydropx_PRO():
 
 
 # ==========================================================================
-#  8. EL TOPE DEL 10% TAMBIÉN EN LA TARIFA PLANA (Christian, 2026-07-28)
+#  8. EL TOPE TAMBIÉN EN LA TARIFA PLANA (Christian, 2026-07-28; tope al 5% el 07-31)
 #
-#  «Envío gratis arriba de $2,500 PERO con tope del 10%: si una compra por 2,500
-#  genera un costo de envío de $500 ni en pedo lo pago.»
+#  «Envío gratis arriba de $2,500 PERO con tope: si una compra por 2,500 genera un
+#  costo de envío de $500 ni en pedo lo pago.»
 #
-#  El camino de la tarifa plana (`shipping_for`, el que se usará el día que
-#  `COBRAR_ENVIO` se ponga en True) tenía su PROPIA cuenta —"gratis arriba de
-#  $2,500"— que nunca miraba lo que la guía costaba de verdad. La regla del 10%
+#  El camino de la tarifa plana (`shipping_for`) tenía su PROPIA cuenta —"gratis
+#  arriba de $2,500"— que nunca miraba lo que la guía costaba de verdad. El tope
 #  existía sólo en el camino de Skydropx. Ahora hay UNA sola regla.
 # ==========================================================================
-def test_la_tarifa_plana_usa_LA_MISMA_regla_del_10_por_ciento():
-    """`shipping_for` no decide nada por su cuenta: delega en la regla de envios.py."""
-    for compra in (0, 179, 879, 2499, 2500, 3000, 50000):
+def test_la_tarifa_plana_usa_LA_MISMA_regla_del_tope():
+    """`shipping_for` no decide nada por su cuenta: delega en la regla de envios.py.
+    Lo único que pone son los tres números de la casa — costo de la guía, compra
+    mínima y tarifa plana."""
+    for compra in (0, 179, 879, 2499, 2500, 3000, 5000, 50000):
         assert server.shipping_for(compra) == envios.cobro_de_envio_al_cliente(
-            server.SHIPPING_FLAT, compra, server.FREE_SHIPPING_FROM)
+            server.COSTO_GUIA_ESTIMADO, compra, server.FREE_SHIPPING_FROM,
+            tarifa_plana=server.SHIPPING_FLAT)
+
+
+def test_la_tarifa_que_se_cobra_y_el_costo_de_la_guia_son_DOS_numeros():
+    """Se separaron el 2026-07-31. Mezclados, bajar el precio al cliente movía solo
+    —y en silencio— el punto donde el envío sale gratis: con $200 de "costo" falso el
+    gratis empezaría en $4,000 en vez de $5,000 sin que nadie lo decidiera."""
+    assert server.SHIPPING_FLAT == 250          # lo que se COBRA abajo de la mínima
+    assert server.COSTO_GUIA_ESTIMADO == 250    # lo que la guía CUESTA
+    # Bajar la tarifa NO mueve el punto donde el envío es gratis de verdad.
+    assert envios.cobro_de_envio_al_cliente(250, 5000, 2500, tarifa_plana=200) == 0
+    assert envios.cobro_de_envio_al_cliente(250, 4000, 2500, tarifa_plana=200) == 50
+
+
+def test_los_numeros_de_envio_se_pueden_mover_sin_desplegar():
+    """Christián dijo «quizás $200 o $219» — un QUIZÁS, no una orden. El día que
+    decida se cambia en el .env del servidor, no en el código."""
+    assert server._pesos_de_entorno('NO_EXISTE_ESTA_VARIABLE_DE_ENVIO', 250) == 250
+    os.environ['ENVIO_DE_PRUEBA'] = '219'
+    try:
+        assert server._pesos_de_entorno('ENVIO_DE_PRUEBA', 250) == 219
+        # Basura o negativo: manda el valor de fábrica. Un envío en $0 por un dedazo
+        # en el .env es dinero que se va sin que nadie se entere.
+        os.environ['ENVIO_DE_PRUEBA'] = 'doscientos'
+        assert server._pesos_de_entorno('ENVIO_DE_PRUEBA', 250) == 250
+        os.environ['ENVIO_DE_PRUEBA'] = '-50'
+        assert server._pesos_de_entorno('ENVIO_DE_PRUEBA', 250) == 250
+        os.environ['ENVIO_DE_PRUEBA'] = '   '
+        assert server._pesos_de_entorno('ENVIO_DE_PRUEBA', 250) == 250
+    finally:
+        os.environ.pop('ENVIO_DE_PRUEBA', None)
 
 
 def test_un_pedido_de_179_NUNCA_lleva_envio_gratis():
     """$250 de guía sobre $179 de mercancía es el 140% del pedido."""
     assert server.shipping_for(179) == server.SHIPPING_FLAT
     assert envios.cobro_de_envio_al_cliente(250, 179, server.FREE_SHIPPING_FROM) == 250
-    assert envios.tope_que_absorbe_la_casa(179) == 17.9
+    assert envios.tope_que_absorbe_la_casa(179) == 8.95
 
 
 def test_una_guia_cara_ya_no_se_regala_por_pasar_el_umbral():
     """$2,600 de compra con una guía REAL de $500: el 19%. No va gratis.
     Antes `shipping_for` devolvía 0 para cualquier compra arriba de $2,500,
     costara lo que costara la guía."""
-    # La casa absorbe su 10% ($260) y el cliente paga los otros $240.
-    assert server.shipping_for(2600, costo_real=500) == 240
-    assert server.shipping_for(2600, costo_real=250) == 0      # el 9.6%: sí cabe
+    # La casa absorbe su 5% ($130) y el cliente paga los otros $370.
+    assert server.shipping_for(2600, costo_real=500) == 370
+    # Y ni siquiera la guía de $250 cabe ya en el 5% de $2,600 ($130).
+    assert server.shipping_for(2600, costo_real=250) == 120
+    assert server.shipping_for(2600, costo_real=120) == 0      # el 4.6%: sí cabe
 
 
 def test_lo_que_la_casa_absorbe_y_cuanto_se_pasa_del_tope():
-    # Pedido de $179, guía de $250, cobro apagado: la casa se come los $250 enteros.
+    # Pedido de $179, guía de $250, envío regalado: la casa se come los $250 enteros.
     assert envios.envio_que_absorbe_la_casa(250, 0) == 250
-    assert envios.absorcion_fuera_de_tope(250, 179, 0) == 232.1     # 250 − 17.90
-    # Pedido de $3,000 con guía de $250: cabe en el 10%, no se pasa de nada.
-    assert envios.absorcion_fuera_de_tope(250, 3000, 0) == 0
-    # Y si el cliente la pagó, la casa no absorbe nada.
+    assert envios.absorcion_fuera_de_tope(250, 179, 0) == 241.05    # 250 − 8.95
+    # Pedido de $3,000 con guía de $250 regalada: el 5% son $150, se pasa por $100.
+    assert envios.absorcion_fuera_de_tope(250, 3000, 0) == 100
+    # Pero cobrando lo que manda la política nueva ($100), la casa se queda en su tope.
+    assert envios.absorcion_fuera_de_tope(250, 3000, 100) == 0
+    # Y si el cliente la pagó completa, la casa no absorbe nada.
     assert envios.envio_que_absorbe_la_casa(250, 250) == 0
     assert envios.absorcion_fuera_de_tope(250, 179, 250) == 0
 
@@ -973,13 +1064,18 @@ def test_el_pedido_guarda_lo_que_la_casa_absorbe_aunque_no_cobre_envio():
     assert server.COBRAR_ENVIO is True               # política nueva: $250 parejo
     # Pedido de $179: el cliente paga los $250, la casa no absorbe nada.
     cobrado = server.shipping_for(179)
-    costo_guia = server.SHIPPING_FLAT
+    costo_guia = server.COSTO_GUIA_ESTIMADO
     assert cobrado == 250
     assert envios.envio_que_absorbe_la_casa(costo_guia, cobrado) == 0
-    # Pedido de $3,000: va gratis, y ahí SÍ lo absorbe la casa — y queda registrado.
-    assert server.shipping_for(3000) == 0
+    # Pedido de $3,000: el cliente pone $100 y la casa absorbe sus $150 — su tope
+    # exacto. Y queda registrado, que es de lo que se trata.
+    assert server.shipping_for(3000) == 100
+    assert envios.envio_que_absorbe_la_casa(costo_guia, 100) == 150
+    assert envios.absorcion_fuera_de_tope(costo_guia, 3000, 100) == 0
+    # Pedido de $5,000: gratis de verdad, y los $250 los absorbe la casa dentro del 5%.
+    assert server.shipping_for(5000) == 0
     assert envios.envio_que_absorbe_la_casa(costo_guia, 0) == 250
-    assert envios.absorcion_fuera_de_tope(costo_guia, 3000, 0) == 0   # 250 cabe en el 10%
+    assert envios.absorcion_fuera_de_tope(costo_guia, 5000, 0) == 0
 
 
 # ==========================================================================
