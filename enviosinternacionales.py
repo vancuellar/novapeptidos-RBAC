@@ -186,6 +186,31 @@ def remitente() -> dict:
     return skydropx.remitente()
 
 
+def saldo() -> dict:
+    """El saldo de ESTA cuenta. Misma ruta que Skydropx — su propia documentación dice
+    «obtiene el saldo de la cuenta Skydropx actual», que es otra confirmación de que es
+    la misma casa con otro nombre. Ver `skydropx.saldo` para el porqué."""
+    if not enabled():
+        return {'ok': False, 'motivo': 'sin credenciales'}
+    try:
+        d = _get('/finance/credits')
+    except Exception as e:
+        return {'ok': False, 'motivo': str(e)[:200]}
+    cuerpo = d.get('data') if isinstance(d, dict) and isinstance(d.get('data'), dict) else d
+    if isinstance(cuerpo, dict) and isinstance(cuerpo.get('attributes'), dict):
+        cuerpo = cuerpo['attributes']
+    if not isinstance(cuerpo, dict):
+        return {'ok': False, 'motivo': 'respuesta inesperada'}
+    for clave in ('balance', 'credits', 'amount', 'saldo', 'available_credit'):
+        if cuerpo.get(clave) is not None:
+            try:
+                return {'ok': True, 'saldo': float(cuerpo[clave]),
+                        'moneda': str(cuerpo.get('currency') or cuerpo.get('currency_code') or 'MXN')}
+            except (TypeError, ValueError):
+                pass
+    return {'ok': False, 'motivo': f'no se encontro el saldo en {sorted(cuerpo)[:6]}'}
+
+
 def _esperar_cotizacion(data: dict, espera_max: float) -> dict:
     """Vuelve a preguntar hasta que la cotización esté completa. O se rinde.
 

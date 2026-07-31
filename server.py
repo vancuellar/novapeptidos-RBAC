@@ -1641,6 +1641,20 @@ async def admin_envios_config(admin=Depends(get_current_admin)):
     }
 
 
+@api_router.get('/admin/envios/saldo')
+async def admin_saldo_paqueterias(admin=Depends(get_current_admin)):
+    """Cuánto dinero queda en cada cuenta de paquetería para comprar guías.
+
+    ⛔ EXISTE POR UN SUSTO REAL (2026-07-31). La primera compra de verdad rebotó con «No
+    tienes los créditos suficientes» — con el pedido YA PAGADO y la clienta esperando.
+    Cotizar es gratis y siempre funcionó, así que nada avisaba de que la cuenta estaba en
+    ceros hasta el segundo exacto de comprar. Esto se mira ANTES de despachar.
+    """
+    return {'proveedores': [
+        {'clave': c, 'nombre': n, **mod.saldo()}
+        for c, n, mod in paqueterias.PROVEEDORES]}
+
+
 @api_router.get('/admin/envios/costo-real')
 async def admin_costo_real_envio(csv: int = 0, admin=Depends(get_current_admin)):
     """Lo que de VERDAD han costado las guías. Es lo que alimenta el piso de 5× del ROI.

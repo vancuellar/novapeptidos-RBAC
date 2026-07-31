@@ -169,6 +169,40 @@ def _get(ruta: str):
     return _llamar(requests.get, ruta)
 
 
+# --------------------------------------------------------------- el saldo
+def saldo() -> dict:
+    """Cuánto dinero queda en la cuenta para comprar guías.
+
+    ⛔ EXISTE POR UN SUSTO REAL (2026-07-31). La primera compra de verdad rebotó con
+    «No tienes los créditos suficientes para este envío» — con el pedido ya pagado y la
+    clienta esperando. Cotizar es gratis y siempre funcionó, así que nada avisaba de que
+    la cuenta estaba en ceros hasta el momento exacto de comprar.
+
+    Se pregunta ANTES de despachar y se enseña en el panel. Nunca revienta: si la ruta
+    falla, se devuelve el motivo y el despacho sigue su curso — un panel que no puede
+    pintar un saldo no puede ser la razón de que no salga un paquete.
+    """
+    if not enabled():
+        return {'ok': False, 'motivo': 'sin credenciales'}
+    try:
+        d = _get('/finance/credits')
+    except Exception as e:
+        return {'ok': False, 'motivo': str(e)[:200]}
+    cuerpo = d.get('data') if isinstance(d, dict) and isinstance(d.get('data'), dict) else d
+    if isinstance(cuerpo, dict) and isinstance(cuerpo.get('attributes'), dict):
+        cuerpo = cuerpo['attributes']
+    if not isinstance(cuerpo, dict):
+        return {'ok': False, 'motivo': 'respuesta inesperada'}
+    for clave in ('balance', 'credits', 'amount', 'saldo', 'available_credit'):
+        if cuerpo.get(clave) is not None:
+            try:
+                return {'ok': True, 'saldo': float(cuerpo[clave]),
+                        'moneda': str(cuerpo.get('currency') or cuerpo.get('currency_code') or 'MXN')}
+            except (TypeError, ValueError):
+                pass
+    return {'ok': False, 'motivo': f'no se encontro el saldo en {sorted(cuerpo)[:6]}'}
+
+
 # --------------------------------------------------------------- el remitente
 # ⚠️ PENDIENTE DE CHRISTIAN: la dirección de quien envía.
 #
