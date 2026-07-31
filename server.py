@@ -6661,6 +6661,10 @@ async def business_chat_history(session_id: str, user=Depends(get_current_distri
 
 
 # ----------------- Startup: seed -----------------
+# Handle del barrido de carritos, para poder cancelarlo al apagar.
+_TAREA_RECUPERACION = None
+
+
 @app.on_event('startup')
 async def arrancar_recuperacion():
     """Cada 15 minutos revisa los carritos abandonados y manda LA oferta a quien
@@ -6672,7 +6676,15 @@ async def arrancar_recuperacion():
                 await _barrer_intentos()
             except Exception:
                 logger.exception('Fallo el barrido de carritos abandonados')
-    asyncio.create_task(bucle())
+    # ⛔ SE GUARDA LA TAREA PARA PODER MATARLA. Sin esto el bucle queda vivo y
+    # dormido 15 minutos, y al apagar la app el grupo de tareas de anyio lo
+    # ESPERA: en producción no se nota (el proceso muere entero), pero en las
+    # pruebas cada `with TestClient(app)` colgaba la corrida hasta un cuarto de
+    # hora. Se veía como un pytest "trabado" al 36%, sin error y sin pista, y
+    # aparecía sólo a veces — la peor clase de falla, porque se le echa la culpa
+    # al cambio de quien pasaba por ahí. Ver `apagar_recuperacion`.
+    global _TAREA_RECUPERACION
+    _TAREA_RECUPERACION = asyncio.create_task(bucle())
 
 
 # ⛔ EL REINTENTO. Cuando la compra de la guía falla por algo pasajero —la cuenta se
@@ -6906,6 +6918,24 @@ async def seed_db():
             logger.info(f'Seeded {len(PRODUCTS)} products')
     except Exception as e:
         logger.error(f'Seed error: {e}')
+
+
+@app.on_event('shutdown')
+async def apagar_recuperacion():
+    """El barrido de carritos se cancela ANTES de cerrar nada más.
+
+    Es el par de `arrancar_recuperacion`: su bucle duerme 900 segundos entre
+    vuelta y vuelta, y una tarea dormida que nadie cancela deja el apagado
+    esperandola."""
+    tarea = _TAREA_RECUPERACION
+    if tarea is not None and not tarea.done():
+        tarea.cancel()
+        try:
+            await tarea
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception('El barrido de carritos murio raro al apagar')
 
 
 @app.on_event('shutdown')

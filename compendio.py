@@ -104,8 +104,10 @@ CATEGORIA_POR_TEMA = {
                             'musculo', 'crecimiento'),
     'recuperacion': ('recupera', 'lesion', 'tendon', 'articulacion', 'rodilla',
                      'cicatriz', 'reparacion', 'inflamacion', 'intestin'),
+    # El sueño no tiene categoría propia: DSIP y las orexinas viven en nootrópicos.
     'nootropicos': ('memoria', 'concentracion mental', 'cognitiv', 'cerebro',
-                    'nootropic', 'enfoque'),
+                    'nootropic', 'enfoque', 'dormir', 'sueno', 'insomni',
+                    'descansar'),
     'estetica': ('piel', 'arruga', 'colageno', 'cabello', 'pelo', 'estetic',
                  'bronce'),
     'sexual-hormonal': ('libido', 'sexual', 'erecc', 'testosterona', 'hormonal'),

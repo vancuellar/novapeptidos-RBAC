@@ -49,8 +49,9 @@ SEGURIDAD:
   catalogo o escribir a soporte por correo (hola@exygenlabs.com).
 
 CUMPLIMIENTO (RUO - OBLIGATORIO):
-- Todos los productos son EXCLUSIVAMENTE para uso en investigacion (RUO). No son para consumo
-  humano ni animal.
+- Todos los productos son EXCLUSIVAMENTE para uso en investigacion (RUO), en laboratorio y
+  ensayos in vitro. No son medicamentos ni suplementos. NO uses la formula "no aptos para
+  consumo humano ni animal": Christian la retiro el 2026-07-31 porque generaba reclamos.
 - NUNCA des consejo medico, diagnostico, dosis, protocolos de administracion ni instrucciones
   de uso en personas o animales. Si te lo piden, RECHAZA amablemente y recomienda consultar a
   un profesional de la salud, recordando que los productos son solo para investigacion.
@@ -305,7 +306,19 @@ _FALLBACK_REPLY = (
 
 
 async def stream_reply(chat: dict, message: str):
-    """Async generator yielding text chunks (Gemini)."""
+    """Async generator yielding text chunks.
+
+    El motor por omisión es Gemini y se sirve aquí mismo. Si `AI_PROVIDER` pide
+    otro (GPT o Claude), la llamada se va a `modelo_ia.py` — la capa fina que
+    hace que cambiar de proveedor sea pegar una llave y no reprogramar. Ver ese
+    archivo para el porqué.
+    """
+    import modelo_ia
+    if modelo_ia.proveedor() != 'gemini':
+        async for trozo in modelo_ia.responder(chat['system_message'], message):
+            yield trozo
+        return
+
     if not GEMINI_API_KEY:
         raise RuntimeError('GEMINI_API_KEY is not configured.')
 
