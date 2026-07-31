@@ -19,6 +19,17 @@ WELCOME_SUBJECTS = {
     'pt': 'Sua conta na Exygen Labs está pronta',
 }
 
+# ⛔ QUIEN ATIENDE AL CLIENTE ES LA CASA, NUNCA EL DISTRIBUIDOR
+# (orden de Christián, 2026-07-31). El cliente final no puede enterarse de que el
+# código que usó es de María, de Alanís o de quien sea: eso es su lista de
+# clientes, y con un nombre y un correo se la puede llevar cualquiera.
+#
+# Por eso todo correo que ve un cliente firma con ESTA persona —la atención de la
+# casa— y la respuesta cae en ESTE buzón. El distribuidor se entera por dentro
+# (la campanita del panel), no exponiéndose en el correo.
+ATENCION_NOMBRE = 'Mónica Flores'
+ATENCION_CORREO = os.environ.get('ATENCION_EMAIL', 'hola@exygenlabs.com')
+
 
 def normalize_language(language):
     lang = (language or DEFAULT_LANGUAGE).lower().strip()[:2]
@@ -1126,7 +1137,6 @@ QUOTE_COPY = {
         'greet': 'HOLA {name}',
         'greetPlain': 'HOLA',
         'intro': '{advisor} preparó esta cotización para ti. Los precios ya traen tu descuento.',
-        'introPlain': 'Preparamos esta cotización para ti. Los precios ya traen tu descuento.',
         'folioLabel': 'Cotización',
         'items': 'Lo que cotizaste',
         'money': 'El dinero',
@@ -1140,7 +1150,7 @@ QUOTE_COPY = {
         'codeTitle': 'Tu código de descuento',
         'codeNote': 'Entra con el botón de arriba y tu descuento se aplica solo. También puedes teclear el código al pagar.',
         'validity': 'Cotización informativa, vigencia de 7 días. Precios en pesos mexicanos (MXN) e incluyen IVA. El envío se calcula al pagar.',
-        'help': '¿Dudas? Contesta este correo y le llega a quien te cotizó, o escríbenos a',
+        'help': '¿Dudas? Contesta este correo y te atiende Mónica, o escríbenos a',
         'ruo': 'Productos para uso exclusivo en investigación (RUO). No son medicamentos ni suplementos; no se venden para consumo humano ni animal.',
         'thanks': 'GRACIAS POR TU INTERÉS',
         'each': 'c/u',
@@ -1151,7 +1161,6 @@ QUOTE_COPY = {
         'greet': 'HELLO {name}',
         'greetPlain': 'HELLO',
         'intro': '{advisor} put together this quote for you. Prices already include your discount.',
-        'introPlain': 'We put together this quote for you. Prices already include your discount.',
         'folioLabel': 'Quote',
         'items': 'What you asked for',
         'money': 'The money',
@@ -1165,7 +1174,7 @@ QUOTE_COPY = {
         'codeTitle': 'Your discount code',
         'codeNote': 'Use the button above and your discount applies by itself. You can also type the code at checkout.',
         'validity': 'Informational quote, valid for 7 days. Prices in Mexican pesos (MXN), tax included. Shipping is calculated at checkout.',
-        'help': 'Questions? Reply to this email and it reaches whoever quoted you, or write to',
+        'help': 'Questions? Reply to this email and Mónica will take care of you, or write to',
         'ruo': 'Research use only (RUO) products. Not medicines or supplements; not sold for human or animal consumption.',
         'thanks': 'THANK YOU FOR YOUR INTEREST',
         'each': 'each',
@@ -1176,7 +1185,6 @@ QUOTE_COPY = {
         'greet': 'OLA {name}',
         'greetPlain': 'OLA',
         'intro': '{advisor} preparou este orçamento para você. Os preços já incluem o seu desconto.',
-        'introPlain': 'Preparamos este orçamento para você. Os preços já incluem o seu desconto.',
         'folioLabel': 'Orçamento',
         'items': 'O que você pediu',
         'money': 'O dinheiro',
@@ -1190,7 +1198,7 @@ QUOTE_COPY = {
         'codeTitle': 'Seu código de desconto',
         'codeNote': 'Entre pelo botão acima e o seu desconto é aplicado sozinho. Você também pode digitar o código no pagamento.',
         'validity': 'Orçamento informativo, validade de 7 dias. Preços em pesos mexicanos (MXN), impostos incluídos. O frete é calculado no pagamento.',
-        'help': 'Dúvidas? Responda este e-mail e chega a quem te orçou, ou escreva para',
+        'help': 'Dúvidas? Responda este e-mail e a Mónica te atende, ou escreva para',
         'ruo': 'Produtos para uso exclusivo em pesquisa (RUO). Não são medicamentos nem suplementos; não são vendidos para consumo humano ou animal.',
         'thanks': 'OBRIGADO PELO SEU INTERESSE',
         'each': 'cada',
@@ -1201,9 +1209,16 @@ QUOTE_COPY = {
 def _quote_email_html(copy, quote):
     """La cotización con el mismo lenguaje visual del correo de pedido.
 
-    `quote`: {folio, client_name, advisor, code, link, lines, list_total,
-              savings, total}. `lines`: [{name, quantity, unit_price, amount,
+    `quote`: {folio, client_name, code, link, lines, list_total, savings,
+              total}. `lines`: [{name, quantity, unit_price, amount,
               list_price}] — nombre, cuánto y a cómo. Nada más.
+
+    ⛔ QUIEN FIRMA ES LA CASA. El saludo NO lee ningún `advisor` que venga en
+    `quote`: siempre pinta `ATENCION_NOMBRE`. Este correo lo abre un CLIENTE
+    FINAL, y aquí llevaba el nombre del distribuidor — o sea, su identidad
+    regalada en el primer correo. El candado vive aquí, en el que arma el HTML,
+    y no en quien lo llama: así, aunque mañana alguien vuelva a meter el nombre
+    del distribuidor en el diccionario, no hay por dónde salga.
     """
     esc = html.escape
     INK, BODY, MUTED, LINE, BG = '#132763', '#3D4657', '#8A93A8', '#E4E8F0', '#FBFCFE'
@@ -1281,8 +1296,7 @@ def _quote_email_html(copy, quote):
 
     nombre = str(quote.get('client_name', '') or '').strip()
     saludo = copy['greet'].format(name=esc(nombre.upper())) if nombre else copy['greetPlain']
-    asesor = str(quote.get('advisor', '') or '').strip()
-    intro = copy['intro'].format(advisor=esc(asesor)) if asesor else copy['introPlain']
+    intro = copy['intro'].format(advisor=esc(ATENCION_NOMBRE))
     folio = esc(str(quote.get('folio', '') or ''))
     link = quote.get('link') or 'https://exygenlabs.com/catalogo'
 
@@ -1382,7 +1396,7 @@ def _quote_email_html(copy, quote):
 
           <tr>
             <td class="em-muted" style="padding:20px 40px 8px 40px; font-family:{FONT}; font-size:13px; line-height:1.6; color:{MUTED};">
-              {copy['help']} <a href="mailto:hola@exygenlabs.com" class="em-link" style="color:{INK};">hola@exygenlabs.com</a>
+              {copy['help']} <a href="mailto:{ATENCION_CORREO}" class="em-link" style="color:{INK};">{ATENCION_CORREO}</a>
             </td>
           </tr>
 

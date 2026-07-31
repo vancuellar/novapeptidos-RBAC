@@ -778,8 +778,15 @@ def test_el_aviso_de_sobre_pedido_viaja_en_la_respuesta():
     src = _fuente()
     ini = src.index('async def create_order(')
     cuerpo = src[ini:src.index('\nasync def', ini + 10)]
-    assert 'result = clean(order.model_dump())' in cuerpo, (
+    assert 'clean(order.model_dump())' in cuerpo, (
         'la respuesta ya no sale del pedido completo: el aviso no llegaría al navegador')
+    # Desde el 2026-07-31 la respuesta pasa por `pedido_para_el_cliente`, que borra
+    # el rastro del distribuidor. Ese filtro NO puede llevarse el aviso de entrega
+    # partida por delante: el cliente tiene que enterarse de que llega en dos.
+    import server
+    for campo in ('backorder', 'backorder_items'):
+        assert campo not in server.CAMPOS_DEL_DISTRIBUIDOR, \
+            f'el filtro del cliente se está comiendo {campo!r}'
 
 
 def test_el_inventario_real_ya_no_se_resta_dos_veces():

@@ -109,6 +109,9 @@ class _Coll:
     async def update_one(self, *a, **k):
         return None
 
+    async def insert_one(self, *a, **k):
+        return None
+
 
 class _FakeDB:
     def __getattr__(self, name):
@@ -495,11 +498,14 @@ def test_el_nombre_del_cliente_va_escapado(como, correo):
     assert '<b>x</b>' not in correo['html']
 
 
-def test_la_respuesta_le_llega_al_distribuidor(como, correo):
-    """El remitente sigue siendo Exygen (dominio autenticado); lo que cambia es a
-    dónde va la respuesta."""
+def test_la_respuesta_le_llega_a_la_casa_no_al_distribuidor(como, correo):
+    """⛔ EL `reply_to` ERA EL CORREO PERSONAL DEL DISTRIBUIDOR (hasta 2026-07-31).
+    Bastaba con que el cliente picara "Responder" para ver de quién era el código.
+    Ahora contesta la atención de la casa; al distribuidor se le avisa por dentro."""
+    import emails
     como(DIST).post(RUTA_CORREO, json=CUERPO)
-    assert correo['reply_to'] == 'dist@x.mx'
+    assert correo['reply_to'] == emails.ATENCION_CORREO
+    assert correo['reply_to'] != 'dist@x.mx'
 
 
 def test_el_correo_va_en_el_idioma_pedido(como, correo):

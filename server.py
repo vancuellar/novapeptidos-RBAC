@@ -96,6 +96,7 @@ from emails import (
     send_invitation_email, send_order_email, send_payment_confirmed_email, normalize_language, email_enabled,
     send_admin_notification, send_distributor_welcome_email, send_news_email,
     send_purchase_alert, send_shipped_email, send_quote_email,
+    ATENCION_CORREO, ATENCION_NOMBRE,
 )
 from datetime import timedelta
 import asyncio
@@ -3110,7 +3111,9 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # checkout no se cae porque el correo no salga. Y va con A QUIÉN COMPRARLE pegado:
     # el nombre y el teléfono del proveedor más barato de cada renglón sobre pedido.
     asyncio.create_task(_avisar_de_la_compra(email_order, 'nuevo'))
-    result = clean(order.model_dump())
+    # La respuesta del checkout va al navegador del CLIENTE: sale sin quién lo
+    # refirió ni el reparto de comisiones (ver `pedido_para_el_cliente`).
+    result = pedido_para_el_cliente(clean(order.model_dump()))
     # Cripto: creamos la factura del proveedor encendido y devolvemos su enlace.
     # El pedido queda 'pendiente' hasta que su webhook confirme que llegó el
     # dinero. NOWPayments primero (más simple); BTCPay como respaldo.
@@ -3336,11 +3339,34 @@ async def set_stock(payload: dict, admin=Depends(get_current_admin)):
     return row
 
 
+# ⛔ EL PEDIDO QUE VE EL CLIENTE VA SIN RASTRO DEL DISTRIBUIDOR
+# (Christián, 2026-07-31). El pedido guarda quién lo refirió y cómo se repartió la
+# comisión —`referred_by`, `commission`, `commissions`— y esas tres rutas devolvían
+# el documento COMPLETO, tal cual sale de la base. Con eso, cualquiera que abriera
+# la consola del navegador después de comprar veía el id del distribuidor y cuánto
+# ganó; y `/orders/{numero}` ni siquiera pide sesión.
+#
+# El candado va aquí, en el servidor, y no escondiéndolo con CSS: lo que no viaja
+# no se puede leer. El distribuidor y el admin siguen viendo TODO lo suyo por sus
+# propias rutas (`/distributor/orders`, `/admin/orders`), que no pasan por aquí.
+CAMPOS_DEL_DISTRIBUIDOR = ('referred_by', 'commission', 'commissions')
+
+
+def pedido_para_el_cliente(order):
+    """El pedido tal como puede verlo quien compró: sin quién lo refirió ni cuánto
+    ganó nadie. Devuelve una copia; el documento original no se toca."""
+    if not order:
+        return order
+    limpio = {k: v for k, v in order.items() if k not in CAMPOS_DEL_DISTRIBUIDOR}
+    limpio.pop('_id', None)
+    return limpio
+
+
 @api_router.get('/orders/me')
 async def my_orders(user=Depends(get_current_user)):
     orders = await db.orders.find({'user_id': user['id']}, {'_id': 0}).to_list(200)
     orders.sort(key=lambda o: o.get('created_at', ''), reverse=True)
-    return orders
+    return [pedido_para_el_cliente(o) for o in orders]
 
 
 def spei_details():
@@ -3361,6 +3387,9 @@ async def get_order(order_number: str):
     order = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
     if not order:
         raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    # Esta ruta NO PIDE SESIÓN (el que compró como invitado no tiene cuenta), así
+    # que es la más expuesta de las tres: sale limpia de rastro del distribuidor.
+    order = pedido_para_el_cliente(order)
     # Solo un pedido SPEI (y solo ese) lleva la CLABE; la referencia es el número de pedido.
     if (order.get('payment_method') or '') == 'spei':
         order['spei'] = spei_details()
@@ -4014,7 +4043,15 @@ async def admin_analytics(admin=Depends(get_current_admin)):
 # ----------------- Public: validar codigo de distribuidor -----------------
 @api_router.get('/discount-code/{code}')
 async def check_discount_code(code: str):
-    """Publico: valida un codigo y devuelve SOLO el % de descuento (nada personal)."""
+    """Publico: valida un codigo y devuelve SOLO el % de descuento (nada personal).
+
+    ⛔ AQUÍ NO SE AGREGA NI UN CAMPO MÁS DEL DISTRIBUIDOR (Christián, 2026-07-31).
+    Esta ruta NO PIDE SESIÓN —el carrito la consulta antes de que nadie entre— así
+    que lo que conteste lo puede leer cualquiera con la dirección. Devolver aquí el
+    nombre o el correo de quien dio el código sería publicar de quién es cada
+    código: la lista de clientes del canal, servida en bandeja. Sólo el porcentaje
+    y las condiciones. Lo vigila `test_privacidad_distribuidor.py` y, en vivo,
+    `npm run auditoria`."""
     c = (code or '').strip().upper()
     cdoc = await db.discount_codes.find_one({'code': c, 'active': True, 'kind': 'coupon'})
     if cdoc and not cdoc.get('used') and (not cdoc.get('expires_at') or cdoc['expires_at'] >= now_iso()):
@@ -4268,7 +4305,10 @@ async def distributor_quote_email(payload: QuoteEmailRequest,
         'client_email': (payload.client_email or '').strip()[:120],
         'client_phone': (payload.client_phone or '').strip()[:40],
         'client_address': (payload.client_address or '').strip()[:200],
-        'advisor': (dist.get('name') or '').strip()[:80],
+        # ⛔ AQUÍ NO VA EL NOMBRE DEL DISTRIBUIDOR (Christián, 2026-07-31). Iba, y
+        # el cliente leía "María preparó esta cotización para ti": su identidad
+        # regalada en el primer correo. Quien firma es la atención de la casa, y
+        # ese nombre lo pone `emails.py`, no esta ruta.
         'code': codigo,
         'link': enlace,
         'lines': lineas,
@@ -4276,14 +4316,27 @@ async def distributor_quote_email(payload: QuoteEmailRequest,
         'savings': max(0.0, lista_total - total),
         'total': total,
     }
-    # El correo sale del dominio de Exygen (el autenticado); la RESPUESTA va al
-    # distribuidor, para que el cliente le conteste a quien le cotizó.
+    # ⛔ LA RESPUESTA CAE EN EL BUZÓN DE LA CASA, NO EN EL DEL DISTRIBUIDOR.
+    # Antes el `reply_to` era su correo personal: bastaba con que el cliente
+    # picara "Responder" para ver de quién era el código. Ahora contesta la
+    # atención de la casa, y al distribuidor se le avisa por dentro (abajo).
     salio = await send_quote_email(
         payload.email, cotizacion,
         language=payload.language or dist.get('language'),
-        reply_to=(dist.get('email') or None))
+        reply_to=ATENCION_CORREO)
     if not salio:
         raise HTTPException(status_code=502, detail='No se pudo enviar la cotización')
+    # El aviso POR DENTRO: el distribuidor sabe que su cotización salió y a quién,
+    # sin que su nombre ni su correo hayan viajado al cliente. Si la campanita
+    # falla, la cotización ya salió y eso no se deshace.
+    try:
+        await notify(dist['id'], 'quote_sent', 'Cotización enviada',
+                     f'Se envió tu cotización a {payload.email} por ${total:,.0f}. '
+                     f'El cliente ve a {ATENCION_NOMBRE} como quien lo atiende, y si '
+                     f'responde el correo la respuesta llega a {ATENCION_CORREO}.',
+                     link='/distribuidor')
+    except Exception:
+        logger.exception('No se pudo avisar la cotización a %s', dist['id'])
     return {'sent': True, 'total': total, 'lines': len(lineas)}
 
 
