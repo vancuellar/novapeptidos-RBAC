@@ -69,6 +69,9 @@ PEDIDO = {
     'shipping': 0, 'total': 2550, 'status': 'pendiente', 'created_at': '2026-07-31T10:00:00',
     # LO QUE DELATA: quién lo refirió y cuánto ganó cada quien.
     'referred_by': DIST['id'], 'commission': 450,
+    # Y la liga FIRMADA al PDF de la etiqueta, que trae el domicilio impreso.
+    'label_url': 'https://app.enviosinternacionales.com/s/s?id=firmada',
+    'label_provider': 'enviosinternacionales',
     'commissions': [{'distributor_id': DIST['id'], 'role': 'seller',
                      'rate': 0.30, 'amount': 450}],
 }
@@ -241,6 +244,27 @@ def test_el_rastreo_publico_no_delata_al_distribuidor(como):
     sin_rastro(r.text, 'GET /orders/{numero}')
     d = r.json()
     assert 'referred_by' not in d and 'commissions' not in d
+
+
+def test_la_liga_de_la_ETIQUETA_no_viaja_al_cliente(como):
+    """⛔ EL DOMICILIO DE QUIEN RECIBE, REGALADO A CUALQUIERA (hallado en vivo el
+    2026-07-31, con el pedido real de Brenda).
+
+    `label_url` parece inofensivo —«la liga de la guía», algo que el cliente ya
+    conoce— y por eso se coló. NO lo es: es la liga FIRMADA al PDF de la ETIQUETA, y
+    ese papel trae impreso el NOMBRE y el DOMICILIO COMPLETO de quien recibe, más la
+    dirección del remitente. Bastaba pedir `/api/orders/EX-...` SIN SESIÓN y bajar el
+    PDF. Y los números de pedido son enumerables: `EX-AAAAMMDD-` + cuatro dígitos.
+
+    Quien tiene que imprimir la etiqueta la pide por `/…/etiqueta` (ver etiquetas.py),
+    que sí exige rol y sirve el PDF desde la casa.
+    """
+    r = como(None).get(f'/api/orders/{PEDIDO["order_number"]}')
+    assert r.status_code == 200
+    assert 'label_url' not in r.json()
+    assert 'app.enviosinternacionales.com' not in r.text
+    # Y tampoco por la puerta de al lado, que también la usa el cliente.
+    assert all('label_url' not in o for o in como(CLIENTE).get('/api/orders/me').json())
 
 
 def test_mis_pedidos_no_delatan_al_distribuidor(como):

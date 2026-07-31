@@ -3822,10 +3822,19 @@ CAMPOS_DEL_DISTRIBUIDOR = ('referred_by', 'commission', 'commissions')
 # interna y `label_error` / `label_hold` son problemas de la casa, no del cliente.
 # Lo que el cliente sí necesita —`tracking_number`, `tracking_url`, `carrier`— se
 # queda: eso es justo lo que se le prometió por correo.
+# ⛔ Y `label_url` SOBRE TODO. Se coló en la primera pasada porque parece «la liga de
+# la guía», algo que el cliente ya conoce. NO LO ES: es la liga FIRMADA al PDF de la
+# ETIQUETA, y ese papel trae impreso el NOMBRE Y EL DOMICILIO COMPLETO de quien recibe,
+# más la dirección del remitente. Comprobado en vivo el 2026-07-31 con el pedido de
+# Brenda: bastaba pedir `/api/orders/EX-...` sin sesión y bajar el PDF para tener su
+# casa. Y los números de pedido son enumerables (`EX-AAAAMMDD-` + cuatro dígitos).
+# Quien tenga que imprimir la etiqueta la pide por `/…/etiqueta` (ver etiquetas.py),
+# que sí exige rol.
 CAMPOS_INTERNOS_DE_ENVIO = (
     'shipping_cost', 'shipping_absorbed', 'shipping_over_cap', 'shipping_quote',
-    'label_provider', 'label_error', 'label_hold', 'label_lock', 'label_intentos',
-    'label_ultimo_intento', 'label_precio_cotizado', 'label_piezas', 'label_empaque',
+    'label_provider', 'label_url', 'label_error', 'label_hold', 'label_lock',
+    'label_intentos', 'label_ultimo_intento', 'label_precio_cotizado', 'label_piezas',
+    'label_empaque',
     'emails_sent', 'card_checkout_url', 'card_preference_id', 'stock_taken',
 )
 
