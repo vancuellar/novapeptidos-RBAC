@@ -313,6 +313,10 @@ CABEZA
   cat <<'CUERPO'
     server_name _;
 
+    # Que las respuestas no anden pregonando "nginx/1.27.5": es informacion
+    # gratis para quien busque una version con agujeros conocidos.
+    server_tokens off;
+
     # Caddy no le pone tope al tamano de subida y nginx si (1 MB). Sin esto,
     # subir un COA o una ficha en PDF por el panel empezaria a fallar.
     client_max_body_size 100m;
