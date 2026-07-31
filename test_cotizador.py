@@ -20,6 +20,7 @@ SOBRE.
 """
 import json
 import os
+import re
 
 os.environ.setdefault('MONGO_URL', 'mongodb://localhost:27017')
 os.environ.setdefault('DB_NAME', 'exygen_test')
@@ -226,9 +227,18 @@ def test_el_checkout_y_el_cotizador_usan_la_misma_funcion():
 # `distributor_eligible` dentro, SIN sesión. No es el costo, pero dice cuánto
 # margen aguanta cada producto y cuáles no dejan 5x. Ahora sale recortado.
 
-MARGENES_PROHIBIDOS = ('commission_cap', 'distributor_eligible', 'comision',
-                       'comisión', 'commission', 'cap"', "cap'", 'margen', 'margin',
-                       'roi', 'costo', 'cost"', 'proveedor', 'provider')
+# Palabras completas, no pedazos: el catálogo trae descripciones de verdad y
+# "esteroidogénesis" contiene "roi". Sin el \b la prueba sería puro ruido y a la
+# tercera falsa alarma alguien la apaga — que es justo cuando deja de proteger.
+MARGENES_PROHIBIDOS = ('commission_cap', 'distributor_eligible', 'commission',
+                       'comision', 'comisión', 'cap', 'caps', 'margen', 'margin',
+                       'roi', 'costo', 'cost', 'proveedor', 'provider', 'supplier')
+
+
+def _sin_margenes(payload, donde):
+    crudo = json.dumps(payload, ensure_ascii=False).lower()
+    for palabra in MARGENES_PROHIBIDOS:
+        assert not re.search(rf'\b{palabra}\b', crudo), f'{donde} trae "{palabra}"'
 
 
 def _publico(como):
@@ -240,17 +250,23 @@ def _publico(como):
 
 def test_el_catalogo_publico_no_lleva_margenes(como):
     """Se lee el payload ENTERO como texto, igual que la prueba del cotizador."""
-    crudo = json.dumps(_publico(como), ensure_ascii=False).lower()
-    for palabra in MARGENES_PROHIBIDOS:
-        assert palabra not in crudo, f'el catálogo público trae "{palabra}"'
+    _sin_margenes(_publico(como), 'el catálogo público')
 
 
 def test_la_ficha_publica_de_un_producto_tampoco(como):
     r = como(None).get('/api/products/retatrutida-20-mg')
     assert r.status_code == 200
-    crudo = json.dumps(r.json(), ensure_ascii=False).lower()
-    for palabra in MARGENES_PROHIBIDOS:
-        assert palabra not in crudo, f'la ficha pública trae "{palabra}"'
+    _sin_margenes(r.json(), 'la ficha pública')
+
+
+def test_la_prueba_de_fugas_sirve_de_verdad(como):
+    """Candado de la candado: si el filtro dejara pasar `commission_cap`, la
+    prueba de arriba TIENE que tronar. Sin esto no sabríamos si protege o si
+    simplemente nunca encuentra nada."""
+    crudo = _publico(como)
+    crudo[0]['commission_cap'] = 0.40
+    with pytest.raises(AssertionError):
+        _sin_margenes(crudo, 'prueba')
 
 
 def test_el_catalogo_publico_dice_que_NO_lleva_descuento(como):
