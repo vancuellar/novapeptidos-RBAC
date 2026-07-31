@@ -364,6 +364,44 @@ def _async(valor):
 
 
 # ==========================================================================
+#  4.ter  LOS TOPES DE LA API: NOMBRE 30, REFERENCIA 40
+# ==========================================================================
+#  ⛔ COMPROBADO EN VIVO EL 2026-07-31, EN LA PRIMERA COMPRA REAL. La cotización pasa
+#  sin quejarse y es la COMPRA la que rebota con 422:
+#     «Dirección de destino nombre es demasiado largo (máximo son 30 caracteres)»
+#     «Address to reference es demasiado largo (40 caracteres máximo)»
+#  O sea que el error aparece con el pedido YA PAGADO y el cliente esperando su guía.
+def test_un_nombre_largo_se_recorta_sin_volverse_ilegible():
+    """«Brenda Iliana Oseguera Gonzalez» son 31 y caben 30. Cortar a lo bruto dejaría
+    «...Gonzale» — un apellido mal escrito en una guía. Se quitan los nombres de en
+    medio, que es lo que sobra."""
+    corto = skydropx._nombre_corto('Brenda Iliana Oseguera Gonzalez')
+    assert len(corto) <= skydropx.MAX_NOMBRE
+    assert corto == 'Brenda Oseguera Gonzalez'
+    # y no se toca lo que ya cabe
+    assert skydropx._nombre_corto('Juan Perez') == 'Juan Perez'
+
+
+def test_un_nombre_larguisimo_se_recorta_igual():
+    largo = 'Maria Guadalupe Fernanda Villanueva De La Torre Hernandez'
+    corto = skydropx._nombre_corto(largo)
+    assert len(corto) <= skydropx.MAX_NOMBRE, corto
+
+
+def test_la_direccion_de_envio_respeta_los_dos_topes():
+    d = {'name': 'Brenda Iliana Oseguera Gonzalez',
+         'address1': 'Prolongacion el Roble 73', 'address2': 'Int. 24 B',
+         'city': 'San Juan del Rio', 'colonia': 'Paseos de la Venta',
+         'phone': '4425217088', 'email': 'b@x.mx',
+         'reference': 'Fracc. Paseos de la Venta, se recibe en Vigilancia de 9am a 7pm'}
+    envio = skydropx._direccion_envio(d)
+    assert len(envio['name']) <= skydropx.MAX_NOMBRE, envio['name']
+    assert len(envio['reference']) <= skydropx.MAX_REFERENCIA, envio['reference']
+    # y sigue diciendo algo útil, no una cadena cortada a la mitad de una palabra
+    assert envio['reference'].startswith('Fracc. Paseos de la Venta')
+
+
+# ==========================================================================
 #  5. LA GUÍA SIEMPRE TRAE NÚMERO DE RASTREO
 # ==========================================================================
 def test_la_compra_devuelve_numero_de_rastreo(dos, con_remitente):

@@ -292,27 +292,69 @@ def _direccion_cotizar(d: dict, cp: str = '') -> dict:
     }
 
 
+# ⛔ TOPES DE LA API, COMPROBADOS EN VIVO AL INTENTAR LA PRIMERA COMPRA REAL
+# (2026-07-31, pedido de Brenda). La cotización pasa sin quejarse y es la COMPRA la que
+# rebota con 422: «nombre es demasiado largo (máximo son 30 caracteres)» y «reference es
+# demasiado largo (40 caracteres máximo)». O sea que el error aparece con el pedido ya
+# pagado y el cliente esperando — por eso se recorta aquí y no se confía en que quepa.
+MAX_NOMBRE = 30
+MAX_REFERENCIA = 40
+
+
+def _nombre_corto(nombre: str, tope: int = MAX_NOMBRE) -> str:
+    """Un nombre que quepa en la guía sin volverse ilegible.
+
+    «Brenda Iliana Oseguera Gonzalez» son 31 caracteres y la API acepta 30. Cortar a lo
+    bruto dejaría «...Gonzale», que en una guía es un apellido mal escrito. Se quitan
+    primero los nombres de en medio —que es lo que sobra— y sólo si aún no cabe se
+    recorta: «Brenda Oseguera Gonzalez».
+    """
+    n = ' '.join((nombre or '').split())
+    if len(n) <= tope:
+        return n
+    partes = n.split(' ')
+    # nombre de pila + los dos últimos apellidos
+    if len(partes) > 3:
+        corto = ' '.join([partes[0]] + partes[-2:])
+        if len(corto) <= tope:
+            return corto
+    # nombre de pila + primer apellido
+    if len(partes) > 2:
+        corto = ' '.join([partes[0], partes[-2]])
+        if len(corto) <= tope:
+            return corto
+    if len(partes) > 1:
+        corto = ' '.join([partes[0], partes[-1]])
+        if len(corto) <= tope:
+            return corto
+    return n[:tope].strip()
+
+
 def _direccion_envio(d: dict) -> dict:
     """Lo que /shipments necesita de más: a quién y en qué calle.
 
     Los datos de zona (país, CP, área) NO se mandan aquí: la API los toma de la
     cotización a la que pertenece el `rate_id` (comprobado en vivo — mandarlos
     aparte no los usa). Estos cinco campos sí son obligatorios y sí se imprimen.
+
+    ⛔ El nombre y la referencia van RECORTADOS a lo que la API acepta: si se pasan,
+    rechaza la compra entera con 422 (comprobado en vivo el 2026-07-31).
     """
     d = d or {}
     calle = ' '.join(x for x in ((d.get('address1') or '').strip(),
                                  (d.get('address2') or '').strip()) if x)
     return {
-        'name': (d.get('name') or '').strip(),
+        'name': _nombre_corto(d.get('name') or ''),
         'company': (d.get('company') or '').strip(),
         'street1': calle,
         'phone': (d.get('phone') or '').strip(),
         'email': (d.get('email') or '').strip(),
         # La API la exige y no la deja vacía. Sin referencia del cliente se manda
         # la colonia o la ciudad: algo verdadero antes que una cadena inventada.
-        'reference': ((d.get('reference') or '').strip()
-                      or (d.get('colonia') or '').strip()
-                      or (d.get('city') or '').strip() or 'Sin referencia'),
+        'reference': (((d.get('reference') or '').strip()
+                       or (d.get('colonia') or '').strip()
+                       or (d.get('city') or '').strip()
+                       or 'Sin referencia')[:MAX_REFERENCIA]).strip(),
     }
 
 
