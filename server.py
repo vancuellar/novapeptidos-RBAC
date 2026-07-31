@@ -41,6 +41,10 @@ from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret
 # ⛔ CHAT IA DE NEGOCIO (admin + distribuidores). El candado por rol vive ahí: el
 # contexto que recibe el modelo se arma según quién pregunta. Ver chat_negocio.py.
 import chat_negocio
+# La red de abajo del formato: lo que el modelo escriba en Markdown y la pantalla
+# no necesite, se limpia antes de salir — sin partir un marcador a la mitad
+# cuando la respuesta llega en chorrito. Ver texto_ia.py.
+import texto_ia
 import coa_store
 import ficha_store
 import secretos
@@ -6557,7 +6561,9 @@ async def interpret_lab(report_id: str, user=Depends(get_current_user)):
         "Marcadores (solo estos; no menciones ningun otro):\n" + '\n'.join(lines)
     )
     try:
-        text = await interpret_lab_report(context)
+        # El mismo aseo que el chat: esta explicación también la escribe el
+        # modelo y también se lee en pantalla (ver texto_ia.py).
+        text = texto_ia.limpiar(await interpret_lab_report(context))
     except Exception as e:
         logger.error(f'Lab interpretation error: {e}')
         raise HTTPException(status_code=502, detail='No pudimos generar la explicacion. Intenta de nuevo en un momento.')
@@ -6676,10 +6682,20 @@ async def ai_chat(payload: ChatInput, user=Depends(get_optional_user)):
 
     async def event_generator():
         collected = ''
+        # El texto sale LIMPIO de Markdown suelto (Christián, 2026-07-31: un
+        # cliente no puede ver `**NAD+ 500**` en la tienda). Y se guarda limpio,
+        # para que el historial de ayer tampoco se relea sucio.
+        limpieza = texto_ia.LimpiezaEnVivo()
         try:
             async for chunk in stream_reply(chat, full_message):
-                collected += chunk
-                yield chunk
+                pedazo = limpieza.alimentar(chunk)
+                if pedazo:
+                    collected += pedazo
+                    yield pedazo
+            cola = limpieza.cerrar()
+            if cola:
+                collected += cola
+                yield cola
         except Exception as e:
             logger.error(f'AI chat error: {e}')
             # 429 = cuota de Gemini agotada (plan gratis: 20/dia). Mensaje honesto
@@ -6776,10 +6792,17 @@ async def business_chat(payload: ChatInput, user=Depends(get_current_distributor
 
     async def event_generator():
         collected = ''
+        limpieza = texto_ia.LimpiezaEnVivo()      # mismo aseo que el chat del sitio
         try:
             async for chunk in stream_reply(chat, historia + payload.message):
-                collected += chunk
-                yield chunk
+                pedazo = limpieza.alimentar(chunk)
+                if pedazo:
+                    collected += pedazo
+                    yield pedazo
+            cola = limpieza.cerrar()
+            if cola:
+                collected += cola
+                yield cola
         except Exception as e:
             logger.error(f'Chat de negocio: {e}')
             # Sin llave o sin cuota NO se truena: se degrada con un mensaje claro.
