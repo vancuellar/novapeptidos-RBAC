@@ -1642,6 +1642,35 @@ async def admin_envios_config(admin=Depends(get_current_admin)):
     }
 
 
+@api_router.post('/admin/orders/{order_id}/rescatar-etiqueta')
+async def admin_rescatar_etiqueta(order_id: str, admin=Depends(get_current_admin)):
+    """Vuelve a pedir el PDF de una guía YA COMPRADA. No compra nada ni cobra de nuevo.
+
+    ⛔ POR QUÉ HACE FALTA (primera compra real, 2026-07-31): la paquetería contestó al
+    instante con el número de rastreo y el `label_url` VACÍO — el PDF se genera unos
+    segundos más tarde. El pedido quedó con guía pagada y sin papel que pegarle al
+    paquete. Esto lo rescata buscando por número de rastreo.
+    """
+    order = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    numero = (order.get('tracking_number') or '').strip()
+    if not numero:
+        raise HTTPException(status_code=400, detail='Ese pedido todavía no tiene guía')
+    if order.get('label_url'):
+        return {'label_url': order['label_url'], 'ya_estaba': True}
+    mod = paqueterias.modulo(order.get('label_provider') or 'skydropx')
+    if mod is None or not mod.enabled():
+        raise HTTPException(status_code=400, detail='Ese proveedor no tiene credenciales')
+    guia = mod.etiqueta_por_rastreo(numero)
+    url = (guia or {}).get('label_url') or ''
+    if not url:
+        raise HTTPException(status_code=404,
+                            detail='La paquetería todavía no publica el PDF de esa guía')
+    await db.orders.update_one({'id': order_id}, {'$set': {'label_url': url}})
+    return {'label_url': url, 'ya_estaba': False}
+
+
 @api_router.get('/admin/envios/saldo')
 async def admin_saldo_paqueterias(admin=Depends(get_current_admin)):
     """Cuánto dinero queda en cada cuenta de paquetería para comprar guías.

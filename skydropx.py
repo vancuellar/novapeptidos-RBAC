@@ -169,6 +169,48 @@ def _get(ruta: str):
     return _llamar(requests.get, ruta)
 
 
+# --------------------------------------------------------------- rescatar la etiqueta
+def etiqueta_por_rastreo(tracking_number: str) -> dict:
+    """Busca el PDF de una guía YA COMPRADA, por su número de rastreo.
+
+    ⛔ EXISTE POR LA PRIMERA COMPRA REAL (2026-07-31). `POST /shipments` contestó al
+    instante con el número de rastreo pero con `label_url` VACÍO: el PDF se genera unos
+    segundos después. El bucle de espera de `comprar_guia` sólo vuelve a preguntar
+    cuando falta el RASTREO, así que con el rastreo ya puesto no esperaba nada y la
+    etiqueta se perdía — guía pagada y sin papel que pegarle al paquete.
+
+    Esto la rescata después, sin volver a comprar ni cobrar de nuevo.
+    """
+    tn = (tracking_number or '').strip()
+    if not tn or not enabled():
+        return {}
+    try:
+        data = _get('/shipments')
+    except Exception as e:
+        logger.warning('No se pudo listar envios para rescatar la etiqueta: %s', e)
+        return {}
+    filas = data.get('data') if isinstance(data, dict) else data
+    for fila in (filas or []):
+        attrs = fila.get('attributes') if isinstance(fila, dict) else None
+        candidatos = [c for c in (fila, attrs) if isinstance(c, dict)]
+        # El rastreo puede venir en el envío o en su etiqueta incluida.
+        for c in candidatos:
+            valores = {str(c.get(k) or '') for k in
+                       ('tracking_number', 'master_tracking_number')}
+            if tn in valores:
+                guia = _guia_del_json({'data': fila, 'included': data.get('included') or []})
+                if guia.get('label_url'):
+                    return guia
+                # el envío existe pero el PDF aún no: se pide el envío suelto
+                if guia.get('shipment_id'):
+                    try:
+                        return _guia_del_json(_get(f"/shipments/{guia['shipment_id']}"))
+                    except Exception:
+                        return guia
+                return guia
+    return {}
+
+
 # --------------------------------------------------------------- el saldo
 def saldo() -> dict:
     """Cuánto dinero queda en la cuenta para comprar guías.

@@ -186,6 +186,39 @@ def remitente() -> dict:
     return skydropx.remitente()
 
 
+def etiqueta_por_rastreo(tracking_number: str) -> dict:
+    """El PDF de una guía ya comprada, buscándola por su número de rastreo.
+
+    Misma razón que en `skydropx.etiqueta_por_rastreo`: en la primera compra real el
+    rastreo llegó al instante y el `label_url` vacío, porque el PDF se genera unos
+    segundos después. Esto lo rescata sin volver a comprar."""
+    tn = (tracking_number or '').strip()
+    if not tn or not enabled():
+        return {}
+    try:
+        data = _get('/shipments')
+    except Exception as e:
+        logger.warning('%s: no se pudo listar envios para rescatar la etiqueta: %s', NOMBRE, e)
+        return {}
+    filas = data.get('data') if isinstance(data, dict) else data
+    for fila in (filas or []):
+        attrs = fila.get('attributes') if isinstance(fila, dict) else None
+        for c in [x for x in (fila, attrs) if isinstance(x, dict)]:
+            if tn in {str(c.get(k) or '') for k in
+                      ('tracking_number', 'master_tracking_number')}:
+                guia = skydropx._guia_del_json(
+                    {'data': fila, 'included': data.get('included') or []})
+                if guia.get('label_url'):
+                    return guia
+                if guia.get('shipment_id'):
+                    try:
+                        return skydropx._guia_del_json(_get(f"/shipments/{guia['shipment_id']}"))
+                    except Exception:
+                        return guia
+                return guia
+    return {}
+
+
 def saldo() -> dict:
     """El saldo de ESTA cuenta. Misma ruta que Skydropx — su propia documentación dice
     «obtiene el saldo de la cuenta Skydropx actual», que es otra confirmación de que es
