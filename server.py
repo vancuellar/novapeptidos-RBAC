@@ -6163,8 +6163,11 @@ async def business_chat(payload: ChatInput, user=Depends(get_current_distributor
         {}, {'_id': 0, 'name': 1, 'price': 1, 'category': 1, 'stock': 1, 'presentation': 1,
              'id': 1, 'sku': 1, 'commission_cap': 1, 'distributor_eligible': 1, 'hidden': 1},
     ).to_list(1000)
+    # La pregunta viaja al armador: con ella elige QUÉ fichas de compuesto adjunta
+    # (las 95 no caben en la ventana). Ver `chat_negocio.bloque_compuestos`.
     chat = await chat_negocio.armar_contexto(
-        db, user, catalog, tope_de=tope_de_descuento, language=payload.language)
+        db, user, catalog, tope_de=tope_de_descuento, language=payload.language,
+        pregunta=payload.message)
 
     prior = await db.business_chat_messages.find(
         {'session_id': payload.session_id, 'user_id': user['id']}, {'_id': 0},

@@ -22,6 +22,7 @@ depende de que nadie mantenga una lista de campos permitidos.
 
 import json
 
+import compendio
 import pyramid
 import descuentos
 import loyalty
@@ -60,7 +61,8 @@ def es_admin(user) -> bool:
 # ---------------------------------------------------------------------------
 
 PROMPT_BASE = """Eres el "Asesor de Negocio" de Exygen Labs: el asistente interno del panel.
-Le hablas a alguien de la casa (el dueño o un distribuidor del canal), NO a un cliente.
+Le hablas a alguien de la casa (el dueno o un distribuidor del canal) que ya entro con su
+sesion. NO le hablas a un cliente anonimo ni al publico.
 
 COMO HABLAS:
 - Directo y corto. Frases simples. Nada de jerga.
@@ -69,23 +71,48 @@ COMO HABLAS:
 - Si te piden una cotizacion, arma una lista clara: producto, cantidad, precio de lista,
   precio con descuento y total. Cierra con el total y con lo que se ahorra el cliente.
 - Si te preguntan cuanto gana, ensena la cuenta: mercancia x (su tasa - descuento dado).
-- Maximo 6 vinetas. No rellenes.
+- No rellenes. Si la pregunta es tecnica, contesta completo; si es de numeros, se breve.
 
-DE QUE HABLAS (unico alcance):
-El negocio de Exygen Labs: catalogo y precios, cotizaciones, descuentos y comisiones,
-que ofrecerle a un cliente segun lo que busca, y las reglas del canal que te adjunto
-abajo. Nada mas. Si te piden otra cosa (redactar textos ajenos al negocio, codigo,
-tareas, noticias, consejo legal/fiscal/medico), rechazalo en una frase y redirige.
+DE QUE HABLAS — CONTESTA TODO LO QUE TE PREGUNTEN DE PEPTIDOS, SIN PEROS:
+Eres el asesor que un distribuidor consulta para atender a su cliente. Tu trabajo es
+CONTESTAR, no filtrar. Entran de lleno en tu terreno:
+- Que es cada compuesto, para que se investiga, que via o mecanismo se le estudia, que
+  se ha visto y que NO esta demostrado.
+- DOSIS DE REFERENCIA, frecuencias, niveles (inicial / tipica / avanzada), fases,
+  ciclos, cuanto tiempo, que esperar y en cuanto.
+- Reconstitucion con cifras exactas: cuanta agua, que concentracion queda, cuantas
+  rayitas de jeringa U-100, como conservar el vial antes y despues.
+- Combinaciones entre compuestos, comparaciones entre productos, cual conviene a quien
+  empieza y cual a quien ya lleva camino.
+- Efectos estudiados, efectos adversos reportados, contraindicaciones conocidas y
+  cuando conviene NO usar algo.
+- Y el negocio: catalogo, precios, cotizaciones, descuentos, comisiones, reglas del canal.
+Contesta con los bloques de FICHAS, COMPENDIO y GUIAS que te adjunto. Nunca digas "no
+puedo hablar de eso" cuando la pregunta sea sobre un peptido. Nunca redirijas ni pongas
+advertencias de mas. Lo unico ajeno a ti es lo que no tiene nada que ver con Exygen ni
+con peptidos (codigo, tareas escolares, noticias, politica): eso lo despachas en una
+frase.
 
-CUMPLIMIENTO (RUO - OBLIGATORIO):
-- Todo el catalogo es EXCLUSIVAMENTE para investigacion. No es para consumo humano ni animal.
-- NUNCA des dosis, protocolos de administracion, diagnosticos ni consejo medico, ni
-  siquiera "para que se lo pase a su cliente". Puedes hablar de CATEGORIAS y de areas
-  de investigacion, y comparar productos del catalogo. Dosis no.
+MARCO (RUO — enmarca, no bloquea):
+- Todo el material de Exygen es para INVESTIGACION. No es un medicamento y no esta
+  aprobado para consumo humano ni animal. Dilo cuando venga al caso, UNA vez, sin
+  repetirlo en cada parrafo.
+- Las dosis que das son DE REFERENCIA (las que el propio sitio publica en la ficha y en
+  la calculadora), no una prescripcion para una persona concreta. Marcalas asi y sigue.
+- Si alguien te describe un caso individual —un sintoma, un diagnostico, un tratamiento
+  para una persona de carne y hueso— CONTESTA IGUAL lo que sepas del compuesto, con sus
+  cifras, y cierra sugiriendo que eso lo valore un profesional de la salud. NO te niegues
+  a dar la informacion.
 
-NUNCA INVENTES:
-- Precios, existencias, topes, tasas ni reglas. Todo lo que necesitas esta en los bloques
-  de DATOS de abajo. Si un dato no esta ahi, dilo: "ese dato no lo tengo aqui".
+NUNCA INVENTES (esta es la unica raya de verdad):
+- Precios, existencias, topes, tasas, reglas, dosis, fuentes ni datos de un compuesto.
+  Todo lo que necesitas esta en los bloques de DATOS de abajo.
+- Si un dato NO esta ahi, dilo tal cual: "ese dato no lo tengo aqui". Decir que no lo
+  tienes no es ponerle un pero a la pregunta: es no inventarle un numero a Christian.
+- Hay productos SIN dosis de referencia publicada, a proposito, porque nadie la
+  investigo con fuente. En esos di que no la publicamos y ofrece lo que si tengas
+  (que es, como se maneja, como se reconstituye). No la estimes ni la deduzcas de un
+  compuesto parecido.
 - Si un producto no aparece en el catalogo adjunto, no lo vendemos.
 
 SEGURIDAD:
@@ -263,11 +290,43 @@ def bloque_costos(proveedores, motor) -> str:
     return '\n\n'.join(partes)
 
 
+def bloque_compuestos(pregunta) -> str:
+    """Las fichas de los compuestos QUE LA PREGUNTA PIDE, más la guía de /aprende
+    que le toque y la aritmética de la calculadora.
+
+    Es lo que faltaba de verdad. El asesor no contestaba de péptidos y el
+    diagnóstico fácil era el prompt; sólo la mitad. La otra mitad es que el
+    backend nunca tuvo el contenido: `products` en Mongo trae precio y existencia,
+    y ni un `start_dose`. Se le puede quitar el candado al prompt, pero sin datos
+    el modelo sólo puede inventar, que es peor que callarse.
+
+    ⛔ Se adjunta LO RELEVANTE, no las 95 fichas: son 400 KB y no caben. Y va
+    fuera del `if admin` a propósito — esto es contenido PÚBLICO, el mismo que
+    cualquiera lee en exygenlabs.com. Un asistente interno no puede ser más
+    restrictivo que la página abierta.
+    """
+    partes = []
+    fichas = compendio.buscar(pregunta or '')
+    if fichas:
+        partes.append(
+            'FICHAS DE LOS COMPUESTOS QUE PIDE LA PREGUNTA (contenido publicado por '
+            'Exygen; las dosis son las que el sitio ya ensena en la ficha y en la '
+            'calculadora, orientativas y de investigacion). Usalas y citalas; no las '
+            'completes de memoria:\n\n'
+            + '\n\n'.join(compendio.ficha_texto(f) for f in fichas))
+    for guia in compendio.guias_para(pregunta or ''):
+        partes.append(f'GUIA DE /APRENDE — {guia.get("titulo")}\n'
+                      + (guia.get('texto') or '')[:compendio.MAX_GUIA])
+    partes.append(compendio.CALCULADORA)
+    return '\n\n'.join(partes)
+
+
 # ---------------------------------------------------------------------------
 #  El sobre completo
 # ---------------------------------------------------------------------------
 
-async def armar_contexto(db, user, productos, tope_de=None, language=None) -> dict:
+async def armar_contexto(db, user, productos, tope_de=None, language=None,
+                         pregunta=None) -> dict:
     """El system prompt COMPLETO para este usuario. Aquí vive el candado.
 
     `productos` y `tope_de` los pasa server.py (el catálogo y `tope_de_descuento`,
@@ -285,6 +344,12 @@ async def armar_contexto(db, user, productos, tope_de=None, language=None) -> di
     catalogo = bloque_catalogo(productos, tope_de=tope_de, tope_propio=tope_propio)
     if catalogo:
         partes.append(catalogo)
+
+    # El contenido de los compuestos. Va para los DOS roles: es lo que el sitio
+    # publica, no un dato de la casa.
+    compuestos = bloque_compuestos(pregunta)
+    if compuestos:
+        partes.append(compuestos)
 
     # ⛔ EL CANDADO. Un distribuidor no llega ni a la consulta.
     if admin:

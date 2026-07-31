@@ -164,6 +164,19 @@ def _preguntar(cliente, texto='¿cuánto gano con 20% de descuento?', sesion='s-
     return cliente.post(RUTA, json={'session_id': sesion, 'message': texto})
 
 
+# Preguntas que el chat NO contestaba y que ahora tiene que contestar. Se usan
+# tanto para el barrido del candado (el contexto crece muchísimo con las fichas:
+# si algo se iba a colar, se cuela aquí) como para probar que el dato viaja.
+PREGUNTAS_DE_PEPTIDOS = (
+    '¿qué es el BPC-157 y para qué se investiga?',
+    '¿cómo reconstituyo un vial de 10 mg?',
+    '¿qué le recomiendo a un cliente que pregunta por recuperación muscular?',
+    '¿NAD+ 500 o 1000 para alguien que empieza?',
+    'BPC-157 y TB-500 juntos: ¿qué dosis de cada uno?',
+    'retatrutida: ¿cómo se escalona la dosis?',
+)
+
+
 def _contexto(cliente, **kw):
     r = _preguntar(cliente, **kw)
     assert r.status_code == 200, r.text
@@ -235,6 +248,33 @@ def test_al_distribuidor_no_le_llega_ni_un_costo(como):
             f'el contexto del distribuidor trae "{palabra}"'
 
 
+@pytest.mark.parametrize('pregunta', PREGUNTAS_DE_PEPTIDOS)
+def test_el_candado_aguanta_con_las_fichas_adjuntas(como, pregunta):
+    """El barrido, otra vez, con el contexto GORDO.
+
+    Adjuntar monografías, dosis y guías multiplica por seis el tamaño del sobre.
+    Ese contenido es público —el mismo de exygenlabs.com— pero usa palabras como
+    "proveedor" o "costo" en sentido inocente ("qué preguntarle a un proveedor",
+    "ventajas de síntesis y costo"), y el barrido no distingue sentidos. Se lavan
+    en el origen (`exportar_compendio.mjs`); esto comprueba que el lavado sirvió.
+    """
+    ctx = _contexto(como(DIST), texto=pregunta)
+    for palabra in PROHIBIDO:
+        assert not re.search(rf'\b{palabra}\b', ctx), \
+            f'"{pregunta}" mete "{palabra}" en el contexto del distribuidor'
+
+
+def test_el_compendio_publicado_viene_lavado():
+    """El archivo de datos, directo. Si alguien regenera el compendio y entra una
+    palabra vetada, esto truena aquí —donde se entiende el porqué— y no dentro de
+    una prueba de chat que parecerá no tener nada que ver."""
+    crudo = (chat_negocio.compendio.RUTA).read_text(encoding='utf-8').lower()
+    for palabra in PROHIBIDO:
+        assert not re.search(rf'\b{palabra}\b', crudo), (
+            f'compendio.json trae "{palabra}": agrega el sinónimo a LAVADO en '
+            'exportar_compendio.mjs y vuelve a generarlo')
+
+
 def test_al_distribuidor_no_le_llega_el_numero_del_costo(como):
     """Ni la palabra ni el número: 12.5 USD/vial es el costo de la Retatrutida."""
     ctx = _contexto(como(DIST))
@@ -302,6 +342,78 @@ def test_el_tope_es_el_mismo_que_el_del_checkout(como):
     tope = min(server.tope_de_descuento(PRODUCTOS[0]),
                max(pyramid.discount_tiers_de(DIST)))
     assert f'retatrutida 20 mg: $3,000 mxn · descuento maximo aqui: {round(tope * 100)}%' in ctx
+
+
+# --------------------------------------- lo que faltaba: con qué contestar
+#
+# Christián, 2026-07-31: «necesitamos que el interno responda TODAS las preguntas
+# sobre péptidos sin poner pero alguno». El asesor decía "no puedo dar dosis" por
+# DOS motivos, y sólo uno era el prompt: la colección `products` de Mongo no trae
+# ni un `start_dose` (191 productos en vivo, cero). Quitarle el candado al prompt
+# sin darle los datos lo habría dejado inventando cifras, que es peor que callar.
+# Estas pruebas miran el sobre: que el dato viaje.
+
+def test_le_llega_la_ficha_del_compuesto_que_preguntan(como):
+    ctx = _contexto(como(DIST), texto='¿qué es el BPC-157 y para qué se investiga?')
+    assert 'pentadecapeptido' in ctx or 'pentadecapéptido' in ctx
+    assert 'reparación de tejidos' in ctx or 'reparacion de tejidos' in ctx
+
+
+def test_le_llegan_las_dosis_de_referencia_que_el_sitio_ya_publica(como):
+    """No es un dato nuevo ni secreto: es el mismo `start_levels` que la
+    calculadora le enseña a cualquier visitante. Va con su fuente, siempre."""
+    ctx = _contexto(como(DIST), texto='¿NAD+ 500 o 1000 para alguien que empieza?')
+    assert 'dosis de referencia' in ctx
+    assert 'de donde sale:' in ctx          # la fuente viaja pegada a la cifra
+
+
+def test_solo_se_adjunta_lo_que_pide_la_pregunta(como):
+    """Las 95 fichas son 400 KB: no caben en la ventana y además tapan lo que sí
+    importa. Si se preguntó por NAD+, no viaja la monografía del BPC-157."""
+    ctx = _contexto(como(DIST), texto='¿NAD+ 500 o 1000 para alguien que empieza?')
+    assert 'nad+' in ctx
+    assert 'pentadecapeptido' not in ctx and 'pentadecapéptido' not in ctx
+
+
+def test_la_pregunta_por_objetivo_tambien_trae_fichas(como):
+    """El caso que más falta le hace a un distribuidor: el cliente no nombra el
+    compuesto, describe lo que busca. Sin esto no llegaba UNA sola ficha."""
+    ctx = _contexto(como(DIST),
+                    texto='un cliente quiere bajar de peso, ¿qué le ofrezco?')
+    assert 'fichas de los compuestos' in ctx
+
+
+def test_la_guia_de_reconstitucion_y_la_aritmetica_viajan(como):
+    ctx = _contexto(como(DIST), texto='¿cómo reconstituyo un vial de 10 mg?')
+    assert 'guia de /aprende' in ctx
+    assert 'rayitas = (dosis en mg / concentracion en mg/ml) x 100' in ctx
+
+
+def test_el_admin_recibe_lo_mismo_de_los_compuestos(como):
+    """El contenido de los compuestos es PÚBLICO: no se reparte por rol. Lo único
+    que se reparte por rol son los números de la casa."""
+    pregunta = '¿qué es el BPC-157 y para qué se investiga?'
+    for quien in (DIST, ADMIN):
+        assert 'fichas de los compuestos' in _contexto(como(quien), texto=pregunta)
+
+
+def test_el_prompt_ya_no_prohibe_las_dosis(como):
+    """La frase que lo cerraba («NUNCA des dosis») se fue, y en su lugar está la
+    orden de contestar. Si alguien la reintroduce, esto truena."""
+    ctx = _contexto(como(DIST))
+    assert 'nunca des dosis' not in ctx
+    assert 'sin peros' in ctx
+    assert 'nunca inventes' in ctx           # la única raya que se queda
+
+
+def test_un_producto_sin_dosis_investigada_lo_dice_en_vez_de_estimarla(como):
+    """63 productos se quedaron sin dosis a propósito (Christián, 2026-07-26):
+    nadie las investigó con fuente. El contexto tiene que pedirle al modelo que lo
+    diga, no que la deduzca de un compuesto parecido."""
+    sin_dosis = next(e for e in chat_negocio.compendio.datos()['productos'].values()
+                     if not e.get('dosis'))
+    texto = chat_negocio.compendio.ficha_texto(sin_dosis).lower()
+    assert 'no la publicamos' in texto and 'no la estimes' in texto
 
 
 # ------------------------------------------------------- las reglas de la casa
