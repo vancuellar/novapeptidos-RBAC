@@ -32,6 +32,9 @@ from auth import (
     get_current_marketing,
 )
 from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret_lab_report
+# ⛔ CHAT IA DE NEGOCIO (admin + distribuidores). El candado por rol vive ahí: el
+# contexto que recibe el modelo se arma según quién pregunta. Ver chat_negocio.py.
+import chat_negocio
 import coa_store
 import ficha_store
 import secretos
@@ -5601,6 +5604,109 @@ async def chat_history(session_id: str):
         {'session_id': session_id}, {'_id': 0}
     ).sort('created_at', 1).to_list(100)
     return msgs
+
+
+# ===========================================================================
+#  CHAT IA DE NEGOCIO — detrás de la sesión, candado por rol en el SERVIDOR
+# ===========================================================================
+#
+# Es OTRO chat, no el del sitio. Vive en el panel y responde de negocio:
+# cotizaciones, cuánto gana con tal descuento, qué ofrecerle a un cliente.
+#
+# ⛔ REGLA DE ORO (Christián, 2026-07-30). Costos, proveedores, márgenes y ROI
+# son EXCLUSIVOS del admin. El candado no es una frase en el prompt: el contexto
+# se ARMA aquí según el rol (ver `chat_negocio.armar_contexto`), así que a un
+# distribuidor el costo no le llega porque nunca entró al sobre. Un modelo se
+# convence; un `if` en el servidor no.
+#
+# Tres puertas, todas del lado del servidor:
+#   1. `get_current_distributor` — sin sesión 401, cliente 403.
+#   2. `deny_view_as` — el "ver como" del admin es SOLO LECTURA: espiar un panel
+#      no puede gastar la cuota ni escribir en la conversación de otro.
+#   3. La conversación se guarda y se lee por `user_id`: nadie ve la de nadie.
+
+# La conversación previa que se le recuerda al modelo. Corta a propósito: cada
+# vuelta re-manda el catálogo entero, y con la cuota gratis de Gemini (20/día)
+# un historial largo no compra nada.
+NEGOCIO_HISTORIAL = 8
+
+
+def _negocio_sin_cuota(e) -> bool:
+    """¿El error es la cuota de Gemini agotada? (plan gratis: 20 al día)."""
+    return '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e)
+
+
+@api_router.post('/business/chat')
+async def business_chat(payload: ChatInput, user=Depends(get_current_distributor)):
+    deny_view_as(user)
+    # El mismo catálogo que ve el sitio, más los campos con los que se calcula el
+    # tope. `tope_de_descuento` recorta a un número: por ahí no se asoma un costo.
+    catalog = await db.products.find(
+        {}, {'_id': 0, 'name': 1, 'price': 1, 'category': 1, 'stock': 1, 'presentation': 1,
+             'id': 1, 'sku': 1, 'commission_cap': 1, 'distributor_eligible': 1, 'hidden': 1},
+    ).to_list(1000)
+    chat = await chat_negocio.armar_contexto(
+        db, user, catalog, tope_de=tope_de_descuento, language=payload.language)
+
+    prior = await db.business_chat_messages.find(
+        {'session_id': payload.session_id, 'user_id': user['id']}, {'_id': 0},
+    ).sort('created_at', 1).to_list(50)
+
+    await db.business_chat_messages.insert_one({
+        'id': str(uuid.uuid4()), 'session_id': payload.session_id, 'user_id': user['id'],
+        'role': 'user', 'content': payload.message, 'created_at': now_iso(),
+    })
+
+    historia = ''
+    if prior:
+        lineas = [f"{'Usuario' if m['role'] == 'user' else 'Asesor'}: {m['content']}"
+                  for m in prior[-NEGOCIO_HISTORIAL:]]
+        historia = ('Conversacion previa:\n' + '\n'.join(lineas)
+                    + '\n\nNuevo mensaje del usuario:\n')
+
+    async def event_generator():
+        collected = ''
+        try:
+            async for chunk in stream_reply(chat, historia + payload.message):
+                collected += chunk
+                yield chunk
+        except Exception as e:
+            logger.error(f'Chat de negocio: {e}')
+            # Sin llave o sin cuota NO se truena: se degrada con un mensaje claro.
+            # El asesor es una ayuda, no la caja — que se caiga en silencio con un
+            # error técnico en pantalla es peor que decir qué pasó.
+            if _negocio_sin_cuota(e):
+                err = ('Se acabó la cuota del asistente por hoy (el plan gratuito de '
+                       'Google da 20 consultas al día). Vuelve a intentar mañana, o '
+                       'avísale a Christián para activar el plan de pago.')
+            elif 'GEMINI_API_KEY' in str(e):
+                err = ('El asistente todavía no tiene su llave configurada en el '
+                       'servidor. Avísale a Christián.')
+            else:
+                err = 'No pude responder en este momento. Intenta de nuevo en un minuto.'
+            collected = err
+            yield err
+        finally:
+            await db.business_chat_messages.insert_one({
+                'id': str(uuid.uuid4()), 'session_id': payload.session_id,
+                'user_id': user['id'], 'role': 'assistant', 'content': collected,
+                'created_at': now_iso(),
+            })
+
+    return StreamingResponse(
+        event_generator(),
+        media_type='text/plain; charset=utf-8',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
+
+
+@api_router.get('/business/history/{session_id}')
+async def business_chat_history(session_id: str, user=Depends(get_current_distributor)):
+    """SU conversación. El filtro por `user_id` no es cosmético: sin él, adivinar
+    el id de sesión de otro distribuidor abriría su chat entero."""
+    return await db.business_chat_messages.find(
+        {'session_id': session_id, 'user_id': user['id']}, {'_id': 0},
+    ).sort('created_at', 1).to_list(100)
 
 
 # ----------------- Startup: seed -----------------
