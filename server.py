@@ -4410,6 +4410,10 @@ def _distributor_rollup(dist, users, orders):
         'distributor_code': dist.get('distributor_code'),
         'commission_rate': dist.get('commission_rate', 0.25),
         'customer_discount_rate': dist.get('customer_discount_rate', 0),
+        # El interruptor de privacidad, para que el admin pueda VERLO y prenderlo desde
+        # el panel. Sin devolverlo, encenderle los datos a otro distribuidor sería
+        # adivinar a ciegas si ya está encendido (Christián, 2026-07-31).
+        CAMPO_VE_CLIENTE: bool(dist.get(CAMPO_VE_CLIENTE)),
         # Pirámide: nivel y de quién cuelga.
         'tier': pyramid.normalize_tier(dist.get('tier')),
         # Lo que de verdad gana y el descuento máximo que puede dar (nivel o mano).
