@@ -22,7 +22,7 @@ from models import (
     DistributorShippingUpdate,
     ShippingQuoteRequest, TrackEvent, RemitenteUpdate, CajasUpdate, ComprarGuiaRequest,
     ProtocolInput, ProtocolUpdate, PerfilSalud, LabReportInput,
-    TokenInput, ActivateInput, ResendVerificationInput,
+    TokenInput, ActivateInput, ResendVerificationInput, AceptarAcuerdoInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
     QuoteEmailRequest,
 )
@@ -842,14 +842,32 @@ async def read_invitation(token: str):
 
 
 @api_router.post('/auth/activate')
-async def activate_account(payload: ActivateInput):
-    """El invitado elige su contraseña; eso mismo confirma su correo."""
+async def activate_account(payload: ActivateInput, request: Request):
+    """El invitado elige su contraseña; eso mismo confirma su correo.
+
+    ⛔ ACUERDO DE DISTRIBUIDOR (sólo con el interruptor encendido). Si quien
+    activa es distribuidor, la pantalla le enseñó el acuerdo completo con una
+    casilla NO premarcada; aquí se exige que venga marcada y se levanta el acta
+    (versión, hash, fecha, IP, user-agent). ES EL MOMENTO CORRECTO para firmar:
+    es cuando de verdad entra al canal, y así ningún distribuidor nuevo empieza
+    a operar sin contrato.
+
+    Con el interruptor APAGADO —como está hoy— `acuerdo.activo()` es False y
+    todo este bloque se salta entero: la activación es exactamente la de
+    siempre, marque o no marque la casilla (que ni siquiera se le pinta)."""
     user = await _consume_token(payload.token, 'invite')
+    if acuerdo.activo() and acuerdo.es_distribuidor(user) and not payload.acepta_acuerdo:
+        raise HTTPException(status_code=400,
+                            detail='Para activar tu cuenta de distribuidor tienes que '
+                                   'leer y aceptar el Acuerdo de Distribuidor.')
     await db.users.update_one({'id': user['id']}, {'$set': {
         'password_hash': hash_password(payload.password),
         'email_verified': True,
         'verified_at': now_iso(),
     }})
+    if acuerdo.activo() and acuerdo.es_distribuidor(user) and payload.acepta_acuerdo:
+        await acuerdo.registrar(db, user, ip=acuerdo.ip_de(request),
+                                user_agent=acuerdo.user_agent_de(request), origen='activacion')
     asyncio.create_task(send_welcome_email(user['name'], user['email'], user.get('language')))
     # Activar la invitacion confirma el correo (solo llega al buzon real), asi que
     # aqui tambien se recogen las compras que haya hecho antes como invitado.
@@ -2695,6 +2713,15 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         if points_used > 0:
             commissions = pyramid.prorratear_por_dinero(
                 commissions, paid_merchandise, after_discount)
+        # ⛔ SIN ACUERDO FIRMADO NO SE DEVENGAN COMISIONES NUEVAS. Se aplica
+        # renglón por renglón: si el vendedor no firmó pero su upline sí, el
+        # upline cobra su diferencial igual — no se castiga a quien cumplió. El
+        # cliente conserva su descuento pase lo que pase: el precio ya se le
+        # prometió y esto es un asunto entre la Empresa y el canal.
+        #
+        # Con el interruptor APAGADO esta llamada devuelve la lista TAL CUAL sin
+        # una sola consulta a la base: hoy no cambia ni un peso de comisión.
+        commissions = await acuerdo.filtrar_comisiones_sin_acuerdo(db, commissions)
         commission = pyramid.seller_amount(commissions)
     order = Order(
         order_number=gen_order_number(),
