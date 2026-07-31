@@ -10,6 +10,7 @@ import string
 import re
 import json
 import io
+import unicodedata            # para comparar nombres sin acentos al buscar duplicados
 import html as html_lib          # para escapar lo que va en los avisos internos
 # `csv` a secas chocaría con el parámetro `csv=1` de /admin/envios/costo-real, que es
 # como se pide el export en ese formato. Se renombra el módulo, no el parámetro.
@@ -4686,6 +4687,10 @@ async def clientes_duplicados(admin=Depends(get_current_admin)):
         de una es el alterno de la otra).
       · `telefono_repetido` — dos personas distintas con el mismo teléfono. Puede ser
         legítimo (una pareja, una oficina); por eso se reporta y no se toca.
+      · `nombre_repetido` — el mismo nombre con dos correos distintos. Es el caso más
+        flojo de los tres (hay muchos Juan Pérez) pero es el que caza a la persona que
+        se registró dos veces con dos buzones, que no deja ninguna otra huella. Como
+        todo lo de aquí, es un aviso para mirarlo, no una fusión.
     """
     users = await db.users.find({}, {'_id': 0, 'password_hash': 0,
                                      'totp_secret': 0}).to_list(5000)
@@ -4712,13 +4717,20 @@ async def clientes_duplicados(admin=Depends(get_current_admin)):
             'motivo': 'correo_sin_confirmar' if not cuenta.get('email_verified') else 'pedido_huerfano',
         })
 
-    por_correo, por_telefono = {}, {}
+    por_correo, por_telefono, por_nombre = {}, {}, {}
     for u in users:
         for c in _correos_de_la_cuenta(u):
             por_correo.setdefault(c, []).append(u)
+        # Los últimos 10 dígitos: el mismo número con y sin lada (+52 55…) es UNO.
         tel = re.sub(r'\D', '', str(u.get('phone') or ''))[-10:]
         if len(tel) == 10:
             por_telefono.setdefault(tel, []).append(u)
+        # Sin acentos, sin dobles espacios y en minúsculas: «María  Neunfeld» y
+        # «maria neunfeld» se teclearon distinto pero son la misma persona.
+        nom = unicodedata.normalize('NFD', str(u.get('name') or ''))
+        nom = ' '.join(''.join(x for x in nom if not unicodedata.combining(x)).lower().split())
+        if len(nom) >= 5:
+            por_nombre.setdefault(nom, []).append(u)
 
     def _fichas(lista):
         return [{'id': x.get('id'), 'name': x.get('name'), 'email': x.get('email'),
@@ -4731,6 +4743,10 @@ async def clientes_duplicados(admin=Depends(get_current_admin)):
     for tel, lista in por_telefono.items():
         if len({x.get('id') for x in lista}) > 1:
             hallazgos.append({'tipo': 'telefono_repetido', 'llave': tel,
+                              'cuentas': _fichas(lista)})
+    for nom, lista in por_nombre.items():
+        if len({x.get('id') for x in lista}) > 1:
+            hallazgos.append({'tipo': 'nombre_repetido', 'llave': nom,
                               'cuentas': _fichas(lista)})
 
     hallazgos.sort(key=lambda h: (h['tipo'], h['llave']))

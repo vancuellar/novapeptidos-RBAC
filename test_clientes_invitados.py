@@ -13,7 +13,7 @@ Lo que se prueba aquí:
   · el correo es la llave, sin distinguir mayúsculas ni espacios;
   · el que ya tiene cuenta no sale DOS veces: se marca como posible duplicado y la
     decisión de fusionar es de Christián, no del programa;
-  · el reporte de duplicados encuentra los tres casos y no inventa ninguno;
+  · el reporte de duplicados encuentra los cuatro casos y no inventa ninguno;
   · nada de esto se lo abre a nadie que no sea admin.
 """
 import os
@@ -192,6 +192,26 @@ def test_el_reporte_no_inventa_duplicados(como):
     r = como(ADMIN).get('/api/admin/clientes/duplicados').json()
     crudo = str(r['duplicados'])
     assert 'u-paz' not in crudo and 'u-maria' not in crudo
+
+
+def test_el_mismo_nombre_con_dos_correos_se_reporta(monkeypatch):
+    """El caso real: «Maria Neunfeld» tiene cuenta de clienta Y de distribuidora, con
+    dos buzones distintos. No deja ninguna otra huella — ni correo ni teléfono en
+    común — así que sin esto no lo caza nadie."""
+    dist = {'id': 'u-maria-1', 'name': 'Maria Neunfeld', 'email': 'marianeunfeld0@gmail.com',
+            'role': 'distributor'}
+    otra = {'id': 'u-maria-2', 'name': 'María  Neunfeld', 'email': 'maria.itlegal@gmail.com',
+            'role': 'user'}
+    monkeypatch.setattr(server, 'db', _FakeDB(users=[ADMIN, PAZ, dist, otra], orders=[]))
+    server.app.dependency_overrides[auth.get_current_user] = lambda: dict(ADMIN)
+    try:
+        r = TestClient(server.app).get('/api/admin/clientes/duplicados').json()
+        nom = [d for d in r['duplicados'] if d['tipo'] == 'nombre_repetido']
+        # Sin acentos y sin el doble espacio: es la misma llave.
+        assert [d['llave'] for d in nom] == ['maria neunfeld']
+        assert {c['id'] for c in nom[0]['cuentas']} == {'u-maria-1', 'u-maria-2'}
+    finally:
+        server.app.dependency_overrides.clear()
 
 
 def test_el_telefono_repetido_tambien_se_reporta(monkeypatch):
