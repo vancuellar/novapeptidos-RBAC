@@ -444,7 +444,50 @@ def test_el_correo_lleva_el_enlace_con_su_codigo(como, correo):
     """Sin el ?ref= la cotización es publicidad gratis: el cliente compra y la
     comisión no es de nadie."""
     como(dict(DIST, distributor_code='DIST-4821')).post(RUTA_CORREO, json=CUERPO)
-    assert '/catalogo?ref=DIST-4821' in correo['html']
+    assert 'ref=DIST-4821' in correo['html']
+
+
+def test_el_enlace_abre_el_checkout_con_el_carrito_armado(como, correo):
+    """El botón ya no manda al catálogo pelón (Christián, 2026-07-30): abre el
+    CHECKOUT con `?pedido=id:cantidad,...` — los mismos renglones que se
+    cotizaron, para que el cliente aterrice a un paso de pagar."""
+    como(dict(DIST, distributor_code='DIST-4821')).post(RUTA_CORREO, json=CUERPO)
+    from urllib.parse import quote as q
+    assert f"/checkout?pedido={q('p-reta:2,p-agua:1')}&ref=DIST-4821" in correo['html']
+
+
+def test_el_enlace_solo_lleva_lo_que_sobrevivio(como, correo):
+    """Un renglón oculto o inexistente no se cotiza — y tampoco viaja en el
+    enlace: el carrito del cliente debe ser IGUAL al documento que leyó."""
+    cuerpo = dict(CUERPO, items=[{'product_id': 'p-reta', 'quantity': 2},
+                                 {'product_id': 'no-existe', 'quantity': 3}])
+    como(DIST).post(RUTA_CORREO, json=cuerpo)
+    from urllib.parse import quote as q
+    assert f"pedido={q('p-reta:2')}" in correo['html']
+    assert 'no-existe' not in correo['html']
+
+
+# ------------------------------------------------- los datos del cliente (opcionales)
+def test_los_datos_del_cliente_se_pintan_si_vienen(como, correo):
+    cuerpo = dict(CUERPO, client_email='juan@x.mx', client_phone='81 1234 5678',
+                  client_address='Av. Siempre Viva 742, Monterrey')
+    como(DIST).post(RUTA_CORREO, json=cuerpo)
+    h = correo['html']
+    for dato in ('juan@x.mx', '81 1234 5678', 'Av. Siempre Viva 742, Monterrey'):
+        assert dato in h
+
+
+def test_sin_datos_de_contacto_no_hay_tarjetita(como, correo):
+    """Con puro nombre el bloque no aparece: el saludo ya lo trae y una tarjeta
+    con un solo renglón repetido se lee como error."""
+    como(DIST).post(RUTA_CORREO, json=CUERPO)
+    assert 'Cotización para' not in correo['html']
+
+
+def test_los_datos_del_cliente_van_escapados(como, correo):
+    cuerpo = dict(CUERPO, client_address='<script>alert(1)</script>')
+    como(DIST).post(RUTA_CORREO, json=cuerpo)
+    assert '<script>' not in correo['html']
 
 
 def test_el_nombre_del_cliente_va_escapado(como, correo):

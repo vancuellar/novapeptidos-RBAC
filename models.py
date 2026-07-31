@@ -458,6 +458,13 @@ class QuoteEmailRequest(BaseModel):
     distribuidor antes de escribir un solo peso."""
     email: EmailStr
     client_name: Optional[str] = ''
+    # Datos de contacto del cliente, TODOS opcionales (Christián, 2026-07-30):
+    # si vienen se pintan en el documento; si no, la cotización sale igual.
+    # Texto libre a propósito — un teléfono puede traer extensión y una dirección
+    # no tiene formato; el servidor los recorta y escapa antes de pintarlos.
+    client_email: Optional[str] = ''
+    client_phone: Optional[str] = ''
+    client_address: Optional[str] = ''
     discount: float = Field(0, ge=0, le=1)
     language: Optional[str] = None
     folio: Optional[str] = ''

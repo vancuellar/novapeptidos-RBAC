@@ -1134,7 +1134,9 @@ QUOTE_COPY = {
         'savings': 'Ahorro',
         'total': 'Total',
         'savingsBadge': 'TE AHORRAS {amount}',
-        'cta': 'Comprar En El Catálogo',
+        'cta': 'Pagar En Línea',
+        'ctaNote': 'El botón abre la tienda con tu carrito ya armado: llegas a un paso de pagar.',
+        'toLabel': 'Cotización para',
         'codeTitle': 'Tu código de descuento',
         'codeNote': 'Entra con el botón de arriba y tu descuento se aplica solo. También puedes teclear el código al pagar.',
         'validity': 'Cotización informativa, vigencia de 7 días. Precios en pesos mexicanos (MXN) e incluyen IVA. El envío se calcula al pagar.',
@@ -1157,7 +1159,9 @@ QUOTE_COPY = {
         'savings': 'Savings',
         'total': 'Total',
         'savingsBadge': 'YOU SAVE {amount}',
-        'cta': 'Order From The Catalog',
+        'cta': 'Pay Online',
+        'ctaNote': 'The button opens the store with your cart already set up — one step from paying.',
+        'toLabel': 'Quote for',
         'codeTitle': 'Your discount code',
         'codeNote': 'Use the button above and your discount applies by itself. You can also type the code at checkout.',
         'validity': 'Informational quote, valid for 7 days. Prices in Mexican pesos (MXN), tax included. Shipping is calculated at checkout.',
@@ -1180,7 +1184,9 @@ QUOTE_COPY = {
         'savings': 'Economia',
         'total': 'Total',
         'savingsBadge': 'VOCE ECONOMIZA {amount}',
-        'cta': 'Comprar No Catálogo',
+        'cta': 'Pagar On-line',
+        'ctaNote': 'O botão abre a loja com o seu carrinho já montado — a um passo de pagar.',
+        'toLabel': 'Orçamento para',
         'codeTitle': 'Seu código de desconto',
         'codeNote': 'Entre pelo botão acima e o seu desconto é aplicado sozinho. Você também pode digitar o código no pagamento.',
         'validity': 'Orçamento informativo, validade de 7 dias. Preços em pesos mexicanos (MXN), impostos incluídos. O frete é calculado no pagamento.',
@@ -1280,6 +1286,29 @@ def _quote_email_html(copy, quote):
     folio = esc(str(quote.get('folio', '') or ''))
     link = quote.get('link') or 'https://exygenlabs.com/catalogo'
 
+    # Los datos del cliente, si el distribuidor los puso. NINGUNO es obligatorio:
+    # con solo el nombre el bloque no aparece (el saludo ya lo trae); con correo,
+    # teléfono o dirección se pinta la tarjetita "Cotización para", como en la hoja.
+    contacto = [str(quote.get(k, '') or '').strip()
+                for k in ('client_email', 'client_phone', 'client_address')]
+    contacto_html = ''
+    if any(contacto):
+        datos = [nombre] if nombre else []
+        datos += [d for d in contacto if d]
+        filas_contacto = ''.join(
+            f'<div class="em-body" style="font-size:13px;line-height:1.7;color:{BODY};">{esc(d)}</div>'
+            for d in datos)
+        contacto_html = (
+            f'<tr><td style="padding:18px 40px 0 40px;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-box" '
+            f'style="background-color:{BG};border:1px solid {LINE};border-radius:10px;">'
+            f'<tr><td style="padding:14px 18px;font-family:{FONT};">'
+            f'<div class="em-muted" style="font-size:11px;letter-spacing:1.5px;color:{MUTED};'
+            f'text-transform:uppercase;padding-bottom:4px;">{copy["toLabel"]}</div>'
+            f'{filas_contacto}'
+            f'</td></tr></table></td></tr>'
+        )
+
     folio_html = ''
     if folio:
         folio_html = (
@@ -1319,6 +1348,7 @@ def _quote_email_html(copy, quote):
             </td>
           </tr>
           {folio_html}
+          {contacto_html}
           <tr>
             <td style="padding:26px 40px 0 40px; font-family:{FONT};">
               <div class="em-muted" style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase; padding-bottom:4px;">{copy['items']}</div>
@@ -1332,6 +1362,7 @@ def _quote_email_html(copy, quote):
           <tr>
             <td align="center" style="padding:28px 40px 8px 40px;">
               <a href="{link}" class="em-btn" style="display:inline-block; background-color:{INK}; color:#FFFFFF; font-family:{FONT}; font-size:15px; font-weight:bold; text-decoration:none; padding:14px 36px; border-radius:999px;">{copy['cta']}</a>
+              <div class="em-muted" style="padding-top:10px; font-family:{FONT}; font-size:12px; line-height:1.6; color:{MUTED};">{copy['ctaNote']}</div>
             </td>
           </tr>
 

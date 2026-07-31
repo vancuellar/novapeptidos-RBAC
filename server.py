@@ -3918,9 +3918,12 @@ def _armar_cotizacion(items, pedido_pct, tope_dist, catalogo):
         pct = min(pedido_pct, tope_de_descuento(doc), tope_dist)
         unit = round(precio * (1 - pct))
         qty = int(it.quantity)
-        lineas.append({'name': _nombre_cotizable(doc), 'quantity': qty,
-                       'unit_price': unit, 'list_price': round(precio),
-                       'amount': unit * qty})
+        # `product_id` viaja en el renglón para armar el enlace al checkout con
+        # el carrito ya puesto. Al HTML del correo no llega: ahí sólo se pintan
+        # nombre, cantidad y precio.
+        lineas.append({'product_id': it.product_id, 'name': _nombre_cotizable(doc),
+                       'quantity': qty, 'unit_price': unit,
+                       'list_price': round(precio), 'amount': unit * qty})
         lista_total += round(precio) * qty
         total += unit * qty
     return lineas, lista_total, total
@@ -3948,10 +3951,21 @@ async def distributor_quote_email(payload: QuoteEmailRequest,
 
     codigo = (dist.get('distributor_code') or '').strip()
     site = os.environ.get('SITE_URL', 'https://exygenlabs.com')
-    enlace = f'{site}/catalogo?ref={urlquote(codigo)}' if codigo else f'{site}/catalogo'
+    # EL ENLACE VA AL CHECKOUT CON EL CARRITO YA ARMADO (Christián, 2026-07-30):
+    # `?pedido=id:cantidad,...` — sólo QUÉ y CUÁNTOS, los mismos renglones que
+    # sobrevivieron la validación de arriba. El sitio los hidrata contra el
+    # catálogo real (CartContext) y el precio lo vuelve a poner el servidor al
+    # cobrar; un enlace manipulado no puede cambiar ni un peso.
+    pedido = ','.join(f"{ln['product_id']}:{ln['quantity']}" for ln in lineas)
+    enlace = f'{site}/checkout?pedido={urlquote(pedido)}'
+    if codigo:
+        enlace += f'&ref={urlquote(codigo)}'
     cotizacion = {
         'folio': (payload.folio or '').strip()[:32],
         'client_name': (payload.client_name or '').strip()[:80],
+        'client_email': (payload.client_email or '').strip()[:120],
+        'client_phone': (payload.client_phone or '').strip()[:40],
+        'client_address': (payload.client_address or '').strip()[:200],
         'advisor': (dist.get('name') or '').strip()[:80],
         'code': codigo,
         'link': enlace,
