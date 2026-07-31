@@ -388,6 +388,25 @@ def test_un_nombre_larguisimo_se_recorta_igual():
     assert len(corto) <= skydropx.MAX_NOMBRE, corto
 
 
+def test_la_calle_larga_se_recorta_sin_partir_palabras():
+    """Tercer tope encontrado, al segundo intento de compra: «Address from street1 es
+    demasiado largo (45 caracteres máximo)». Ninguno de los tres está documentado."""
+    larga = 'Avenida Paseo de los Flamboyanes Manzana 12 Lote 5 Interior A'
+    corta = skydropx._calle_corta(larga)
+    assert len(corta) <= skydropx.MAX_CALLE, corta
+    assert not corta.endswith(' ')
+    assert corta.split()[-1] in larga.split(), 'cortó una palabra a la mitad'
+
+
+def test_si_no_cabe_calle_mas_interior_manda_la_calle():
+    """El número interior se sacrifica antes que la calle: la calle y el número son lo
+    que lleva al repartidor a la puerta."""
+    assert skydropx._calle_corta('Prolongacion el Roble 73', 'Int. 24 B') == \
+        'Prolongacion el Roble 73 Int. 24 B'
+    calle = 'Circuito de las Buganvilias Numero 1450 Depto'
+    assert skydropx._calle_corta(calle, 'Interior 302 Torre B') == calle
+
+
 def test_la_direccion_de_envio_respeta_los_dos_topes():
     d = {'name': 'Brenda Iliana Oseguera Gonzalez',
          'address1': 'Prolongacion el Roble 73', 'address2': 'Int. 24 B',

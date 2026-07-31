@@ -333,6 +333,33 @@ def _direccion_cotizar(d: dict, cp: str = '') -> dict:
 # pagado y el cliente esperando — por eso se recorta aquí y no se confía en que quepa.
 MAX_NOMBRE = 30
 MAX_REFERENCIA = 40
+# Y el tercero, encontrado al segundo intento de compra: «Address from street1 es
+# demasiado largo (45 caracteres máximo)». Ninguno de los tres está en su documentación
+# —su OpenAPI sólo declara un maxLength, y es de otro campo— así que van saliendo de uno
+# en uno, cada vez con un pedido pagado esperando. Por eso ahora se recortan TODOS aquí.
+MAX_CALLE = 45
+
+
+def _calle_corta(address1: str, address2: str = '', tope: int = MAX_CALLE) -> str:
+    """La calle que cabe en la guía sin perder por dónde entra el paquete.
+
+    Se junta calle + interior, que es lo que la paquetería imprime. Si no cabe:
+      1. se suelta el interior (address2), porque la calle y el número son lo que
+         lleva al repartidor a la puerta;
+      2. y si aun así no cabe, se corta en el último espacio antes del tope, para no
+         partir una palabra a la mitad y dejar una calle que no existe.
+    """
+    a1 = ' '.join((address1 or '').split())
+    a2 = ' '.join((address2 or '').split())
+    junto = ' '.join(x for x in (a1, a2) if x)
+    if len(junto) <= tope:
+        return junto
+    if a1 and len(a1) <= tope:
+        return a1                       # el interior se va a la referencia si hace falta
+    corte = a1[:tope]
+    if ' ' in corte:
+        corte = corte[:corte.rfind(' ')]
+    return corte.strip()
 
 
 def _nombre_corto(nombre: str, tope: int = MAX_NOMBRE) -> str:
@@ -375,8 +402,7 @@ def _direccion_envio(d: dict) -> dict:
     rechaza la compra entera con 422 (comprobado en vivo el 2026-07-31).
     """
     d = d or {}
-    calle = ' '.join(x for x in ((d.get('address1') or '').strip(),
-                                 (d.get('address2') or '').strip()) if x)
+    calle = _calle_corta(d.get('address1') or '', d.get('address2') or '')
     return {
         'name': _nombre_corto(d.get('name') or ''),
         'company': (d.get('company') or '').strip(),
