@@ -30,6 +30,13 @@ import server
 # ==========================================================================
 def _match(doc, filtro):
     for k, v in (filtro or {}).items():
+        # `$or` lo usa TODA consulta que acepta id O sku (la venta directa y la reserva
+        # de inventario). Sin esto el doble no encontraba nunca el producto y la prueba
+        # pasaba por vacía, que es peor que fallar.
+        if k == '$or':
+            if not any(_match(doc, cond) for cond in v):
+                return False
+            continue
         if isinstance(v, dict):
             if '$gte' in v and not (doc.get(k) or 0) >= v['$gte']:
                 return False
@@ -60,6 +67,15 @@ class FakeCol:
             if _match(d, filtro):
                 return dict(d)
         return None
+
+    def find(self, filtro=None, proj=None):
+        halladas = [dict(d) for d in self.docs if _match(d, filtro)]
+
+        class _Cursor:
+            async def to_list(self, n=None):
+                return halladas[:n] if n else halladas
+
+        return _Cursor()
 
     async def delete_one(self, filtro):
         for i, d in enumerate(self.docs):
@@ -314,6 +330,91 @@ def test_la_venta_directa_respeta_el_tope_por_producto():
     assert 'commission_cap' in cuerpo, 'no lee el tope del producto'
     assert 'NO_DISCOUNT_CATEGORIES' in cuerpo, 'los insumos vuelven a llevar descuento'
     assert 'round(subtotal * rate)' not in cuerpo, 'volvió el descuento plano'
+
+
+# Las dos de arriba LEEN EL CÓDIGO; ésta lo CORRE. Un auditor volvió a reportar el 60%
+# el 2026-07-30, ya cerrado desde el día anterior, y una prueba que sólo busca texto no
+# sirve para refutarlo: pasa igual si alguien vuelve a asignar `rate` más abajo. Aquí se
+# manda el 0.60 por la puerta de verdad y se mira el pedido que quedó grabado.
+def test_pedir_60pct_en_la_venta_directa_GRABA_40pct(db):
+    """Christián: el máximo de la casa es 40% (`loyalty.MAX_DISCOUNT`). El tope del
+    producto lo aprieta todavía más: Orexin A tiene 35% y ahí se queda.
+
+    Sobre $374,360 (40 piezas), lo que el 60% regalaba de más son $89,846.
+    """
+    import loyalty
+
+    db.cols['users'] = FakeCol([{'id': 'u1', 'role': 'customer', 'name': 'Prueba',
+                                 'email': 'prueba@example.com', 'points_balance': 0}])
+    db.cols['products'] = FakeCol([{
+        'id': 'orexin-uuid', 'sku': 'OREXINA-10MG', 'name': 'Orexin A 10 mg',
+        'price': 9359.0, 'slug': 'orexin-a-10-mg', 'presentation': '10 mg',
+        'commission_cap': 0.35, 'category': 'longevidad', 'stock': 40,
+    }])
+
+    salida = asyncio.run(server.admin_create_order(
+        server.ManualOrderCreate(
+            user_id='u1',
+            items=[server.OrderItem(product_id='orexin-uuid', name='Orexin A 10 mg',
+                                    price=9359.0, quantity=40, presentation='10 mg')],
+            discount_rate=0.60),
+        admin={'id': 'admin', 'role': 'admin'}))
+
+    grabado = db.cols['orders'].docs[0]
+    assert grabado['discount_rate'] == loyalty.MAX_DISCOUNT == 0.40, \
+        f'la venta directa grabó {grabado["discount_rate"]}, no el techo de la casa'
+    # 40 × $9,359 = $374,360, y el tope del producto (35%) manda sobre el 40% pedido.
+    assert grabado['subtotal'] == 374360.0
+    assert salida['discount'] == round(374360 * 0.35) == 131026, salida
+    assert salida['total'] == 374360 - 131026, salida
+    # Con el descuento máximo NO se acumulan puntos (Christián, 2026-07-27).
+    assert salida['points_earned'] == 0, salida
+
+
+def test_la_venta_directa_normal_no_se_recorta_de_mas(db):
+    """El candado tapa lo que se pasa del techo; no puede castigar al que pide menos.
+    Un 20% con un producto de tope 35% se cobra 20%, entero, y sí genera puntos."""
+    db.cols['users'] = FakeCol([{'id': 'u1', 'role': 'customer', 'name': 'Prueba',
+                                 'email': 'prueba@example.com', 'points_balance': 0}])
+    db.cols['products'] = FakeCol([{
+        'id': 'orexin-uuid', 'sku': 'OREXINA-10MG', 'name': 'Orexin A 10 mg',
+        'price': 1000.0, 'slug': 'orexin-a-10-mg', 'presentation': '10 mg',
+        'commission_cap': 0.35, 'category': 'longevidad', 'stock': 40,
+    }])
+
+    salida = asyncio.run(server.admin_create_order(
+        server.ManualOrderCreate(
+            user_id='u1',
+            items=[server.OrderItem(product_id='orexin-uuid', name='Orexin A 10 mg',
+                                    price=1000.0, quantity=10, presentation='10 mg')],
+            discount_rate=0.20),
+        admin={'id': 'admin', 'role': 'admin'}))
+
+    assert db.cols['orders'].docs[0]['discount_rate'] == 0.20
+    assert salida['discount'] == 2000 and salida['total'] == 8000, salida
+    assert salida['points_earned'] == 240, salida     # 3% de $8,000
+
+
+def test_los_insumos_nunca_llevan_descuento_en_la_venta_directa(db):
+    """Agua bacteriostática y jeringas quedan fuera, aunque el admin pida 40%."""
+    db.cols['users'] = FakeCol([{'id': 'u1', 'role': 'customer', 'name': 'Prueba',
+                                 'email': 'prueba@example.com', 'points_balance': 0}])
+    db.cols['products'] = FakeCol([{
+        'id': 'agua-uuid', 'sku': 'AGUA-30ML', 'name': 'Agua bacteriostática 30 ml',
+        'price': 300.0, 'slug': 'agua-bacteriostatica-30-ml', 'presentation': '30 ml',
+        'commission_cap': 0.35, 'category': 'suministros', 'stock': 40,
+    }])
+
+    salida = asyncio.run(server.admin_create_order(
+        server.ManualOrderCreate(
+            user_id='u1',
+            items=[server.OrderItem(product_id='agua-uuid',
+                                    name='Agua bacteriostática 30 ml',
+                                    price=300.0, quantity=4, presentation='30 ml')],
+            discount_rate=0.40),
+        admin={'id': 'admin', 'role': 'admin'}))
+
+    assert salida['discount'] == 0 and salida['total'] == 1200, salida
 
 
 # ---------- Pagado ≠ entregado (Christián, 2026-07-29) ----------
