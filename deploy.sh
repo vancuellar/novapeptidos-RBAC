@@ -765,6 +765,16 @@ desplegar() {
   verde "  $URL_PUBLICA -> 200   |   $URL_LOCAL -> $codigo_local"
   gris  "  Salud del color $nuevo: $(salud_de "$nuevo")"
 
+  # -- 9. Recoger la basura. Cada despliegue deja una imagen huerfana y cache
+  #       de build, y NADIE los borraba: el 2026-07-30 el disco llego al 99%
+  #       (11 GB de imagenes viejas) y ningun despliegue podia subir. Se borra
+  #       SOLO lo huerfano: `image prune` sin -a no toca ninguna imagen con
+  #       etiqueta, asi que app-api:anterior (la marcha atras) queda intacta.
+  paso "Recogiendo la basura de despliegues anteriores"
+  docker image prune -f >/dev/null 2>&1 || true
+  docker builder prune -af >/dev/null 2>&1 || true
+  gris "  Disco: $(df -h / | awk 'NR==2{print $5" usado, queda "$4}')"
+
   echo ""
   verde "############################################################"
   verde "#  DESPLIEGUE LISTO — sirviendo el color $nuevo"
