@@ -36,9 +36,10 @@ def _sender():
     return os.environ.get('EMAIL_FROM', 'Exygen Labs <hola@exygenlabs.com>')
 
 
-def _send_via_ses(to_address, subject, html_body):
+def _send_via_ses(to_address, subject, html_body, reply_to=None):
     region = os.environ.get('SES_REGION', 'us-east-1')
     ses = boto3.client('sesv2', region_name=region)
+    extra = {'ReplyToAddresses': [reply_to]} if reply_to else {}
     ses.send_email(
         FromEmailAddress=_sender(),
         Destination={'ToAddresses': [to_address]},
@@ -46,18 +47,22 @@ def _send_via_ses(to_address, subject, html_body):
             'Subject': {'Data': subject, 'Charset': 'UTF-8'},
             'Body': {'Html': {'Data': html_body, 'Charset': 'UTF-8'}},
         }},
+        **extra,
     )
 
 
-def _send_via_resend(to_address, subject, html_body):
+def _send_via_resend(to_address, subject, html_body, reply_to=None):
     """Resend por HTTP. No necesita SDK y no tiene sandbox que pedir."""
     api_key = os.environ.get('RESEND_API_KEY')
     if not api_key:
         raise RuntimeError('RESEND_API_KEY is not configured.')
+    cuerpo = {'from': _sender(), 'to': [to_address], 'subject': subject, 'html': html_body}
+    if reply_to:
+        cuerpo['reply_to'] = reply_to
     resp = requests.post(
         'https://api.resend.com/emails',
         headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
-        json={'from': _sender(), 'to': [to_address], 'subject': subject, 'html': html_body},
+        json=cuerpo,
         timeout=20,
     )
     if resp.status_code >= 300:
@@ -67,13 +72,19 @@ def _send_via_resend(to_address, subject, html_body):
 PROVIDERS = {'ses': _send_via_ses, 'resend': _send_via_resend}
 
 
-def _send_email_sync(to_address, subject, html_body):
-    """Despacha al proveedor configurado. `EMAIL_PROVIDER` = ses | resend."""
+def _send_email_sync(to_address, subject, html_body, reply_to=None):
+    """Despacha al proveedor configurado. `EMAIL_PROVIDER` = ses | resend.
+
+    ⛔ EL REMITENTE NUNCA CAMBIA: sale de `EMAIL_FROM` (el dominio de Exygen, que
+    es el que está autenticado con SPF/DKIM). `reply_to` sólo cambia a dónde va la
+    RESPUESTA — así el cliente que contesta una cotización le contesta a su
+    distribuidor, sin que el correo salga suplantando su dominio y caiga en spam.
+    """
     name = os.environ.get('EMAIL_PROVIDER', 'ses').strip().lower()
     send = PROVIDERS.get(name)
     if not send:
         raise RuntimeError(f'EMAIL_PROVIDER desconocido: {name}')
-    send(to_address, subject, html_body)
+    send(to_address, subject, html_body, reply_to=reply_to)
 
 
 RESET_SUBJECTS = {
@@ -1083,3 +1094,298 @@ async def send_purchase_alert(order, momento='nuevo'):
                     admin_notify_address())
     except Exception:
         logger.exception('Failed to send purchase alert for %s', numero)
+
+
+# ============================================================================
+#  LA COTIZACIÓN POR CORREO  (Christián, 2026-07-30)
+# ============================================================================
+#
+# El distribuidor arma la cotización en su panel y la manda al correo de su cliente.
+# Es el MISMO armazón visual de los demás correos de Exygen —tarjeta blanca sobre
+# fondo gris, tablas anidadas, estilos en línea, versión oscura con las clases
+# `em-*`— para que el cliente reconozca de dónde viene antes de leer una palabra.
+#
+# ⛔ AQUÍ NO SE ASOMA NI UN COSTO. Lo ve un cliente final: sólo hay precio público,
+# el descuento que se le dio y los totales. Ni proveedor, ni margen, ni ROI, ni la
+# comisión del distribuidor. Hay una prueba que lee el HTML entero y truena si
+# aparece cualquiera de esas palabras.
+#
+# El remitente es SIEMPRE el de Exygen (dominio autenticado); lo único que cambia
+# es el `reply-to`, que apunta al distribuidor para que el cliente le conteste a él.
+
+QUOTE_SUBJECTS = {
+    'es': 'Tu cotización de Exygen Labs{folio}',
+    'en': 'Your Exygen Labs quote{folio}',
+    'pt': 'Seu orçamento da Exygen Labs{folio}',
+}
+
+QUOTE_COPY = {
+    'es': {
+        'preheader': 'Tu cotización de Exygen Labs por {total}.',
+        'heading': 'Tu cotización',
+        'greet': 'HOLA {name}',
+        'greetPlain': 'HOLA',
+        'intro': '{advisor} preparó esta cotización para ti. Los precios ya traen tu descuento.',
+        'introPlain': 'Preparamos esta cotización para ti. Los precios ya traen tu descuento.',
+        'folioLabel': 'Cotización',
+        'items': 'Lo que cotizaste',
+        'money': 'El dinero',
+        'listPrice': 'Precio de lista',
+        'savings': 'Ahorro',
+        'total': 'Total',
+        'savingsBadge': 'TE AHORRAS {amount}',
+        'cta': 'Comprar En El Catálogo',
+        'codeTitle': 'Tu código de descuento',
+        'codeNote': 'Entra con el botón de arriba y tu descuento se aplica solo. También puedes teclear el código al pagar.',
+        'validity': 'Cotización informativa, vigencia de 7 días. Precios en pesos mexicanos (MXN) e incluyen IVA. El envío se calcula al pagar.',
+        'help': '¿Dudas? Contesta este correo y le llega a quien te cotizó, o escríbenos a',
+        'ruo': 'Productos para uso exclusivo en investigación (RUO). No son medicamentos ni suplementos; no se venden para consumo humano ni animal.',
+        'thanks': 'GRACIAS POR TU INTERÉS',
+        'each': 'c/u',
+    },
+    'en': {
+        'preheader': 'Your Exygen Labs quote for {total}.',
+        'heading': 'Your quote',
+        'greet': 'HELLO {name}',
+        'greetPlain': 'HELLO',
+        'intro': '{advisor} put together this quote for you. Prices already include your discount.',
+        'introPlain': 'We put together this quote for you. Prices already include your discount.',
+        'folioLabel': 'Quote',
+        'items': 'What you asked for',
+        'money': 'The money',
+        'listPrice': 'List price',
+        'savings': 'Savings',
+        'total': 'Total',
+        'savingsBadge': 'YOU SAVE {amount}',
+        'cta': 'Order From The Catalog',
+        'codeTitle': 'Your discount code',
+        'codeNote': 'Use the button above and your discount applies by itself. You can also type the code at checkout.',
+        'validity': 'Informational quote, valid for 7 days. Prices in Mexican pesos (MXN), tax included. Shipping is calculated at checkout.',
+        'help': 'Questions? Reply to this email and it reaches whoever quoted you, or write to',
+        'ruo': 'Research use only (RUO) products. Not medicines or supplements; not sold for human or animal consumption.',
+        'thanks': 'THANK YOU FOR YOUR INTEREST',
+        'each': 'each',
+    },
+    'pt': {
+        'preheader': 'Seu orçamento da Exygen Labs de {total}.',
+        'heading': 'Seu orçamento',
+        'greet': 'OLA {name}',
+        'greetPlain': 'OLA',
+        'intro': '{advisor} preparou este orçamento para você. Os preços já incluem o seu desconto.',
+        'introPlain': 'Preparamos este orçamento para você. Os preços já incluem o seu desconto.',
+        'folioLabel': 'Orçamento',
+        'items': 'O que você pediu',
+        'money': 'O dinheiro',
+        'listPrice': 'Preço de tabela',
+        'savings': 'Economia',
+        'total': 'Total',
+        'savingsBadge': 'VOCE ECONOMIZA {amount}',
+        'cta': 'Comprar No Catálogo',
+        'codeTitle': 'Seu código de desconto',
+        'codeNote': 'Entre pelo botão acima e o seu desconto é aplicado sozinho. Você também pode digitar o código no pagamento.',
+        'validity': 'Orçamento informativo, validade de 7 dias. Preços em pesos mexicanos (MXN), impostos incluídos. O frete é calculado no pagamento.',
+        'help': 'Dúvidas? Responda este e-mail e chega a quem te orçou, ou escreva para',
+        'ruo': 'Produtos para uso exclusivo em pesquisa (RUO). Não são medicamentos nem suplementos; não são vendidos para consumo humano ou animal.',
+        'thanks': 'OBRIGADO PELO SEU INTERESSE',
+        'each': 'cada',
+    },
+}
+
+
+def _quote_email_html(copy, quote):
+    """La cotización con el mismo lenguaje visual del correo de pedido.
+
+    `quote`: {folio, client_name, advisor, code, link, lines, list_total,
+              savings, total}. `lines`: [{name, quantity, unit_price, amount,
+              list_price}] — nombre, cuánto y a cómo. Nada más.
+    """
+    esc = html.escape
+    INK, BODY, MUTED, LINE, BG = '#132763', '#3D4657', '#8A93A8', '#E4E8F0', '#FBFCFE'
+    GREEN = '#0F7B5A'
+    FONT = 'Helvetica,Arial,sans-serif'
+
+    rows = []
+    for ln in quote.get('lines', []):
+        qty = int(ln.get('quantity', 1) or 1)
+        unit = float(ln.get('unit_price', 0) or 0)
+        lista = float(ln.get('list_price', 0) or 0)
+        antes = (f'<span class="em-muted" style="color:{MUTED};font-size:11px;'
+                 f'text-decoration:line-through;">&nbsp;{_money(lista)}</span>'
+                 if lista > unit else '')
+        rows.append(
+            f'<tr>'
+            f'<td class="em-body em-line" style="padding:10px 0;border-bottom:1px solid {LINE};'
+            f'font-family:{FONT};font-size:14px;line-height:1.5;color:{BODY};">'
+            f'{esc(str(ln.get("name", "")))}'
+            f'<span class="em-muted" style="color:{MUTED};">&nbsp;&times;{qty}</span>'
+            f'<br><span class="em-muted" style="color:{MUTED};font-size:11px;">'
+            f'{_money(unit)} {copy["each"]}{antes}</span></td>'
+            f'<td align="right" class="em-body em-line" style="padding:10px 0;border-bottom:1px solid {LINE};'
+            f'font-family:{FONT};font-size:14px;color:{BODY};white-space:nowrap;">'
+            f'{_money(ln.get("amount", 0))}</td>'
+            f'</tr>'
+        )
+
+    def total_row(label, value, strong=False, color=None):
+        c = color or (INK if strong else MUTED)
+        cls = 'em-ink' if strong else 'em-muted'
+        size = '17px' if strong else '14px'
+        weight = 'bold' if strong else 'normal'
+        pad = '12px 0 0 0' if strong else '6px 0 0 0'
+        return (f'<tr>'
+                f'<td class="{cls}" style="padding:{pad};font-family:{FONT};font-size:{size};'
+                f'color:{c};font-weight:{weight};">{label}</td>'
+                f'<td align="right" class="{cls}" style="padding:{pad};font-family:{FONT};'
+                f'font-size:{size};color:{c};font-weight:{weight};white-space:nowrap;">{value}</td>'
+                f'</tr>')
+
+    ahorro = float(quote.get('savings', 0) or 0)
+    totals = [total_row(copy['listPrice'], _money(quote.get('list_total', 0)))]
+    if ahorro > 0:
+        totals.append(total_row(copy['savings'], '-' + _money(ahorro), color=GREEN))
+    totals.append(total_row(copy['total'], _money(quote.get('total', 0)), strong=True))
+
+    badge = ''
+    if ahorro > 0:
+        badge = (f'<tr><td style="padding:18px 40px 0 40px;">'
+                 f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-save" '
+                 f'style="background-color:{BG}; border:2px dashed {INK}; border-radius:10px;">'
+                 f'<tr><td align="center" class="em-ink" style="padding:11px 20px;font-family:{FONT};'
+                 f'font-size:15px;font-weight:bold;letter-spacing:1.5px;color:{INK};">'
+                 f'{copy["savingsBadge"].format(amount=_money(ahorro))}</td></tr></table></td></tr>')
+
+    codigo = esc(str(quote.get('code', '') or ''))
+    code_html = ''
+    if codigo:
+        code_html = (
+            f'<tr><td style="padding:18px 40px 0 40px;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-box" '
+            f'style="background-color:{BG};border:1px solid {LINE};border-radius:10px;">'
+            f'<tr><td style="padding:14px 18px;font-family:{FONT};">'
+            f'<div class="em-muted" style="font-size:11px;letter-spacing:1.5px;color:{MUTED};'
+            f'text-transform:uppercase;">{copy["codeTitle"]}</div>'
+            f'<div class="em-ink" style="font-size:20px;color:{INK};font-weight:bold;'
+            f'letter-spacing:1px;padding-top:5px;">{codigo}</div>'
+            f'<div class="em-muted" style="font-size:12px;line-height:1.6;color:{MUTED};padding-top:6px;">'
+            f'{copy["codeNote"]}</div>'
+            f'</td></tr></table></td></tr>'
+        )
+
+    nombre = str(quote.get('client_name', '') or '').strip()
+    saludo = copy['greet'].format(name=esc(nombre.upper())) if nombre else copy['greetPlain']
+    asesor = str(quote.get('advisor', '') or '').strip()
+    intro = copy['intro'].format(advisor=esc(asesor)) if asesor else copy['introPlain']
+    folio = esc(str(quote.get('folio', '') or ''))
+    link = quote.get('link') or 'https://exygenlabs.com/catalogo'
+
+    folio_html = ''
+    if folio:
+        folio_html = (
+            f'<tr><td style="padding:22px 40px 0 40px;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-box" '
+            f'style="background-color:{BG}; border:1px solid {LINE}; border-radius:10px;">'
+            f'<tr><td align="center" style="padding:14px 20px; font-family:{FONT};">'
+            f'<div class="em-muted" style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; '
+            f'text-transform:uppercase;">{copy["folioLabel"]}</div>'
+            f'<div class="em-ink" style="font-size:20px; color:{INK}; font-weight:bold; '
+            f'letter-spacing:1px; padding-top:5px;">{folio}</div>'
+            f'</td></tr></table></td></tr>'
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="es-MX">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{DARK_EMAIL_STYLE}</head>
+<body class="em-bg" style="margin:0; padding:0; background-color:{BG};">
+  <div style="display:none; max-height:0; overflow:hidden; mso-hide:all;">{copy['preheader'].format(total=_money(quote.get('total', 0)))}</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-bg" style="background-color:{BG};">
+    <tr>
+      <td align="center" style="padding:32px 16px;">
+        <table role="presentation" width="560" cellpadding="0" cellspacing="0" class="em-card" style="max-width:560px; width:100%; background-color:#FFFFFF; border:1px solid {LINE}; border-radius:14px;">
+
+          <tr>
+            <td align="center" style="padding:36px 40px 8px 40px;">
+              <div class="em-ink" style="font-family:{FONT}; font-size:20px; letter-spacing:3px; color:{INK}; font-weight:bold;">EXYGEN&nbsp;LABS</div>
+              <div class="em-muted" style="font-family:{FONT}; font-size:11px; letter-spacing:2px; color:{MUTED}; padding-top:4px;">RESEARCH PEPTIDES</div>
+            </td>
+          </tr>
+
+          <tr>
+            <td style="padding:28px 40px 0 40px; font-family:{FONT};">
+              <h1 class="em-ink" style="margin:0; font-size:26px; line-height:1.25; color:{INK}; font-weight:bold;">{copy['heading']}</h1>
+              <p class="em-body" style="margin:16px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{saludo}</p>
+              <p class="em-body" style="margin:12px 0 0 0; font-size:15px; line-height:1.6; color:{BODY};">{intro}</p>
+            </td>
+          </tr>
+          {folio_html}
+          <tr>
+            <td style="padding:26px 40px 0 40px; font-family:{FONT};">
+              <div class="em-muted" style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase; padding-bottom:4px;">{copy['items']}</div>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{''.join(rows)}</table>
+              <div class="em-muted" style="font-size:11px; letter-spacing:1.5px; color:{MUTED}; text-transform:uppercase; padding:18px 0 0 0;">{copy['money']}</div>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{''.join(totals)}</table>
+            </td>
+          </tr>
+          {badge}
+          {code_html}
+          <tr>
+            <td align="center" style="padding:28px 40px 8px 40px;">
+              <a href="{link}" class="em-btn" style="display:inline-block; background-color:{INK}; color:#FFFFFF; font-family:{FONT}; font-size:15px; font-weight:bold; text-decoration:none; padding:14px 36px; border-radius:999px;">{copy['cta']}</a>
+            </td>
+          </tr>
+
+          <tr>
+            <td align="center" class="em-ink" style="padding:20px 40px 4px 40px; font-family:{FONT}; font-size:14px; font-weight:bold; letter-spacing:2px; color:{INK};">
+              {copy['thanks']}
+            </td>
+          </tr>
+
+          <tr>
+            <td align="center" class="em-muted" style="padding:10px 40px 22px 40px; font-family:{FONT}; font-size:12px; color:{MUTED}; letter-spacing:0.5px;">
+              Pureza HPLC &ge;99% &nbsp;&middot;&nbsp; {copy['validity']}
+            </td>
+          </tr>
+
+          <tr><td style="padding:0 40px;"><div class="em-line" style="border-top:1px solid {LINE};"></div></td></tr>
+
+          <tr>
+            <td class="em-muted" style="padding:20px 40px 8px 40px; font-family:{FONT}; font-size:13px; line-height:1.6; color:{MUTED};">
+              {copy['help']} <a href="mailto:hola@exygenlabs.com" class="em-link" style="color:{INK};">hola@exygenlabs.com</a>
+            </td>
+          </tr>
+
+          <tr>
+            <td class="em-footer" style="padding:12px 40px 28px 40px; font-family:{FONT}; font-size:11px; line-height:1.6; color:#A6ADBE;">
+              {copy['ruo']}<br><br>
+              &copy; 2026 Exygen Labs &middot; <a href="https://exygenlabs.com" class="em-footer" style="color:{MUTED};">exygenlabs.com</a>
+            </td>
+          </tr>
+
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+
+
+async def send_quote_email(to_address, quote, language=None, reply_to=None):
+    """Manda la cotización al cliente del distribuidor. Devuelve True si salió.
+
+    A diferencia de los demás correos, este SÍ informa el fracaso: no va colgado
+    de una compra en segundo plano, sino de un botón que alguien acaba de pulsar,
+    y decirle 'enviada' cuando no salió es mentirle en la cara."""
+    if not email_enabled():
+        logger.info('EMAIL_ENABLED != true, skipping quote email to %s', to_address)
+        return False
+    lang = normalize_language(language)
+    copy = QUOTE_COPY[lang]
+    folio = str(quote.get('folio', '') or '').strip()
+    subject = QUOTE_SUBJECTS[lang].format(folio=f' {folio}' if folio else '')
+    try:
+        await asyncio.to_thread(_send_email_sync, to_address, subject,
+                                _quote_email_html(copy, quote), reply_to)
+        logger.info('Quote email sent to %s (folio=%s, lang=%s)', to_address, folio, lang)
+        return True
+    except Exception:
+        logger.exception('Failed to send quote email to %s', to_address)
+        return False

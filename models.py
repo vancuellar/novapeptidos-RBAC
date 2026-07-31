@@ -74,6 +74,22 @@ class ActivateInput(BaseModel):
     Nunca mandamos una contraseña por correo."""
     token: str
     password: str = Field(min_length=6)
+    # ⛔ ACUERDO DE DISTRIBUIDOR — la casilla de la pantalla de activación.
+    # `False` por omisión a propósito: es la casilla NO PREMARCADA que exige el
+    # art. 93 Bis del Código de Comercio. Un cuerpo que no la mande NO firma.
+    # Mientras el interruptor esté apagado el servidor la ignora por completo.
+    acepta_acuerdo: bool = False
+    acuerdo_version: Optional[str] = None
+
+
+class AceptarAcuerdoInput(BaseModel):
+    """La firma desde el panel: casilla + versión que el usuario tenía leída.
+
+    `acepto` NO tiene valor por omisión distinto de False, y `version` viaja para
+    que el servidor rechace la firma si el texto cambió mientras la pantalla
+    estaba abierta. Nadie firma un documento distinto del que leyó."""
+    acepto: bool = False
+    version: Optional[str] = None
 
 
 class ResendVerificationInput(BaseModel):
@@ -423,6 +439,29 @@ class DistributorShippingUpdate(BaseModel):
     carrier: Optional[str] = None
     tracking_number: Optional[str] = None
     tracking_url: Optional[str] = None
+
+
+class QuoteLine(BaseModel):
+    """Un renglón de la cotización que el distribuidor manda por correo.
+
+    ⛔ SOLO QUÉ Y CUÁNTOS. Ni precio ni descuento por renglón: el precio lo pone
+    el SERVIDOR con el catálogo real (misma regla que el checkout). Si el modelo
+    aceptara un precio, cualquiera podría mandarle a un cliente una cotización
+    firmada por Exygen con el número que se le antojara."""
+    product_id: str
+    quantity: int = Field(1, ge=1, le=999)
+
+
+class QuoteEmailRequest(BaseModel):
+    """La cotización que sale por correo. `discount` es una PETICIÓN, no una
+    orden: el servidor la recorta al tope de cada producto y al máximo de este
+    distribuidor antes de escribir un solo peso."""
+    email: EmailStr
+    client_name: Optional[str] = ''
+    discount: float = Field(0, ge=0, le=1)
+    language: Optional[str] = None
+    folio: Optional[str] = ''
+    items: List[QuoteLine] = Field(default_factory=list)
 
 
 # ---------- Distributors ----------

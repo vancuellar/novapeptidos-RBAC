@@ -37,9 +37,11 @@ RUTA = '/api/distributor/quote-caps'
 # Catálogo de mentira con un caso de cada cosa que recorta.
 PRODUCTOS = [
     {'id': 'p-reta', 'sku': 'RETA-20MG', 'slug': 'retatrutida-20-mg', 'name': 'Retatrutida 20 mg',
-     'category': 'metabolicos', 'commission_cap': 0.40, 'distributor_eligible': True},
+     'category': 'metabolicos', 'commission_cap': 0.40, 'distributor_eligible': True,
+     'price': 3000, 'presentation': '20 mg'},
     {'id': 'p-agua', 'sku': 'AGUA-30ML', 'slug': 'agua-30-ml', 'name': 'Agua bacteriostática 30 mL',
-     'category': 'accesorios', 'commission_cap': 0.40, 'distributor_eligible': True},
+     'category': 'accesorios', 'commission_cap': 0.40, 'distributor_eligible': True,
+     'price': 500, 'presentation': '30 mL'},
     {'id': 'p-hgh', 'sku': 'HGH-40IU', 'slug': 'hgh-40-iu', 'name': 'HGH 40 IU',
      'category': 'hormona-crecimiento', 'commission_cap': 0.35, 'distributor_eligible': True},
     {'id': 'p-frag', 'sku': 'FRAG-5MG', 'slug': 'hgh-fragment-5-mg', 'name': 'HGH Fragment 176-191 5 mg',
@@ -50,7 +52,7 @@ PRODUCTOS = [
      'category': 'hormona-crecimiento', 'commission_cap': 0.25, 'distributor_eligible': True},
     {'id': 'p-oculto', 'sku': 'DYS-500', 'slug': 'dysport-500-u', 'name': 'Dysport 500 U',
      'category': 'estetica', 'commission_cap': 0.40, 'distributor_eligible': True,
-     'hidden': True},
+     'price': 9000, 'hidden': True},
     # El que trae basura en el tope: no debe tumbar la ruta.
     {'id': 'p-raro', 'sku': None, 'slug': 'producto-raro', 'name': 'Producto raro',
      'category': 'bienestar', 'commission_cap': 'no-es-un-numero', 'distributor_eligible': True},
@@ -325,3 +327,166 @@ def test_tope_de_descuento_nunca_pasa_del_tope_duro():
     assert server.tope_de_descuento({'commission_cap': -1}) == 0.0
     assert server.tope_de_descuento({}) == server.COMMISSION_CAP
     assert server.tope_de_descuento(None) == server.COMMISSION_CAP
+
+
+# ============================================================================
+#  LA COTIZACIÓN POR CORREO  (Christián, 2026-07-30)
+# ============================================================================
+# El distribuidor manda la cotización al correo de su cliente. Tres cosas que
+# importan y aquí se prueban:
+#   · LA PUERTA: sin sesión 401, cliente 403, "ver como" 403.
+#   · EL PRECIO LO PONE EL SERVIDOR: del navegador sólo viaja qué y cuántos.
+#   · EL SOBRE: en el HTML del correo no aparece ni un costo, ni el proveedor,
+#     ni el ROI — lo lee un CLIENTE FINAL.
+#   · EL FRENO: nadie usa el dominio de Exygen como cañón de spam.
+
+RUTA_CORREO = '/api/distributor/quote/email'
+
+
+@pytest.fixture
+def correo(monkeypatch):
+    """Atrapa el correo en vez de mandarlo. Devuelve la caja con lo enviado."""
+    import emails
+    caja = {}
+    monkeypatch.setenv('EMAIL_ENABLED', 'true')
+
+    def _fake(to, subject, html_body, reply_to=None):
+        caja.update(to=to, subject=subject, html=html_body, reply_to=reply_to)
+
+    monkeypatch.setattr(emails, '_send_email_sync', _fake)
+    monkeypatch.setattr(server, '_COTIZACIONES_MANDADAS', {})
+    return caja
+
+
+CUERPO = {'email': 'cliente@x.mx', 'client_name': 'Juan Pérez', 'discount': 0.15,
+          'language': 'es', 'folio': 'COT-260730-1234',
+          'items': [{'product_id': 'p-reta', 'quantity': 2},
+                    {'product_id': 'p-agua', 'quantity': 1}]}
+
+
+# ------------------------------------------------------------------- la puerta
+def test_correo_sin_sesion_no_pasa(como, correo):
+    assert como(None).post(RUTA_CORREO, json=CUERPO).status_code == 401
+
+
+def test_correo_de_un_cliente_no_pasa(como, correo):
+    assert como(CLIENTE).post(RUTA_CORREO, json=CUERPO).status_code == 403
+
+
+def test_ver_como_no_manda_correos(como, correo):
+    """El 'ver como' del admin es SOLO LECTURA: espiar el panel de alguien no
+    puede convertirse en mandar correos desde su cuenta."""
+    espia = dict(DIST, view_as=True)
+    assert como(espia).post(RUTA_CORREO, json=CUERPO).status_code == 403
+
+
+def test_el_distribuidor_si_manda(como, correo):
+    r = como(DIST).post(RUTA_CORREO, json=CUERPO)
+    assert r.status_code == 200 and r.json()['sent'] is True
+    assert correo['to'] == 'cliente@x.mx'
+
+
+# --------------------------------------------------- el precio lo pone el server
+def test_el_precio_sale_del_catalogo_no_del_navegador(como, correo):
+    """El cuerpo no tiene dónde meter un precio: el modelo sólo acepta producto y
+    cantidad. Aunque lo mande, se cae solo y el correo lleva el precio real."""
+    cuerpo = dict(CUERPO, items=[{'product_id': 'p-reta', 'quantity': 1, 'price': 1}])
+    r = como(DIST).post(RUTA_CORREO, json=cuerpo)
+    assert r.status_code == 200
+    # 3,000 con 15% = 2,550. Si hubiera hecho caso al navegador diría $1.
+    assert r.json()['total'] == 2550
+    assert '$1 MXN' not in correo['html']
+
+
+def test_el_insumo_no_lleva_descuento_ni_en_el_correo(como, correo):
+    """El agua bacteriostática tiene tope 0: va a precio de lista aunque la
+    cotización pida 15%."""
+    cuerpo = dict(CUERPO, items=[{'product_id': 'p-agua', 'quantity': 2}])
+    assert como(DIST).post(RUTA_CORREO, json=cuerpo).json()['total'] == 1000
+
+
+def test_nadie_da_mas_descuento_del_que_puede(como, correo):
+    """Pide 90%. Su máximo es 25% y el del producto 40%: manda el 25%."""
+    cuerpo = dict(CUERPO, discount=0.90, items=[{'product_id': 'p-reta', 'quantity': 1}])
+    assert como(DIST).post(RUTA_CORREO, json=cuerpo).json()['total'] == 2250
+
+
+def test_lo_oculto_no_se_cotiza_por_correo(como, correo):
+    cuerpo = dict(CUERPO, items=[{'product_id': 'p-oculto', 'quantity': 1}])
+    assert como(DIST).post(RUTA_CORREO, json=cuerpo).status_code == 400
+
+
+def test_una_cotizacion_vacia_no_manda_correo(como, correo):
+    assert como(DIST).post(RUTA_CORREO, json=dict(CUERPO, items=[])).status_code == 400
+    assert not correo
+
+
+# -------------------------------------------------------------------- el sobre
+def test_el_correo_no_lleva_ni_un_costo(como, correo):
+    """Lo lee un CLIENTE FINAL. Se busca la palabra en el HTML entero."""
+    como(DIST).post(RUTA_CORREO, json=CUERPO)
+    crudo = correo['html'].lower()
+    for palabra in ('costo', 'proveedor', 'supplier', 'roi', 'margen',
+                    'comisión', 'comision', 'utilidad'):
+        assert palabra not in crudo, f'el correo de la cotización trae "{palabra}"'
+
+
+def test_el_correo_trae_lo_que_se_cotizó(como, correo):
+    como(DIST).post(RUTA_CORREO, json=CUERPO)
+    h = correo['html']
+    assert 'Retatrutida 20 mg' in h
+    assert 'COT-260730-1234' in h and 'COT-260730-1234' in correo['subject']
+    assert 'JUAN PÉREZ' in h            # el saludo va en mayúsculas
+    assert 'EXYGEN' in h                 # el membrete de siempre
+
+
+def test_el_correo_lleva_el_enlace_con_su_codigo(como, correo):
+    """Sin el ?ref= la cotización es publicidad gratis: el cliente compra y la
+    comisión no es de nadie."""
+    como(dict(DIST, distributor_code='DIST-4821')).post(RUTA_CORREO, json=CUERPO)
+    assert '/catalogo?ref=DIST-4821' in correo['html']
+
+
+def test_el_nombre_del_cliente_va_escapado(como, correo):
+    como(DIST).post(RUTA_CORREO, json=dict(CUERPO, client_name='<b>x</b>'))
+    assert '<b>x</b>' not in correo['html']
+
+
+def test_la_respuesta_le_llega_al_distribuidor(como, correo):
+    """El remitente sigue siendo Exygen (dominio autenticado); lo que cambia es a
+    dónde va la respuesta."""
+    como(DIST).post(RUTA_CORREO, json=CUERPO)
+    assert correo['reply_to'] == 'dist@x.mx'
+
+
+def test_el_correo_va_en_el_idioma_pedido(como, correo):
+    como(DIST).post(RUTA_CORREO, json=dict(CUERPO, language='pt'))
+    assert 'orçamento' in correo['subject'].lower()
+    como(DIST).post(RUTA_CORREO, json=dict(CUERPO, language='en'))
+    assert 'quote' in correo['subject'].lower()
+
+
+# --------------------------------------------------------------------- el freno
+def test_nadie_usa_esto_como_cañon_de_spam(como, correo):
+    cliente = como(DIST)
+    for _ in range(server.COTIZACIONES_POR_HORA):
+        assert cliente.post(RUTA_CORREO, json=CUERPO).status_code == 200
+    assert cliente.post(RUTA_CORREO, json=CUERPO).status_code == 429
+
+
+def test_el_freno_es_por_distribuidor(como, correo):
+    """El tope de uno no puede dejar mudo a otro."""
+    for _ in range(server.COTIZACIONES_POR_HORA):
+        como(DIST).post(RUTA_CORREO, json=CUERPO)
+    otro = dict(DIST, id='u-dist-2', email='otro@x.mx')
+    assert como(otro).post(RUTA_CORREO, json=CUERPO).status_code == 200
+
+
+def test_el_freno_suelta_al_pasar_la_hora(como, correo):
+    server._COTIZACIONES_MANDADAS['u-dist'] = [0.0] * server.COTIZACIONES_POR_HORA
+    assert server._puede_mandar_cotizacion('u-dist', ahora=7200) is True
+
+
+def test_una_cotizacion_kilometrica_se_rechaza(como, correo):
+    largo = dict(CUERPO, items=[{'product_id': 'p-reta', 'quantity': 1}] * 41)
+    assert como(DIST).post(RUTA_CORREO, json=largo).status_code == 400
