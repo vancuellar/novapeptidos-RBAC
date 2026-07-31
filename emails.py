@@ -523,8 +523,12 @@ SHIPPED_BODIES = {
 async def send_shipped_email(order, language=None):
     """Le manda al cliente su numero de guia. Nunca lanza.
 
-    El boton lleva al rastreo de la paqueteria si lo conocemos, y si no a la ficha
-    del pedido en el sitio: mas vale mandar a un lugar que existe que a un enlace roto.
+    ⛔ EL BOTON LLEVA A NUESTRA PAGINA, NO A LA DE FEDEX (Christian, 2026-07-31):
+    «quiero que vivan en nuestra pagina el mayor tiempo posible». Antes apuntaba al
+    rastreo de la paqueteria y se perdia al cliente en el primer clic. Ya no hace
+    falta: `/pedido/{numero}` trae el rastreo ADENTRO —los mismos eventos que enseña
+    la paqueteria, pedidos a su API y pintados con nuestra marca (ver rastreo.py y
+    RastreoEnvio.js)—, y ahi mismo tiene la liga al sitio del carrier si la quiere.
     """
     if not email_enabled():
         return
@@ -542,7 +546,7 @@ async def send_shipped_email(order, language=None):
                   .replace('{tracking}', html.escape(numero)))
     html_body = _action_email_html(
         greet, cuerpo, cta, footer, name=customer.get('full_name', ''), email='',
-        link=order.get('tracking_url') or f'{site}/pedido/{number}')
+        link=f'{site}/pedido/{number}')
     try:
         await asyncio.to_thread(_send_email_sync, to,
                                 SHIPPED_SUBJECTS[lang].format(number=number), html_body)
@@ -960,9 +964,13 @@ def _order_email_html(order, copy, link, etapa='nuevo'):
         preheader = copy['preheaderPaid'].format(number=number)
         intro = copy['introPaid']
         boton = copy.get('trackShipment', copy['track']) if rastreo else copy['track']
-        # Con guia, el boton lleva al rastreo de la paqueteria; sin ella, a la ficha.
-        if rastreo and order.get('tracking_url'):
-            link = order['tracking_url']
+        # ⛔ EL BOTON SE QUEDA EN CASA (Christian, 2026-07-31): «quiero que vivan en
+        # nuestra pagina el mayor tiempo posible». Antes, con guia, este renglon
+        # mandaba el boton al rastreo de FedEx y se perdia al cliente en cuanto
+        # picaba. Ya no hace falta: `/pedido/{numero}` trae el rastreo ADENTRO
+        # (ver rastreo.py y RastreoEnvio.js), con los mismos eventos que enseña la
+        # paqueteria. Quien de todos modos quiera ver el sitio de FedEx tiene la liga
+        # abajo de la linea de tiempo. Por eso aqui ya no se pisa `link`.
     else:
         heading = copy['heading']
         preheader = copy['preheader'].format(number=number)

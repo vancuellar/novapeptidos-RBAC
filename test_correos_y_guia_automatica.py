@@ -334,6 +334,34 @@ def test_el_correo_del_cliente_NUNCA_trae_la_cifra_del_envio(db, con_llave,
                 f'el correo del cliente enseña «{prohibido}»: eso es interno'
 
 
+def test_el_boton_del_correo_lleva_a_NUESTRA_pagina_no_a_la_de_fedex(db, monkeypatch,
+                                                                     correos, fondo):
+    """⛔ ORDEN DE CHRISTIÁN (2026-07-31): «quiero que vivan en nuestra página el
+    mayor tiempo posible».
+
+    El correo con guía mandaba el botón al rastreo de FedEx y se perdía al cliente en
+    el primer clic. Ahora `/pedido/{numero}` trae el rastreo ADENTRO (ver rastreo.py y
+    RastreoEnvio.js), así que el botón se queda en casa.
+
+    La liga de la paquetería NO desaparece del mundo: sigue estando en nuestra propia
+    página, abajo de la línea de tiempo. Lo que no puede es ser el destino del botón.
+    """
+    asyncio.run(db.orders.insert_one(
+        _pedido('tarjeta', status='confirmado', carrier='FedEx',
+                tracking_number='875164874865',
+                tracking_url='https://www.fedex.com/fedextrack/?trknbr=875164874865')))
+    asyncio.run(server.avisar_al_cliente(db.orders.docs[0], 'pagado'))
+    fondo()
+
+    cuerpo = _del_cliente(correos)[0][2]
+    assert 'fedex.com' not in cuerpo.lower(), \
+        'el botón del correo sigue mandando al sitio de la paquetería'
+    assert 'exygenlabs.com/pedido/EX-20260731-0001' in cuerpo, \
+        'el correo no lleva a nuestra página del pedido'
+    # El número de guía SÍ se queda: es lo que el cliente busca cuando abre el correo.
+    assert '875164874865' in cuerpo
+
+
 def test_el_correo_de_pago_sigue_sin_revelar_al_distribuidor(db, monkeypatch,
                                                              correos, fondo):
     """El candado de Mónica Flores no se deshizo al consolidar los correos."""
