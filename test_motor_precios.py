@@ -797,7 +797,11 @@ def test_el_inventario_real_ya_no_se_resta_dos_veces():
 _PEDIDO_PARTIDO = {
     'order_number': 'EX-TEST', 'subtotal': 1000, 'discount': 0, 'shipping': 0,
     'total': 1000, 'payment_method': 'spei',
-    'items': [{'name': 'Orexin A 10 mg', 'price': 9359, 'quantity': 21}],
+    'items': [
+        {'product_id': 'p1', 'name': 'Orexin A 10 mg', 'price': 9359, 'quantity': 21},
+        {'product_id': 'p2', 'name': 'Vitamina D3 10 mL', 'price': 500, 'quantity': 2},
+        {'product_id': 'p3', 'name': 'Agua Bacteriostatica', 'price': 179, 'quantity': 1},
+    ],
     'customer': {'full_name': 'Prueba', 'email': 'x@y.com', 'address': 'Calle 1'},
     'backorder': True,
     'backorder_items': [
@@ -809,21 +813,34 @@ _PEDIDO_PARTIDO = {
 }
 
 
-@pytest.mark.parametrize('lang,frases', [
-    ('es', ['DOS entregas', '20 de 21 salen ya, 1 sobre pedido', 'las 2 sobre pedido',
-            '2 a 5 dias habiles', 'alrededor de una semana despues']),
-    ('en', ['TWO deliveries', '20 of 21 ship now, 1 on backorder', 'all 2 on backorder',
-            '2 to 5 business days', 'about a week later']),
-    ('pt', ['DUAS entregas', '20 de 21 saem agora, 1 sob encomenda', 'as 2 sob encomenda',
-            '2 a 5 dias uteis', 'cerca de uma semana depois']),
+# ⛔ Christián (2026-07-30) quitó el bloque grande de "dos entregas": asusta más de lo
+# que informa, y el desglose de piezas es un dato de OPERACIÓN, no algo que el cliente
+# necesite ver. Ahora es una nota corta pegada a CADA producto que sí va sobre pedido —
+# sin "dos entregas", sin plazos duros, sin el desglose de cuántas piezas.
+@pytest.mark.parametrize('lang,nota', [
+    ('es', 'Se surte desde EUA'),
+    ('en', 'Ships from the USA'),
+    ('pt', 'Vem dos EUA'),
 ])
-def test_el_correo_del_pedido_avisa_del_envio_partido_en_los_tres_idiomas(lang, frases):
-    """El correo es el papel que le queda al cliente. Una entrega en dos partes que solo
-    se anunció en una pantalla es una sorpresa una semana después."""
+def test_el_correo_del_pedido_avisa_del_envio_partido_en_los_tres_idiomas(lang, nota):
+    """El correo es el papel que le queda al cliente: la misma nota corta que ya vio en
+    el carrito y el checkout, pegada a cada producto que va sobre pedido."""
     import emails
     h = emails._order_email_html(_PEDIDO_PARTIDO, emails.ORDER_COPY[lang], 'https://x/y')
-    for f in frases:
-        assert f in h, f'falta {f!r} en el correo en {lang}'
+    # Aparece una vez por cada producto sobre pedido (Orexin A y Vitamina D3), nunca
+    # como bloque aparte.
+    assert h.count(nota) == 2, f'la nota no aparece pegada a cada producto sobre pedido en {lang}'
+    assert 'DOS entregas' not in h and 'TWO deliveries' not in h and 'DUAS entregas' not in h
+
+
+def test_la_nota_no_sale_en_un_producto_que_si_alcanza():
+    """La nota SOLO va pegada a los productos que de verdad van sobre pedido — el agua
+    bacteriostática del pedido sí alcanza y no debe llevarla."""
+    import emails
+    h = emails._order_email_html(_PEDIDO_PARTIDO, emails.ORDER_COPY['es'], 'https://x/y')
+    inicio = h.index('Agua Bacteriostatica')
+    fin = h.index('</tr>', inicio)
+    assert 'Se surte desde EUA' not in h[inicio:fin]
 
 
 def test_un_pedido_completo_no_lleva_aviso_de_sobre_pedido():
@@ -831,7 +848,7 @@ def test_un_pedido_completo_no_lleva_aviso_de_sobre_pedido():
     import emails
     completo = dict(_PEDIDO_PARTIDO, backorder=False, backorder_items=[])
     h = emails._order_email_html(completo, emails.ORDER_COPY['es'], 'https://x/y')
-    assert 'DOS entregas' not in h and 'sobre pedido' not in h
+    assert 'Se surte desde EUA' not in h
 
 
 # ---------- El aviso interno de compra ----------

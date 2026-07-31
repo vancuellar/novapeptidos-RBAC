@@ -568,13 +568,9 @@ ORDER_COPY = {
         'points': 'GANAS {points} PUNTOS CON ESTA COMPRA',
         'pointsUsed': 'Puntos canjeados',
         # ENVIO PARTIDO: lo que hay sale ya y lo demas se manda pedir. Christian,
-        # 2026-07-30. El cliente ya lo vio antes de pagar; aqui queda por escrito.
-        'backorderTitle': 'Tu pedido llega en DOS entregas',
-        'backorderIntro': 'Lo que tenemos listo sale de inmediato. Lo demas lo mandamos pedir y te llega despues, sin que pagues envio extra.',
-        'backorderNow': 'Sale ya: llega en 2 a 5 dias habiles',
-        'backorderLater': 'Sobre pedido: llega alrededor de una semana despues',
-        'backorderLine': '{name}: {now} de {asked} salen ya, {later} sobre pedido',
-        'backorderAll': '{name}: las {later} sobre pedido',
+        # 2026-07-30. Ya NO se anuncia como "dos entregas" ni con plazos duros: una
+        # nota corta pegada a CADA producto sobre pedido, igual que en el sitio.
+        'backorderItemNote': 'Se surte desde EUA: tarda un poco mas en llegar. Te mantendremos al tanto.',
         'thanks': 'GRACIAS POR TU COMPRA',
     },
     'en': {
@@ -603,12 +599,7 @@ ORDER_COPY = {
         'savings': 'YOU SAVED {amount}',
         'points': 'YOU EARN {points} POINTS WITH THIS ORDER',
         'pointsUsed': 'Points redeemed',
-        'backorderTitle': 'Your order arrives in TWO deliveries',
-        'backorderIntro': 'What we have in stock ships right away. The rest we order for you and it arrives later, with no extra shipping cost.',
-        'backorderNow': 'Ships now: arrives in 2 to 5 business days',
-        'backorderLater': 'On backorder: arrives about a week later',
-        'backorderLine': '{name}: {now} of {asked} ship now, {later} on backorder',
-        'backorderAll': '{name}: all {later} on backorder',
+        'backorderItemNote': "Ships from the USA - takes a little longer. We'll keep you posted.",
         'thanks': 'THANK YOU FOR YOUR ORDER',
     },
     'pt': {
@@ -637,12 +628,7 @@ ORDER_COPY = {
         'savings': 'VOCE ECONOMIZOU {amount}',
         'points': 'VOCE GANHA {points} PONTOS COM ESTA COMPRA',
         'pointsUsed': 'Pontos resgatados',
-        'backorderTitle': 'Seu pedido chega em DUAS entregas',
-        'backorderIntro': 'O que temos pronto sai de imediato. O restante nos encomendamos e chega depois, sem que voce pague frete extra.',
-        'backorderNow': 'Sai agora: chega em 2 a 5 dias uteis',
-        'backorderLater': 'Sob encomenda: chega cerca de uma semana depois',
-        'backorderLine': '{name}: {now} de {asked} saem agora, {later} sob encomenda',
-        'backorderAll': '{name}: as {later} sob encomenda',
+        'backorderItemNote': 'Vem dos EUA: demora um pouco mais para chegar. Vamos te manter informado.',
         'thanks': 'OBRIGADO PELA SUA COMPRA',
     },
 }
@@ -692,15 +678,28 @@ def _order_email_html(order, copy, link):
     INK, BODY, MUTED, LINE, BG = '#132763', '#3D4657', '#8A93A8', '#E4E8F0', '#FBFCFE'
     FONT = 'Helvetica,Arial,sans-serif'
 
+    # ⛔ ENVIO PARTIDO, VERSION CORTA (Christian, 2026-07-30). Ya no es un bloque grande
+    # con "dos entregas" y el desglose de piezas: es una nota chiquita pegada a CADA
+    # producto que va sobre pedido, igual que en el carrito y el checkout del sitio. Se
+    # empareja por product_id (lo normal) y por nombre como respaldo, porque no todo
+    # renglon viejo trae el id.
+    lineas_bo = order.get('backorder_items') or []
+    ids_bo = {str(b.get('product_id')) for b in lineas_bo if b.get('product_id')}
+    nombres_bo = {str(b.get('name', '')).strip().lower() for b in lineas_bo if b.get('name')}
+
     rows = []
     for item in order.get('items', []):
         qty = int(item.get('quantity', 1) or 1)
         line_total = float(item.get('price', 0) or 0) * qty
+        es_sobre_pedido = (str(item.get('product_id', '')) in ids_bo
+                           or str(item.get('name', '')).strip().lower() in nombres_bo)
+        nota = (f'<br><span class="em-muted" style="color:{MUTED};font-size:11px;">'
+                f'{copy["backorderItemNote"]}</span>' if es_sobre_pedido else '')
         rows.append(
             f'<tr>'
             f'<td class="em-body em-line" style="padding:10px 0;border-bottom:1px solid {LINE};font-family:{FONT};'
             f'font-size:14px;line-height:1.5;color:{BODY};">{esc(str(item.get("name", "")))}'
-            f'<span class="em-muted" style="color:{MUTED};">&nbsp;&times;{qty}</span></td>'
+            f'<span class="em-muted" style="color:{MUTED};">&nbsp;&times;{qty}</span>{nota}</td>'
             f'<td align="right" class="em-body em-line" style="padding:10px 0;border-bottom:1px solid {LINE};font-family:{FONT};'
             f'font-size:14px;color:{BODY};white-space:nowrap;">{_money(line_total)}</td>'
             f'</tr>'
@@ -753,40 +752,6 @@ def _order_email_html(order, copy, link):
             f'</td></tr></table></td></tr>'
         )
     number = esc(str(order.get('order_number', '')))
-
-    # ⛔ ENVIO PARTIDO. Si el pedido trae piezas sobre pedido, el correo lo dice con el
-    # desglose — no basta con que lo haya visto en el checkout: el correo es el papel que
-    # le queda al cliente, y una entrega en dos partes que solo se anuncio en una pantalla
-    # es una sorpresa una semana despues.
-    backorder_html = ''
-    lineas_bo = order.get('backorder_items') or []
-    if lineas_bo:
-        renglones = []
-        for b in lineas_bo:
-            nombre = esc(str(b.get('name', '')))
-            ya, luego = int(b.get('en_mano', 0) or 0), int(b.get('por_surtir', 0) or 0)
-            pedidas = int(b.get('pedidas', 0) or 0)
-            texto = (copy['backorderAll'].format(name=nombre, later=luego) if ya <= 0
-                     else copy['backorderLine'].format(name=nombre, now=ya, asked=pedidas,
-                                                       later=luego))
-            renglones.append(
-                f'<tr><td class="em-body" style="padding:3px 0;font-family:{FONT};'
-                f'font-size:13px;line-height:1.5;color:{BODY};">{texto}</td></tr>')
-        backorder_html = (
-            f'<tr><td style="padding:18px 40px 0 40px;">'
-            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" class="em-box" '
-            f'style="background-color:{BG};border:1px solid {LINE};border-radius:10px;"><tr>'
-            f'<td style="padding:14px 18px;">'
-            f'<div class="em-ink" style="font-family:{FONT};font-size:13px;font-weight:bold;'
-            f'color:{INK};padding-bottom:6px;">{copy["backorderTitle"]}</div>'
-            f'<div class="em-body" style="font-family:{FONT};font-size:13px;line-height:1.6;'
-            f'color:{BODY};padding-bottom:8px;">{copy["backorderIntro"]}</div>'
-            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
-            f'{"".join(renglones)}</table>'
-            f'<div class="em-muted" style="font-family:{FONT};font-size:12px;line-height:1.6;'
-            f'color:{MUTED};padding-top:8px;">{copy["backorderNow"]}<br>{copy["backorderLater"]}</div>'
-            f'</td></tr></table></td></tr>'
-        )
 
     # Estilo ticket de super: ahorro y puntos en cajas punteadas, solo si aplican.
     ticket_lines = []
@@ -850,7 +815,6 @@ def _order_email_html(order, copy, link):
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{''.join(totals)}</table>
             </td>
           </tr>
-          {backorder_html}
           {ticket_html}
           {spei_html}
           <tr>
