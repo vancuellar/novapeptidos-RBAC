@@ -247,14 +247,20 @@ async def enviar_compra(order, test=None):
     log: {'enviado': bool, 'motivo': str, ...}. Cobrar es lo importante; medir
     va después y jamás debe tumbar un webhook.
     """
+    # ⛔ EL PEDIDO DE PRUEBA SE DESCARTA ANTES QUE NADA, incluso antes de mirar si hay
+    # token. Estaba después, y aunque en producción daba igual —con token puesto, el
+    # siguiente `if` lo atrapaba— hacía que la garantía dependiera de la configuración:
+    # el motivo que se devolvía era «sin token», o sea que un pedido de prueba se
+    # frenaba POR CASUALIDAD y no por la regla. Un pedido de @example.com no se le
+    # manda a Meta nunca, haya token o no, y ahora lo dice la primera línea.
+    if es_pedido_de_prueba(order or {}):
+        return {'enviado': False, 'motivo': 'pedido de prueba'}
+
     if not configurado():
         logger.warning('Meta CAPI apagado: falta META_CAPI_TOKEN en el entorno. '
                        'La compra %s no se le avisó a Meta.',
                        (order or {}).get('order_number', '?'))
         return {'enviado': False, 'motivo': 'sin token'}
-
-    if es_pedido_de_prueba(order or {}):
-        return {'enviado': False, 'motivo': 'pedido de prueba'}
 
     cuerpo = construir_evento(order or {}, test=test)
     if not cuerpo:

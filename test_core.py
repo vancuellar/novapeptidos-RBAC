@@ -2197,3 +2197,31 @@ def test_el_override_no_pasa_de_su_propia_comision():
     import pyramid
     d = {'commission_rate': 0.30, 'tier': 'junior0', 'max_discount_override': 0.45}
     assert max(pyramid.discount_tiers_de(d)) == 0.30
+
+
+# ==========================================================================
+#  LA COMPUERTA SE VIGILA A SÍ MISMA
+# ==========================================================================
+def test_todas_las_pruebas_del_repo_estan_en_pytest_ini():
+    """⛔ UN ARCHIVO DE PRUEBAS QUE NADIE CORRE ES PEOR QUE NO TENERLO: aparenta
+    cobertura que no existe.
+
+    `pytest.ini` lista los archivos A MANO —tiene que hacerlo, porque sin `testpaths`
+    pytest sale a recorrer el entorno virtual y se cuelga— y esa lista se quedó atrás
+    DOS veces el mismo día (2026-07-31): primero con tres archivos nuevos (43 pruebas
+    invisibles) y luego con `test_meta_capi.py`, que llevaba tiempo fuera de la suite
+    escondiendo una prueba en rojo.
+
+    Esta prueba cierra el agujero: si agregas un `test_*.py` y no lo registras, truena
+    aquí y te dice cuál falta."""
+    import os
+    import re
+    base = os.path.dirname(os.path.abspath(__file__))
+    en_disco = {f for f in os.listdir(base)
+                if f.startswith('test_') and f.endswith('.py')}
+    with open(os.path.join(base, 'pytest.ini'), encoding='utf-8') as fh:
+        registrados = set(re.findall(r'test_[a-z_0-9]+\.py', fh.read()))
+    faltan = sorted(en_disco - registrados)
+    assert not faltan, (
+        f'estos archivos de prueba NO los corre nadie: {faltan}. '
+        'Agrégalos a `testpaths` en pytest.ini.')

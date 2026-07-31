@@ -2431,6 +2431,37 @@ async def _devolver_puntos(user_id, puntos):
         await db.users.update_one({'id': user_id}, {'$inc': {'points_balance': puntos}})
 
 
+async def _apartar_cupon(coupon, order_number: str) -> bool:
+    """Quema un cupón de un solo uso MIRANDO Y MARCANDO EN EL MISMO PASO.
+
+    ⛔ EL MISMO CANDADO QUE `_apartar_puntos` Y `_reservar_inventario`, y por la misma
+    razón — este era el que faltaba. El cupón se miraba al principio del checkout
+    (`not _c.get('used')`) y se marcaba usado hasta el final, ya grabado el pedido.
+    Entre esas dos líneas hay una docena de `await` (inventario, puntos, insert del
+    pedido, correos), y cada uno suelta el hilo: dos checkouts simultáneos con el MISMO
+    cupón leían los dos `used: False`, los dos se llevaban el descuento y el cupón de un
+    solo uso pagaba dos veces. Es dinero que sale, no un desajuste cosmético.
+
+    Aquí la condición viaja DENTRO del update (`used` distinto de True): si el pedido de
+    al lado ya lo quemó, Mongo no encuentra el documento, no marca nada y se devuelve
+    False. El que llega tarde se queda sin descuento, que es lo correcto.
+    """
+    if not coupon or not coupon.get('single_use', True):
+        return True                      # los reutilizables no se apartan
+    r = await db.discount_codes.update_one(
+        {'id': coupon['id'], 'used': {'$ne': True}},
+        {'$set': {'used': True, 'active': False, 'used_order': order_number}})
+    return bool(r.matched_count)
+
+
+async def _devolver_cupon(coupon):
+    """Revive un cupón que se quemó para un pedido que no llegó a existir."""
+    if coupon and coupon.get('single_use', True):
+        await db.discount_codes.update_one(
+            {'id': coupon['id']},
+            {'$set': {'used': False, 'active': True}, '$unset': {'used_order': ''}})
+
+
 def _piezas_a_devolver(order):
     """Cuántas piezas devolverle al inventario por producto, al cancelar o borrar.
 
@@ -2918,20 +2949,31 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         raise HTTPException(
             status_code=409,
             detail='Tus puntos cambiaron mientras comprabas. Vuelve a intentarlo.')
+    # ⛔ Y EL CUPÓN SE QUEMA AQUÍ MISMO, por lo mismo que las piezas y los puntos: se
+    # miraba al principio del checkout y se marcaba usado hasta el final, así que dos
+    # pedidos a la vez usaban el MISMO cupón de un solo uso (ver `_apartar_cupon`).
+    if not await _apartar_cupon(coupon, order.order_number):
+        await _devolver_reserva(reservado)
+        await _devolver_reserva_viva(reservado_vivo)
+        await _devolver_puntos(user['id'] if user else None, points_used)
+        raise HTTPException(
+            status_code=409,
+            detail='Ese cupón acaba de usarse en otra compra. Vuelve a intentarlo.')
     try:
         await db.orders.insert_one(order.model_dump())
     except Exception:
         await _devolver_reserva(reservado)      # sin pedido no hay nada que apartar
         await _devolver_reserva_viva(reservado_vivo)
         await _devolver_puntos(user['id'] if user else None, points_used)
+        await _devolver_cupon(coupon)
         raise
     # Ese carrito SI se cerro: su intento deja de estar pendiente y la IA ya no le escribe.
     asyncio.create_task(_cerrar_intentos(payload.customer.email))
     # Con sesion iniciada, estos datos quedan como los suyos para la proxima compra.
     await _recordar_datos_de_compra(user, payload.customer)
-    if coupon and coupon.get('single_use', True):
-        await db.discount_codes.update_one({'id': coupon['id']},
-                                           {'$set': {'used': True, 'active': False, 'used_order': order.order_number}})
+    # El cupón YA se quemó arriba, apartado en un solo paso condicionado
+    # (`_apartar_cupon`). Aquí se marcaba con un `$set` a secas y SIN condición: ése era
+    # el canje que dos pedidos simultáneos podían hacer dos veces con el mismo cupón.
     # LA CAMPANITA: el admin y quien ganó comisión se enteran DENTRO de la app, no
     # sólo por correo (Christián, 2026-07-30).
     await avisar_de_la_venta(order.model_dump(), commissions)
