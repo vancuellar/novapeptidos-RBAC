@@ -4,11 +4,15 @@ Aquí vive la ARITMÉTICA del envío, sin red y sin base de datos, para que se p
 probar de verdad. Hablar con Skydropx es cosa de `skydropx.py`; decidir cuánto se
 le cobra al cliente es cosa de este archivo.
 
-⛔ HOY ESTO NO COBRA NADA. Los dos interruptores de abajo nacen APAGADOS a
-propósito (Christian, 2026-07-28). Con ellos apagados el checkout se comporta
-EXACTAMENTE como antes de que existiera este archivo: no se cotiza, no se cobra
-envío y no se compra guía. El día que Christian decida encenderlo, se prenden
-aquí y nada más.
+✅ ESTO SÍ COBRA. Los dos interruptores de abajo están PRENDIDOS desde el
+2026-08-01: el checkout cotiza con Skydropx y le cobra el envío al cliente, y al
+confirmarse el pago el servidor compra la guía solo.
+
+⛔ `COTIZAR_EN_CHECKOUT` no se apaga — la razón, con nombre y fecha, está en el
+comentario que acompaña al interruptor. En corto: estuvo apagado desde el 28-jul
+mientras el de comprar la guía sí estaba prendido, así que la casa pagó el envío
+de cada pedido sin cobrarlo. Este encabezado decía «hoy esto no cobra nada» y
+llevaba días siendo falso; se corrigió el 2026-08-01.
 """
 
 # --------------------------------------------------------------------- switches

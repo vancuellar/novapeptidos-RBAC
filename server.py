@@ -83,6 +83,8 @@ import acuerdo
 # cuando la regla vivía dentro de este archivo.
 from cobrado import (ESTADOS_PAGADOS, esta_pagado, esta_vivo, cobrado_de,
                      por_cobrar_de, solo_cobrados)
+# Marcar y barrer los pedidos que dejan las pruebas, sin tocar una venta real.
+import pruebas
 import auth_factors
 import btcpay
 import mercadopago
@@ -1514,10 +1516,29 @@ def shipping_for(merchandise_paid, costo_real=None):
 # ==========================================================================
 #  ENVÍO POR SKYDROPX — cotizar en el checkout y comprar la guía al pagarse
 # ==========================================================================
-# ⛔ TODO ESTO NACE APAGADO (`envios.COTIZAR_EN_CHECKOUT` y
-# `envios.COMPRAR_GUIA_AL_PAGAR`, los dos en False). Con ellos apagados el sitio se
-# comporta EXACTAMENTE como antes: el checkout no cotiza, no cobra envío y nadie
-# compra guías. Christian los prende cuando decida.
+# ✅ LOS DOS INTERRUPTORES ESTÁN PRENDIDOS desde el 2026-08-01
+# (`envios.COTIZAR_EN_CHECKOUT` y `envios.COMPRAR_GUIA_AL_PAGAR`, los dos en True).
+# El checkout cotiza con Skydropx, le cobra el envío al cliente, y cuando entra el
+# pago el servidor compra la guía solo, con el tope de `TOPE_GUIA_AUTOMATICA_MXN`.
+#
+# ⛔ `COTIZAR_EN_CHECKOUT` NO SE APAGA. Christián lo ordenó así: «Yo jamás lo apagué.
+# Préndelo y SIEMPRE debe estar prendido.» Este comentario decía justo lo contrario
+# —que ambos nacían apagados— y era mentira desde ese día; se corrigió el 2026-08-01.
+#
+# Y lo que costó la mentira, para que no se repita: `COTIZAR_EN_CHECKOUT` nació
+# apagado el 28-jul como precaución mientras se estrenaba Skydropx y ahí se quedó,
+# pero `COMPRAR_GUIA_AL_PAGAR` sí quedó prendido. O sea que durante esos días la casa
+# **compró la guía de cada pedido y no se la cobró a nadie**: entre $165 y $250
+# regalados por venta, invisibles porque el checkout se veía normal.
+#
+# Apagar el interruptor NO es la forma de reaccionar a una caída de la paquetería.
+# `envio_se_cotiza()` exige DOS cosas —el interruptor y que exista la llave de
+# Skydropx—, así que sin llave, o si la paquetería no contesta, el sitio se degrada
+# solo: cae a la tarifa plana de $250 y sigue vendiendo. Apagarlo es otra cosa, es
+# decidir NO COBRAR, y eso sólo lo decide Christián.
+#
+# Lo fija `test_core.test_el_cobro_del_pedido_respeta_el_interruptor`, que exige los
+# dos en True: si alguien los apaga, la suite se pone roja.
 COLECCION_COTIZACIONES = 'shipping_quotes'
 
 
@@ -4533,6 +4554,91 @@ async def admin_orders_lote(payload: LoteDePedidos, admin=Depends(get_current_ad
 
     return {'accion': payload.accion, 'hechos': len(hechos), 'numeros': hechos,
             'protegidos': protegidos, 'no_encontrados': faltantes}
+
+
+# ----------------- Los pedidos que dejan las pruebas -----------------
+# ⛔ QUIEN PRUEBA COMPRANDO EN PRODUCCIÓN, LIMPIA LO QUE ENSUCIÓ (Christián, 2026-08-01).
+# La regla completa está en CLAUDE.md; la mecánica y el porqué, en `pruebas.py`.
+class MarcaDePrueba(BaseModel):
+    es_prueba: bool
+
+
+@api_router.put('/admin/orders/{order_id}/prueba')
+async def admin_marcar_prueba(order_id: str, payload: MarcaDePrueba,
+                              admin=Depends(get_current_admin)):
+    """Pone (o quita) la etiqueta de PEDIDO DE PRUEBA.
+
+    Es SÓLO una etiqueta: no borra nada, no esconde nada y se quita igual de fácil.
+    Existe para que el barrido sepa qué es basura de una prueba y qué no: lo que nadie
+    marcó, el barrido ni lo mira.
+    """
+    deny_view_as(admin)                      # 'ver como' es de sólo lectura
+    order = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    await db.orders.update_one({'id': order_id},
+                               {'$set': {'es_prueba': bool(payload.es_prueba)}})
+    logger.info('Admin %s marcó el pedido %s como %s', admin.get('email'),
+                order.get('order_number'),
+                'DE PRUEBA' if payload.es_prueba else 'NO de prueba')
+    # Se contesta de una vez si el barrido podrá llevárselo. Marcar una venta real no
+    # está prohibido —a veces uno se equivoca de renglón— pero el Panel tiene que poder
+    # decirlo en el momento y no cuando ya se apretó "barrer".
+    motivos = pruebas.senales_de_venta_real(order)
+    return {'order_number': order.get('order_number'), 'es_prueba': bool(payload.es_prueba),
+            'se_puede_barrer': bool(payload.es_prueba) and not motivos, 'motivos': motivos}
+
+
+class BarridoDePruebas(BaseModel):
+    simulacro: bool = True
+
+
+@api_router.post('/admin/orders/barrer-pruebas')
+async def admin_barrer_pruebas(payload: BarridoDePruebas, admin=Depends(get_current_admin)):
+    """BARRE los pedidos marcados como prueba. No puede llevarse una venta de verdad.
+
+    Tres candados, en este orden:
+
+      1. Sólo mira los pedidos con la etiqueta `es_prueba`. Lo que nadie marcó no
+         existe para el barrido — no hay "borrar todos los pendientes".
+      2. De ésos aparta cualquiera con una señal de venta real
+         (`pruebas.senales_de_venta_real`): pagado, surtido, con comprobante o con guía.
+         Ante la duda, no se borra: se devuelve en `protegidos` con el motivo.
+      3. El borrado NO se escribe aquí. Se le pasa al lote de siempre con
+         `forzar=False`, que es donde vive el candado de los pedidos pagados y donde se
+         devuelven puntos e inventario. Un camino de borrado propio sería un candado
+         menos y otra copia de la aritmética.
+
+    Por omisión es SIMULACRO: contesta qué haría y no toca nada. Borra de verdad sólo
+    con `simulacro: false`.
+    """
+    deny_view_as(admin)
+    marcados = await db.orders.find({'es_prueba': True}, {'_id': 0}).to_list(500)
+    barrer, protegidos = [], []
+    for o in marcados:
+        motivos = pruebas.senales_de_venta_real(o)
+        if motivos:
+            protegidos.append({'order_number': o.get('order_number'),
+                               'status': o.get('status'),
+                               'cliente': (o.get('customer') or {}).get('full_name', ''),
+                               'total': o.get('total', 0),
+                               'motivos': motivos})
+        else:
+            barrer.append(o)
+
+    if payload.simulacro or not barrer:
+        return {'simulacro': bool(payload.simulacro), 'marcados': len(marcados),
+                'borrados': 0, 'numeros': [o.get('order_number') for o in barrer],
+                'protegidos': protegidos}
+
+    lote = await admin_orders_lote(
+        LoteDePedidos(ids=[o['id'] for o in barrer], accion='borrar', forzar=False), admin)
+    # Si el lote frenó alguno (un pedido que cambió de estado entre el simulacro y el
+    # botón), su motivo es siempre el mismo candado: ya estaba pagado.
+    return {'simulacro': False, 'marcados': len(marcados),
+            'borrados': lote['hechos'], 'numeros': lote['numeros'],
+            'protegidos': protegidos + [{**p, 'motivos': ['pagado']}
+                                        for p in lote['protegidos']]}
 
 
 @api_router.put('/admin/orders/{order_id}/status')
