@@ -1816,8 +1816,13 @@ def test_el_cobro_del_pedido_respeta_el_interruptor():
     assert 'shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0' in src, \
         'la orden ya no calcula el envío con el interruptor: el sitio y el cobro se separan'
     import envios
-    assert envios.COTIZAR_EN_CHECKOUT is False, \
-        'la cotización de Skydropx se prendió sin que nadie lo pidiera'
+    # 2026-08-01: el candado se voltea. Antes vigilaba que la cotización NO se
+    # prendiera sola; desde que Christián la pidió («préndelo y SIEMPRE debe estar
+    # prendido»), lo que hay que vigilar es que nadie la APAGUE. Estuvo apagada
+    # desde el 28-jul con la compra de guía prendida, o sea que la casa pagó el
+    # envío de cada pedido sin cobrarlo.
+    assert envios.COTIZAR_EN_CHECKOUT is True, \
+        'la cotización de envío se apagó: la casa vuelve a regalar la guía en cada pedido'
     # ✅ LA COMPRA AUTOMÁTICA DE GUÍAS SÍ SE PRENDIÓ, y la pidió Christián el
     # 2026-07-31. Este candado ya no vigila que esté apagada —vigila que no esté
     # SUELTA. Gastar dinero solo sin frenos es peor que no gastarlo: por eso lo que se

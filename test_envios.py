@@ -672,15 +672,29 @@ def test_si_la_paqueteria_no_contesta_no_se_inventa_un_cargo(db, con_llave, monk
     assert cobrado == 0 and guardado == {}
 
 
-def test_apagado_el_envio_se_comporta_EXACTAMENTE_como_hoy(db):
-    """Sin COTIZAR en el checkout: cero cargo por cotización y nada guardado.
+def test_la_cotizacion_en_el_checkout_va_SIEMPRE_prendida():
+    """⛔ `COTIZAR_EN_CHECKOUT` no se apaga.
 
-    ⚠️ La compra automática de la guía SÍ está prendida desde el 2026-07-31 (orden de
-    Christián) y es otro interruptor: cotizarle al cliente en el checkout y comprar la
-    guía cuando entra el dinero son dos decisiones distintas. Este caso vigila la
-    primera, que sigue apagada.
+    Orden de Christián del 2026-08-01: «Yo jamás lo apagué. Préndelo y SIEMPRE debe
+    estar prendido.» Nació apagado el 28-jul como precaución y se quedó así. El costo
+    de ese olvido fue real: `COMPRAR_GUIA_AL_PAGAR` sí estaba prendido, así que la
+    casa compraba la guía de cada pedido y no se la cobraba a nadie.
+
+    Si Skydropx se cae no hace falta apagar nada: el módulo se degrada solo (ver el
+    caso de abajo, sin credenciales). Apagar el interruptor es decidir NO COBRAR, y
+    eso sólo lo decide él.
     """
-    assert envios.COTIZAR_EN_CHECKOUT is False      # ⛔ nace apagado
+    assert envios.COTIZAR_EN_CHECKOUT is True
+
+
+def test_apagado_el_envio_se_comporta_EXACTAMENTE_como_antes(db, monkeypatch):
+    """Y si algún día se apaga, el checkout no se rompe: cae a la tarifa plana.
+
+    El interruptor va prendido en la vida real (caso de arriba); aquí se apaga a
+    propósito para comprobar que la degradación sigue siendo limpia — cero cargo por
+    cotización y nada guardado.
+    """
+    monkeypatch.setattr(envios, 'COTIZAR_EN_CHECKOUT', False)
     assert server.envio_se_cotiza() is False
     # Sin cotización viva se cae a la tarifa plana de $250, que es la política nueva.
     cobrado, guardado = asyncio.run(server._envio_del_pedido(_pedido(), 1000, PFLAGS))

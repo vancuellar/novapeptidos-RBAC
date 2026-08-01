@@ -12,8 +12,6 @@ aquí y nada más.
 """
 
 # --------------------------------------------------------------------- switches
-# ⛔ APAGADOS. No los prendas sin que Christian lo pida.
-#
 # `COTIZAR_EN_CHECKOUT`: el checkout pide precios reales de Estafeta por CP y peso,
 # los enseña, y el envío elegido se suma al total del pedido.
 #
@@ -23,7 +21,24 @@ aquí y nada más.
 # Son DOS y no uno porque son dos decisiones distintas: se puede querer comprar la
 # guía automáticamente sin cobrarle el envío al cliente (la casa lo absorbe), pero
 # no al revés — cobrar un envío que nadie compra es cobrar por nada.
-COTIZAR_EN_CHECKOUT = False
+#
+# ⛔ `COTIZAR_EN_CHECKOUT` VA SIEMPRE PRENDIDO. NO SE APAGA.
+#
+# Orden de Christián del 2026-08-01, con estas palabras: «Yo jamás lo apagué.
+# Préndelo y SIEMPRE debe estar prendido.»
+#
+# Nació apagado el 2026-07-28 (commit 3b28b35) como precaución mientras se
+# estrenaba la integración con Skydropx, y ahí se quedó olvidado. El costo de ese
+# olvido: durante esos días **la casa absorbió el envío de cada pedido** — se
+# compraba la guía (`COMPRAR_GUIA_AL_PAGAR` sí estaba prendido) pero al cliente no
+# se le cobraba un peso. Con guías de $165 a $250, eso es margen regalado en cada
+# venta, y no se veía por ningún lado porque el checkout se comportaba «normal».
+#
+# Si alguna vez hay que apagarlo —una caída de Skydropx, por ejemplo— NO hace falta
+# tocar esto: sin llave o sin respuesta de la paquetería el módulo ya se degrada
+# solo y el checkout sigue vendiendo (ver `skydropx.py` y `envio_se_cotiza()`).
+# Apagar el interruptor es otra cosa: es decidir no cobrar. Y eso lo decide él.
+COTIZAR_EN_CHECKOUT = True
 COMPRAR_GUIA_AL_PAGAR = True
 
 

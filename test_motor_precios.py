@@ -532,9 +532,12 @@ def test_el_envio_se_cobra_parejo_y_nunca_se_resta():
     assert 'COBRAR_ENVIO = True' in src, 'cambió la política de envío sin decirlo'
     assert 'shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0' in src
     assert 'total = paid_merchandise + shipping' in src, 'el envío tiene que SUMAR'
-    # Skydropx no cambia la política: nace apagado y el envío sigue sin cobrarse.
+    # La cotización en vivo va PRENDIDA desde el 2026-08-01 (orden de Christián).
+    # Convive con la tarifa plana: si Skydropx no contesta, se cae a los $250. Lo
+    # que este candado vigila es que nadie la apague — apagada, la casa compra la
+    # guía y no se la cobra a nadie.
     import envios
-    assert envios.COTIZAR_EN_CHECKOUT is False, 'la cotización en vivo sigue apagada'
+    assert envios.COTIZAR_EN_CHECKOUT is True, 'la cotización en vivo se apagó'
     assert '- 250' not in src and '-250' not in src.replace('-2500', ''), \
         'apareció una resta de 250: el envío no es un descuento'
 
