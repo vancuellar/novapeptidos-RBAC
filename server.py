@@ -31,7 +31,7 @@ from models import (
     ProtocolInput, ProtocolUpdate, PerfilSalud, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput, AceptarAcuerdoInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
-    QuoteEmailRequest,
+    QuoteEmailRequest, ShareCartRequest,
 )
 from auth import (
     hash_password, verify_password, create_token, create_view_as_token, deny_view_as,
@@ -68,6 +68,10 @@ import pyramid
 # LA REGLA DE 5 (consumo propio de distribuidores) y el cierre de la puerta
 # anónima. Módulo puro para poder probarlo de verdad; ver descuentos.py.
 import descuentos
+# ⛔ OBSEQUIOS DEL DISTRIBUIDOR Y CARRITO COMPARTIBLE (Christián, 2026-08-01). El
+# regalo se APILA con el código de descuento, su código interno NUNCA se le enseña
+# al cliente, y no puede romper el ROI. Módulo puro; ver regalos.py.
+import regalos
 # Los TEXTOS de la campanita cuando entra una venta (en los tres idiomas).
 import avisos_de_venta
 # ⛔ ACUERDO DE DISTRIBUIDOR — aceptación electrónica. NACE APAGADO: mientras
@@ -3420,6 +3424,51 @@ async def _es_primera_compra(email: str) -> bool:
     return previo is None
 
 
+async def _obsequios_del_pedido(payload):
+    """Las CORTESÍAS que trae el carrito compartido de este pedido, si trae alguna.
+
+    Devuelve `(documento, renglones_de_cortesía, envío_de_cortesía)`.
+
+    ⛔ De la petición sólo se lee el TOKEN. Qué se regala, cuánto vale y si cabe se
+    resuelve aquí contra el catálogo real y, más abajo, contra el ROI de ESTE pedido
+    (no el del carrito que se compartió: el cliente pudo haberle quitado renglones
+    entre que lo abrió y que pagó, y ahí el mismo regalo ya no cabe).
+
+    Y de paso pega la ATRIBUCIÓN: si el cliente no escribió ningún código, la venta
+    se le acredita a quien le mandó el enlace. Si escribió uno, manda el suyo — un
+    enlace no le quita a nadie el código que el cliente tecleó a propósito.
+    """
+    token = (getattr(payload, 'shared_cart_token', '') or '').strip()
+    if not token:
+        return None, [], False
+    doc = await db[COLECCION_CARRITOS].find_one({'token': token}, {'_id': 0})
+    if not doc:
+        logger.info('Carrito compartido no encontrado (%s): el pedido sigue sin cortesías.', token[:8])
+        return None, [], False
+    if doc.get('expires_at') and doc['expires_at'] < now_iso():
+        logger.info('Carrito compartido vencido (%s): el pedido sigue sin cortesías.', token[:8])
+        return None, [], False
+    if not (payload.distributor_code or '').strip() and doc.get('ref'):
+        payload.distributor_code = doc['ref']
+
+    obsequios = doc.get('gifts') or []
+    envio_gratis = any(g.get('tipo') == regalos.TIPO_ENVIO for g in obsequios)
+    productos = [g for g in obsequios if g.get('tipo') == regalos.TIPO_PRODUCTO and g.get('product_id')]
+    if not productos:
+        return doc, [], envio_gratis
+    catalogo = await _catalogo_de([_Renglon(g['product_id']) for g in productos])
+    renglones = []
+    for g in productos:
+        d = catalogo.get(g['product_id'])
+        if not d or d.get('hidden') or not d.get('price'):
+            continue
+        renglones.append(OrderItem(
+            product_id=g['product_id'], name=_nombre_cotizable(d),
+            price=0.0, quantity=int(g.get('cantidad') or 1),
+            presentation=d.get('presentation') or ''))
+    return doc, renglones, envio_gratis
+
+
 @api_router.post('/orders')
 async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     deny_view_as(user)          # en modo "ver como" no se compra nada
@@ -3445,7 +3494,23 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # Resolvemos cada renglon contra el catalogo real. Aceptamos id o SKU: el
     # carrito viejo mandaba ids inventados ("slug::5 mg") que no existian, y eso
     # hacia que el producto se saltara su tope de comision (Christian 2026-07-25).
+    # ⛔ EL CARRITO COMPARTIDO (Christián, 2026-08-01). Si el cliente llegó por el
+    # enlace que le mandó su distribuidora, el token trae consigo DOS cosas que el
+    # navegador no puede fabricar: la atribución de la venta y las cortesías.
+    #
+    # Del token no se cree ni un peso: se abre el documento guardado y se vuelven a
+    # resolver los obsequios contra el catálogo de HOY. Un token inventado no
+    # encuentra nada y la compra sigue como cualquier otra.
+    _carrito_doc, _regalo_items, _envio_de_cortesia = await _obsequios_del_pedido(payload)
+    if _regalo_items:
+        payload.items.extend(_regalo_items)
+
     _pflags = await _catalogo_de(payload.items)
+    # Los renglones de CORTESÍA nacen sin precio: se los pone el catálogo AQUÍ, antes
+    # de la comparación de abajo, para no anotar en la bitácora una discrepancia que
+    # no existe (esos renglones el navegador jamás los mandó).
+    for _r in _regalo_items:
+        _r.price = float((_pflags.get(_r.product_id) or {}).get('price') or 0)
 
     # ⛔ EL PRECIO LO PONE EL SERVIDOR, NUNCA EL NAVEGADOR.
     # Hasta el 2026-07-27 el subtotal se calculaba con `item.price` tal como venía en la
@@ -3477,7 +3542,20 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         d = _pflags.get(item.product_id, {})
         return max(0.0, min(0.50, float(d.get('commission_cap', 0.50) or 0.50)))
 
+    # ⛔ LOS RENGLONES DE CORTESÍA NO ENTRAN A LA ARITMÉTICA DEL DESCUENTO.
+    # Se identifican por OBJETO, no por `product_id`: si el cliente compró agua y
+    # además se le obsequió agua, son dos renglones del mismo producto y sólo uno es
+    # el regalo — comparando ids se le quitaría el descuento al que sí se está pagando.
+    _cortesias = {id(r) for r in _regalo_items}
+
+    def _es_cortesia(item):
+        return id(item) in _cortesias
+
     def _eligible(item):
+        if _es_cortesia(item):
+            # Un regalo ya está al 100% de descuento: no se le descuenta encima ni
+            # paga comisión. Su costo se mide aparte, contra el piso de rentabilidad.
+            return False
         d = _pflags.get(item.product_id, {})
         if (d.get('category') or '') in NO_DISCOUNT_CATEGORIES:
             return False   # insumos (agua bacteriostática, viales, jeringas): nunca
@@ -3515,7 +3593,11 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     for it in payload.items:
         if it.quantity is None or it.quantity < 1:
             raise HTTPException(status_code=400, detail=f'Cantidad invalida en {it.name}')
-    pedido_por_producto = _agrupar_por_producto(payload.items, _pflags)
+    # La REGLA DE 5 cuenta piezas COMPRADAS. Una cortesía no acerca a nadie al precio
+    # de distribuidor: si contara, regalarse dos viales a uno mismo sería la forma de
+    # bajarle el precio a los otros tres.
+    pedido_por_producto = _agrupar_por_producto(
+        [it for it in payload.items if not _es_cortesia(it)], _pflags)
 
     # Ya con los precios del catálogo (ver arriba): el navegador no decide nada.
     subtotal = sum(item.price * item.quantity for item in payload.items)
@@ -3630,7 +3712,43 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     discount, discount_rate, discount_capped, discount_lines = descuentos.repartir(
         payload.items, _clave_de, lambda it: _cap_of(it) if _eligible(it) else 0.0,
         tasas_pedidas, tasa_base)
-    after_discount = subtotal - discount
+
+    # ⛔ LAS CORTESÍAS, MEDIDAS CONTRA EL ROI DE **ESTE** PEDIDO (Christián, 2026-08-01).
+    #
+    # Regalar es descontar: el vial de cortesía sale del MISMO margen que el descuento,
+    # así que se suman los dos y se miden contra el mismo tope que ya protege a la casa
+    # (`commission_cap` por producto, y el techo del 40% encima).
+    #
+    # Se revisa AQUÍ y no sólo al compartir el enlace porque el cliente pudo quitarle
+    # renglones al carrito entre que lo abrió y que pagó: el mismo regalo que cabía en
+    # un pedido de $12,000 no cabe en uno de $900. Si no cabe, se cae EL REGALO — nunca
+    # la venta (regla de la casa: vender siempre) — y queda constancia en la bitácora.
+    gift_discount = round(sum(r.price * r.quantity for r in _regalo_items))
+    _valor_cortesias = gift_discount + (COSTO_GUIA_ESTIMADO if _envio_de_cortesia else 0)
+    if _valor_cortesias > 0:
+        _permitido = regalos.piso_de_rentabilidad(
+            [it for it in payload.items if not _es_cortesia(it)],
+            lambda it: _cap_of(it) if _eligible(it) else 0.0,
+            techo=techo_de_descuento(user))
+        _veredicto = regalos.cabe_el_obsequio(discount, _valor_cortesias, _permitido)
+        if not _veredicto['cabe']:
+            logger.warning(
+                'CORTESÍA RECHAZADA AL COBRAR (carrito %s): descuento $%.0f + regalo $%.0f '
+                'sobre un permitido de $%.0f; se pasa por $%.0f. La venta sigue, el regalo no.',
+                (getattr(payload, 'shared_cart_token', '') or '')[:8], discount,
+                _valor_cortesias, _veredicto['permitido'], _veredicto['exceso'])
+            payload.items = [it for it in payload.items if not _es_cortesia(it)]
+            _regalo_items, _envio_de_cortesia, gift_discount = [], False, 0
+            _cortesias = set()
+            # El subtotal se rehace sin los renglones de cortesía. El descuento NO hace
+            # falta recalcularlo: las cortesías nunca recibieron un peso de descuento
+            # (`_eligible` las excluye), así que `discount` ya vale lo mismo sin ellas.
+            subtotal = sum(it.price * it.quantity for it in payload.items)
+
+    # El regalo se descuenta ENTERO: el cliente no paga un peso por lo que se le
+    # obsequió, pero el renglón sí existe en el pedido para que salga en la caja y
+    # baje del inventario como cualquier otra pieza que se manda.
+    after_discount = subtotal - discount - gift_discount
     # Lealtad: el canje se limita al saldo real y a la mercancia (el envio va en dinero).
     points_used = 0
     if payload.points_to_use and user and loyalty.eligible(user):
@@ -3644,6 +3762,12 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # GUARDADA (revalidada contra este CP y este peso, y recotizada si ya no vale);
     # apagado, del camino de siempre.
     shipping, shipping_quote = await _envio_del_pedido(payload, paid_merchandise, _pflags)
+    # ENVÍO DE CORTESÍA: la distribuidora lo obsequió en el carrito que compartió. El
+    # cliente no paga guía; la casa sí la sigue pagando, y eso se guarda igual en
+    # `shipping_absorbed` para que el regalo se pueda sumar después. Ya pasó el piso
+    # de rentabilidad de arriba: aquí sólo se aplica lo que allá se autorizó.
+    if _envio_de_cortesia:
+        shipping = 0
     total = paid_merchandise + shipping
     # Lo que la guia cuesta DE VERDAD. Sin cotizacion de Skydropx no es cero: es la
     # tarifa plana, que es lo que la paqueteria cobra igual. Se calculaba con
@@ -3736,6 +3860,14 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         discount_capped=discount_capped,
         discount_lines=discount_lines,
         regla_de_5=regla_de_5,
+        # Las cortesías: lo que se regaló y cuánto valía. El código del obsequio NO
+        # entra aquí — el pedido lo lee el cliente. Ver el comentario en `models.py`.
+        gift_discount=gift_discount,
+        gift_lines=[{'product_id': r.product_id, 'name': r.name,
+                     'quantity': int(r.quantity), 'list_price': float(r.price)}
+                    for r in _regalo_items],
+        gift_shipping=bool(_envio_de_cortesia),
+        shared_cart_token=(getattr(payload, 'shared_cart_token', '') or '')[:64],
         shipping=shipping,
         shipping_quote=shipping_quote,
         shipping_cost=costo_guia,
@@ -5459,6 +5591,252 @@ async def distributor_quote_email(payload: QuoteEmailRequest,
     except Exception:
         logger.exception('No se pudo avisar la cotización a %s', dist['id'])
     return {'sent': True, 'total': total, 'lines': len(lineas)}
+
+
+# ==========================================================================
+#  EL CARRITO COMPARTIBLE  —  el enlace que Mónica manda por WhatsApp
+# ==========================================================================
+# Encargo de Christián (2026-08-01): «Necesito que Mónica pueda compartir un carrito
+# con sus clientes.» Un enlace, el cliente lo abre en su teléfono sin cuenta, ve su
+# carrito ya armado con SUS precios y SUS cortesías, y la venta se le atribuye a ella.
+#
+# ⛔ EL ENLACE NO LLEVA DINERO ADENTRO. Sólo un token opaco. Todo —precios, descuento,
+# envío y el valor de las cortesías— lo calcula el SERVIDOR al abrirlo y lo vuelve a
+# calcular al cobrar. Es la misma lección que costó dinero el 2026-07-27, cuando se
+# podía comprar mandando precio $0: si el número viaja en la URL, el número se edita.
+#
+# ⛔ Y EL CÓDIGO DEL OBSEQUIO NO VIAJA. Vive en `gift_code` dentro del documento y no
+# sale por ninguna de estas rutas: la respuesta se arma con la lista blanca de
+# `regalos.vista_publica`. Ver la prueba que lee el payload entero y truena si aparece.
+COLECCION_CARRITOS = 'shared_carts'
+
+# Cuánto vive un carrito compartido. Un mes es lo que tarda una conversación de
+# WhatsApp en cerrarse; más allá de eso los precios ya no son los de esa charla y es
+# mejor que el cliente vuelva a pedirle uno nuevo a su distribuidora.
+VIGENCIA_CARRITO_DIAS = 30
+
+# Cuántos carritos puede armar un distribuidor al día. El mismo freno que las
+# cotizaciones por correo, y por lo mismo: es una ruta que ESCRIBE.
+CARRITOS_POR_DIA = 120
+_CARRITOS_ARMADOS = {}
+
+
+def _puede_armar_carrito(dist_id, ahora=None):
+    import time as _t
+    ahora = ahora if ahora is not None else _t.time()
+    marcas = [m for m in _CARRITOS_ARMADOS.get(dist_id, []) if ahora - m < 86400]
+    if len(marcas) >= CARRITOS_POR_DIA:
+        _CARRITOS_ARMADOS[dist_id] = marcas
+        return False
+    marcas.append(ahora)
+    _CARRITOS_ARMADOS[dist_id] = marcas
+    return True
+
+
+class _Renglon:
+    """Un renglón suelto con la forma que esperan `_catalogo_de`, `_armar_cotizacion`
+    y `regalos.piso_de_rentabilidad` (que leen atributos, no llaves). Existe para no
+    tener que fabricar un `OrderItem` completo —con nombre e imagen— sólo para
+    preguntarle su precio al catálogo."""
+
+    def __init__(self, product_id, quantity=1, price=0.0, name=''):
+        self.product_id = product_id
+        self.quantity = int(quantity or 1)
+        self.price = float(price or 0)
+        self.name = name
+
+
+async def _resolver_carrito(doc):
+    """Recalcula un carrito compartido CONTRA EL CATÁLOGO DE HOY. Devuelve (privado, público).
+
+    Se recalcula al ABRIRLO y otra vez al COBRAR, nunca se lee un total guardado: un
+    carrito de hace tres semanas tiene que cobrar los precios de hoy, y un token
+    manipulado no puede inventar ni un peso porque de él sólo se toman qué productos,
+    cuántos y qué se obsequió.
+
+    El diccionario PRIVADO trae lo que necesita el checkout (incluido el veredicto de
+    ROI); el PÚBLICO es el que ve el cliente, armado con lista blanca.
+    """
+    guardados = doc.get('items') or []
+    lineas_pedidas = [_Renglon(i.get('product_id'), i.get('quantity') or 1)
+                      for i in guardados]
+    catalogo = await _catalogo_de(lineas_pedidas + [
+        _Renglon(g.get('product_id')) for g in (doc.get('gifts') or []) if g.get('product_id')])
+
+    dist = await db.users.find_one({'id': doc.get('distributor_id')}, {'_id': 0}) or {}
+    tope_dist = max(pyramid.discount_tiers_de(dist) or [0]) if dist else 0.0
+    pedido_pct = max(0.0, float(doc.get('discount_asked') or 0))
+    lineas, lista_total, total_mercancia = _armar_cotizacion(
+        lineas_pedidas, pedido_pct, tope_dist, catalogo)
+
+    # ---- las cortesías, valuadas por el servidor contra el catálogo real ----
+    def _precio_de(pid):
+        d = catalogo.get(pid) or {}
+        return float(d.get('price') or 0)
+
+    costo_guia = float(COSTO_GUIA_ESTIMADO)
+    obsequios = doc.get('gifts') or []
+    valor_obsequio = regalos.valor_de_obsequios(obsequios, _precio_de, costo_guia)
+
+    # ---- ⛔ EL PISO DE RENTABILIDAD, EN EL SERVIDOR Y OTRA VEZ ----
+    # Regalar es descontar: el vial de cortesía sale del mismo margen que el
+    # descuento. Se suman y se miden contra el tope de cada producto y el techo del
+    # 40%. Si no cabe, el obsequio NO se aplica — la venta sigue en pie (nunca se
+    # bloquea una venta), pero el regalo se cae y queda constancia.
+    items_para_tope = [_Renglon(ln['product_id'], ln['quantity'],
+                                float(ln['list_price']), ln['name'])
+                       for ln in lineas]
+    permitido = regalos.piso_de_rentabilidad(
+        items_para_tope,
+        lambda it: tope_de_descuento(catalogo.get(it.product_id) or {}),
+        techo=techo_de_descuento(None))
+    veredicto = regalos.cabe_el_obsequio(lista_total - total_mercancia, valor_obsequio, permitido)
+
+    aplicados = obsequios if veredicto['cabe'] else []
+    if obsequios and not veredicto['cabe']:
+        logger.warning('OBSEQUIO RECHAZADO por ROI en el carrito %s: se regalaban $%.0f '
+                       'sobre un permitido de $%.0f (se pasa por $%.0f).',
+                       doc.get('token'), veredicto['entregado'], veredicto['permitido'],
+                       veredicto['exceso'])
+
+    # Cómo se le NOMBRA cada cortesía al cliente: su nombre y la palabra "cortesía"
+    # la pone la pantalla. Aquí sólo viaja el nombre real del producto.
+    vistos = []
+    envio_de_cortesia = False
+    for g in aplicados:
+        if g.get('tipo') == regalos.TIPO_ENVIO:
+            envio_de_cortesia = True
+            vistos.append({'tipo': regalos.TIPO_ENVIO, 'name': '', 'quantity': 1})
+        else:
+            d = catalogo.get(g.get('product_id')) or {}
+            if not d or d.get('hidden'):
+                continue
+            vistos.append({'tipo': regalos.TIPO_PRODUCTO, 'name': _nombre_cotizable(d),
+                           'quantity': int(g.get('cantidad') or 1)})
+
+    # ---- el envío, con la política de la casa y no una inventada aquí ----
+    envio = 0
+    if COBRAR_ENVIO and lineas:
+        envio = 0 if envio_de_cortesia else shipping_for(total_mercancia)
+
+    publico = regalos.vista_publica({
+        'token': doc.get('token'),
+        'folio': doc.get('folio') or '',
+        'client_name': doc.get('client_name') or '',
+        'currency': 'MXN',
+        'lines': lineas,
+        'gifts': vistos,
+        'list_total': round(lista_total),
+        'discount': round(lista_total - total_mercancia),
+        # El PORCENTAJE, que es lo que Christián pidió que se lea en vez de "ahorro".
+        'discount_rate': round((lista_total - total_mercancia) / lista_total, 4) if lista_total else 0,
+        'shipping': round(envio),
+        'shipping_free': bool(COBRAR_ENVIO and lineas and envio <= 0),
+        'total': round(total_mercancia + envio),
+        # El código del DISTRIBUIDOR sí viaja: es lo que atribuye la venta, y el
+        # cliente ya lo veía en los enlaces `?ref=` de siempre. El del OBSEQUIO no.
+        'ref': doc.get('ref') or '',
+        'expires_at': doc.get('expires_at'),
+    })
+    privado = {
+        'gifts_aplicados': aplicados,
+        'gifts_vistos': vistos,
+        'envio_de_cortesia': envio_de_cortesia,
+        'veredicto': veredicto,
+        'catalogo': catalogo,
+        'ref': doc.get('ref') or '',
+    }
+    return privado, publico
+
+
+@api_router.post('/distributor/cart/share')
+async def distributor_cart_share(payload: ShareCartRequest,
+                                 dist=Depends(get_current_distributor)):
+    """Arma el carrito compartible y devuelve SU ENLACE. Nunca el código del obsequio.
+
+    Tres candados, los tres en el servidor:
+      1. `get_current_distributor` + `deny_view_as` — un cliente no entra, y el
+         "ver como" del admin es sólo lectura.
+      2. EL PRECIO LO PONE EL SERVIDOR. Del navegador sólo viajan qué, cuántos y
+         cuánto descuento se PIDE.
+      3. EL REGALO NO ROMPE EL ROI. Si no cabe bajo el tope, se responde 409 con la
+         cuenta hecha para que el distribuidor lo vea y lo baje. Aquí sí se frena
+         —es la pantalla de quien arma— y al cobrar se vuelve a medir por si el
+         catálogo cambió entre que se compartió y que el cliente pagó.
+    """
+    deny_view_as(dist)
+    await _exigir_acuerdo(dist)
+    if not payload.items:
+        raise HTTPException(status_code=400, detail='El carrito no tiene renglones')
+    if len(payload.items) > 40:
+        raise HTTPException(status_code=400, detail='Demasiados renglones en el carrito')
+    if not _puede_armar_carrito(dist['id']):
+        raise HTTPException(status_code=429, detail='Demasiados carritos seguidos. Espera un momento.')
+
+    catalogo = await _catalogo_de(
+        list(payload.items) + [_Renglon(g.product_id) for g in payload.gifts if g.product_id])
+    limpios = regalos.limpiar_obsequios(
+        [g.model_dump() for g in payload.gifts],
+        lambda pid: bool(catalogo.get(pid)) and not (catalogo.get(pid) or {}).get('hidden'))
+
+    ahora = now_iso()
+    vence = (datetime.now(timezone.utc) + timedelta(days=VIGENCIA_CARRITO_DIAS)).isoformat()
+    doc = {
+        'token': regalos.nuevo_token_de_carrito(),
+        # ⛔ EL CÓDIGO INTERNO DEL OBSEQUIO. Se guarda para poder auditar de dónde
+        # salió cada cortesía, y NO SALE de este archivo hacia ningún cliente: ni en
+        # la respuesta de aquí, ni en la de `/carrito/{token}`, ni en el PDF.
+        'gift_code': regalos.nuevo_codigo_de_obsequio(),
+        'distributor_id': dist['id'],
+        'ref': (dist.get('distributor_code') or '').strip(),
+        'folio': (payload.folio or '').strip()[:32],
+        'client_name': (payload.client_name or '').strip()[:80],
+        'language': (payload.language or dist.get('language') or 'es')[:5],
+        'discount_asked': max(0.0, float(payload.discount or 0)),
+        'items': [{'product_id': i.product_id, 'quantity': int(i.quantity)}
+                  for i in payload.items],
+        'gifts': limpios,
+        'created_at': ahora,
+        'expires_at': vence,
+    }
+    privado, publico = await _resolver_carrito(doc)
+    if not publico['lines']:
+        raise HTTPException(status_code=400, detail='Ninguno de esos productos se puede cotizar')
+    if limpios and not privado['veredicto']['cabe']:
+        # El único "no" de todo esto, y es del lado del distribuidor (no del cliente):
+        # el regalo se pasa del margen que este pedido aguanta.
+        raise HTTPException(status_code=409, detail={
+            'error': 'regalo_sin_margen',
+            'entregado': privado['veredicto']['entregado'],
+            'permitido': privado['veredicto']['permitido'],
+            'exceso': privado['veredicto']['exceso'],
+        })
+    await db[COLECCION_CARRITOS].insert_one(dict(doc))
+    site = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+    return {
+        'token': doc['token'],
+        'url': f"{site}/carrito/{doc['token']}",
+        **publico,
+    }
+
+
+@api_router.get('/carrito/{token}')
+async def abrir_carrito_compartido(token: str):
+    """EL CARRITO QUE ABRE EL CLIENTE. Sin sesión, desde su teléfono.
+
+    ⛔ Ruta PÚBLICA a propósito: el cliente de Mónica no tiene cuenta y no se le va a
+    pedir una para ver lo que ella le mandó. Lo que sale de aquí es lo mismo que ya
+    puede ver cualquiera en el catálogo —productos y precios— más el descuento que su
+    distribuidora le dio. Ni un costo, ni un proveedor, ni un margen, ni el código del
+    obsequio.
+    """
+    doc = await db[COLECCION_CARRITOS].find_one({'token': (token or '').strip()}, {'_id': 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail='Ese carrito ya no existe')
+    if doc.get('expires_at') and doc['expires_at'] < now_iso():
+        raise HTTPException(status_code=410, detail='Ese carrito ya venció. Pídele uno nuevo a quien te lo mandó.')
+    _privado, publico = await _resolver_carrito(doc)
+    return publico
 
 
 @api_router.post('/distributor/codes/rotate')

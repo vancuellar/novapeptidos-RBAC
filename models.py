@@ -255,6 +255,11 @@ class OrderCreate(BaseModel):
     # servidor va por el precio a la cotización que ÉL guardó. Ver `shipping_quotes`
     # en server.py. Lo que el navegador mande en `shipping` se sigue ignorando.
     shipping_quote_id: Optional[str] = None
+    # EL CARRITO COMPARTIDO que le mandó su distribuidora por WhatsApp. Viaja el
+    # TOKEN, nunca el regalo ni su valor: el servidor abre el documento, revalida el
+    # obsequio contra el ROI de ESTE pedido y sólo entonces lo aplica. Un token
+    # inventado no encuentra documento y la compra sigue como una compra normal.
+    shared_cart_token: Optional[str] = None
     attribution: Optional[Attribution] = None
     # Cuándo aceptó el comprador el aviso 18+/RUO en la puerta del sitio (ISO).
     # Antes se le volvía a pedir lo MISMO con una casilla en el checkout, y sin
@@ -307,6 +312,19 @@ class Order(BaseModel):
     # y por eso pagaron precio de cliente. Es el empujón del carrito: «llevas 3 de 5».
     # [{product_id, name, quantity, faltan, minimo}]
     regla_de_5: List[dict] = []
+    # ⛔ LAS CORTESÍAS DEL DISTRIBUIDOR (Christián, 2026-08-01). Lo que se obsequió en
+    # este pedido, en pesos y renglón por renglón. Es dinero regalado y por eso se
+    # guarda: sin este número, «Mónica regala agua» no aparece en ningún reporte.
+    #
+    # ⛔ AQUÍ NO SE GUARDA EL CÓDIGO DEL OBSEQUIO, A PROPÓSITO. El pedido se le enseña
+    # al cliente (ficha de pedido, correo de confirmación, panel de su cuenta), así
+    # que cualquier cosa escrita aquí es cosa que él puede leer. El rastro para
+    # auditar va por `shared_cart_token`, que sí es suyo y ya conoce: de ahí sale el
+    # `gift_code` en `shared_carts`, que nunca cruza la puerta.
+    gift_discount: float = 0
+    gift_lines: List[dict] = []         # [{product_id, name, quantity, list_price}]
+    gift_shipping: bool = False         # la guía fue de cortesía
+    shared_cart_token: str = ''
     shipping: float
     total: float
     status: str = 'pendiente'   # pendiente | confirmado | enviado | entregado | cancelado
@@ -577,6 +595,35 @@ class QuoteEmailRequest(BaseModel):
     language: Optional[str] = None
     folio: Optional[str] = ''
     items: List[QuoteLine] = Field(default_factory=list)
+
+
+class GiftLine(BaseModel):
+    """UN obsequio del distribuidor. `tipo` es 'producto' o 'envio'.
+
+    ⛔ AQUÍ NO HAY PRECIO NI CÓDIGO, y es a propósito. El valor del regalo lo pone
+    el SERVIDOR contra el catálogo real —igual que el precio de un renglón— y el
+    código interno lo GENERA el servidor: si el navegador pudiera mandarlo, el
+    código dejaría de ser secreto en el momento en que alguien abriera la consola.
+    """
+    tipo: str = 'producto'          # ver regalos.TIPOS — 'producto' | 'envio'
+    product_id: Optional[str] = ''
+    cantidad: int = Field(1, ge=1, le=5)
+
+
+class ShareCartRequest(BaseModel):
+    """EL CARRITO COMPARTIBLE que el distribuidor manda por WhatsApp.
+
+    Mismo principio que la cotización por correo: del navegador sólo viajan QUÉ
+    productos, CUÁNTOS, cuánto descuento se PIDE y qué se quiere obsequiar. Los
+    precios, el descuento real de cada renglón, el envío y el valor del regalo los
+    calcula el servidor y los vuelve a calcular al cobrar.
+    """
+    client_name: Optional[str] = ''
+    discount: float = Field(0, ge=0, le=1)
+    language: Optional[str] = None
+    folio: Optional[str] = ''
+    items: List[QuoteLine] = Field(default_factory=list)
+    gifts: List[GiftLine] = Field(default_factory=list)
 
 
 # ---------- Distributors ----------
