@@ -27,7 +27,7 @@ from models import (
     OrderCreate, Order, OrderItem, CustomerInfo, OrderStatusUpdate, OrderShippingUpdate,
     DistributorShippingUpdate,
     ShippingQuoteRequest, TrackEvent, RemitenteUpdate, CajasUpdate, EmpaquesUpdate,
-    ComprarGuiaRequest,
+    ComprarGuiaRequest, CotizadorEnvioRequest,
     ProtocolInput, ProtocolUpdate, PerfilSalud, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput, AceptarAcuerdoInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
@@ -2013,6 +2013,304 @@ async def admin_cotizar_envio(order_id: str, admin=Depends(get_current_admin)):
                                         and skydropx.dentro_del_plazo(o['dias'])}
                     for o in doc['opciones']],
     }
+
+
+# ==========================================================================
+#  COTIZADOR DE ENVÍOS — preguntar sin tener que armar un pedido
+# ==========================================================================
+# ⛔ POR QUÉ EXISTE (Christián, 2026-08-01). Hasta hoy el envío sólo se podía
+# cotizar de dos maneras, y las dos exigían un pedido: el checkout (con un carrito)
+# o la ficha de un pedido ya hecho. Pero la pregunta que se hace todos los días —
+# «¿cuánto cuesta mandar esto a tal código postal?»— llega ANTES de que exista el
+# pedido, cuando un cliente pregunta por WhatsApp. Sin esta pantalla la respuesta
+# era inventar un carrito de mentira o adivinar.
+#
+# ⛔ DOS PANTALLAS, UNA SOLA CUENTA. El admin y el distribuidor preguntan lo mismo y
+# el servidor cotiza igual; lo que cambia es lo que se DEVUELVE:
+#   · el admin ve además lo que la casa absorbe, si se pasa del tope y qué proveedor
+#     ganó — él sí ve costos;
+#   · el distribuidor ve la tarifa, el plazo y lo que se le cobraría al cliente. Y
+#     NADA MÁS. Su respuesta se arma con una lista blanca de llaves (`_solo_lo_del_`
+#     `distribuidor`), no quitando campos: quitar se olvida el día que se agregue
+#     uno nuevo, la lista blanca no. Hay pruebas que intentan sacarle un costo.
+#
+# ⛔ COLECCIÓN APARTE, A PROPÓSITO. Las cotizaciones de aquí NO viven en
+# `shipping_quotes` sino en `shipping_cotizador`. En modo manual el peso lo teclea
+# una persona, y si compartieran colección un id de este cotizador podría acabar
+# pagando un envío en el checkout. Separadas, eso es imposible: `_cotizacion_valida`
+# sólo lee la otra. El precio del checkout lo sigue poniendo el servidor.
+COLECCION_COTIZADOR = 'shipping_cotizador'
+
+# Cuántas consultas recientes se guardan y se enseñan. Es un historial CORTO a
+# propósito: sirve para no repetir la consulta de hace un rato, no para auditar.
+HISTORIAL_COTIZADOR = 10
+
+# Skydropx (y el segundo proveedor) sólo cubren México. No es una limitación
+# nuestra: es el alcance de las paqueterías contratadas. Decirlo de frente es mejor
+# que dejar una rueda girando hasta que la API contesta que no.
+PAISES_CON_COBERTURA = ('', 'MX', 'MEX', 'MEXICO', 'MÉXICO')
+
+
+def _hay_cobertura(pais: str) -> bool:
+    return (pais or 'MX').strip().upper() in PAISES_CON_COBERTURA
+
+
+async def _bulto_del_cotizador(payload) -> tuple:
+    """El bulto a cotizar y el importe de mercancía.
+
+    Devuelve (paquete, mercancía, piezas, renglones sin precio).
+
+    En 'items' los dos números salen del CATÁLOGO —el mismo que usa el checkout— y
+    lo que venga del navegador sobre peso o precio no se mira. En 'manual' el peso es
+    el que se capturó, y por eso ese camino no puede cobrar nada (ver `models`).
+
+    ⛔ EL CUARTO NÚMERO NO ES ADORNO. Si un renglón no aparece en el catálogo del
+    servidor, su precio NO se toma del navegador —eso es justo lo que no se hace
+    aquí— así que suma cero y el importe de compra queda corto. Corto quiere decir
+    que la pantalla diría «el cliente paga los $250 de tarifa plana» cuando el pedido
+    de verdad quizá pasaba de la mínima. Callarlo es enseñar un número equivocado con
+    cara de bueno; por eso se cuenta y se dice.
+    """
+    if (payload.mode or 'items').strip().lower() == 'manual':
+        paquete = envios.paquete_manual(payload.peso_kg, payload.largo_cm,
+                                        payload.ancho_cm, payload.alto_cm)
+        try:
+            mercancia = max(0.0, float(payload.merchandise_mxn or 0))
+        except (TypeError, ValueError):
+            mercancia = 0.0
+        return paquete, round(mercancia, 2), 0, 0
+    pflags = await _catalogo_de(payload.items)
+    paquete = envios.paquete_del_pedido(payload.items, pflags)
+    mercancia, sin_precio = 0.0, 0
+    for it in payload.items or []:
+        doc = pflags.get(it.product_id) or {}
+        try:
+            precio = float(doc.get('price') or 0)
+            mercancia += precio * max(0, int(it.quantity or 0))
+        except (TypeError, ValueError):
+            precio = 0.0
+        if precio <= 0:
+            sin_precio += 1
+    return (paquete, round(mercancia, 2), envios.piezas_del_pedido(payload.items),
+            sin_precio)
+
+
+def _solo_lo_del_distribuidor(resp: dict) -> dict:
+    """La MISMA respuesta, recortada a lo que el distribuidor puede ver.
+
+    ⛔ LISTA BLANCA, NO LISTA NEGRA. Se copian las llaves permitidas a un diccionario
+    nuevo; todo lo demás se queda fuera por no estar nombrado. Si mañana alguien le
+    agrega `costo_de_compra` a la respuesta del admin, aquí no aparece solo — que es
+    exactamente lo contrario de lo que pasaría con un `pop()`.
+
+    Lo que SÍ ve: la tarifa del envío, el plazo, la paquetería y lo que se le cobraría
+    al cliente con la política de la casa (que es pública: está en el checkout).
+    Lo que NO: lo que la casa absorbe, si se pasó de su tope, con qué proveedor se
+    contrata, cuánto se ahorra por comparar y el detalle del empaque.
+    """
+    opciones = [{'carrier': o.get('carrier', ''), 'service': o.get('service', ''),
+                 'days': o.get('days', 0), 'price': o.get('price', 0),
+                 'recomendada': bool(o.get('recomendada'))}
+                for o in (resp.get('opciones') or [])]
+    cobro = resp.get('cobro') or {}
+    return {
+        'enabled': resp.get('enabled', False),
+        'cobertura': resp.get('cobertura', True),
+        'pais': resp.get('pais', 'MX'),
+        'detail': resp.get('detail', ''),
+        'peso_kg': resp.get('peso_kg', 0),
+        'quoted_at': resp.get('quoted_at', ''),
+        'opciones': opciones,
+        'cobro': {
+            'mercancia': cobro.get('mercancia', 0),
+            'cliente_paga': cobro.get('cliente_paga', 0),
+            'gratis': cobro.get('gratis', False),
+            'envio_gratis_desde': cobro.get('envio_gratis_desde', 0),
+            'tarifa_plana': cobro.get('tarifa_plana', 0),
+            'falta_para_gratis': cobro.get('falta_para_gratis', 0),
+            'productos_sin_precio': cobro.get('productos_sin_precio', 0),
+        },
+    }
+
+
+async def _cotizar_para_el_cotizador(payload, quien: dict, es_admin: bool) -> dict:
+    """El cotizador completo, con TODO lo que ve el admin. El recorte va aparte.
+
+    Se degrada con elegancia igual que el checkout: sin credenciales, fuera de México
+    o sin tarifas, responde una frase que se puede leer en pantalla en vez de dejar
+    la rueda girando.
+    """
+    pais = (payload.country or 'MX').strip().upper() or 'MX'
+    if not _hay_cobertura(pais):
+        # ⛔ Se contesta ANTES de llamar a nadie: las paqueterías contratadas no salen
+        # de México y preguntarles por Madrid es esperar un "no" caro.
+        return {'enabled': True, 'cobertura': False, 'pais': pais, 'opciones': [],
+                'detail': 'Fuera de México no hay cobertura: las paqueterías '
+                          'contratadas (Skydropx) sólo cubren la República Mexicana. '
+                          'Un envío internacional se cotiza aparte, a mano.'}
+    cp = (payload.postal_code or '').strip()
+    if len(cp) < 5:
+        return {'enabled': True, 'cobertura': True, 'pais': pais, 'opciones': [],
+                'detail': 'Falta el código postal de destino (5 dígitos).'}
+    paquete, mercancia, piezas, sin_precio = await _bulto_del_cotizador(payload)
+    if not paquete.get('peso_kg'):
+        return {'enabled': True, 'cobertura': True, 'pais': pais, 'opciones': [],
+                'detail': 'Falta decir qué se manda: elige productos o captura el peso.'}
+    if not paqueterias.cuantos_activos():
+        return {'enabled': False, 'cobertura': True, 'pais': pais, 'opciones': [],
+                'proveedores': paqueterias.encendidos(),
+                'detail': 'No hay paquetería conectada: faltan SKYDROPX_CLIENT_ID y '
+                          'SKYDROPX_CLIENT_SECRET (se pegan en Admin → Cobros).'}
+    destino = {'zip': cp, 'province': payload.state or '', 'city': payload.city or '',
+               'country': 'MX'}
+    try:
+        # `filtrar` en False sólo para el admin: quien paga la guía tiene derecho a ver
+        # TODAS las tarifas aunque tarden más de lo prometido. Al distribuidor se le
+        # enseñan nada más las que de verdad se le podrían ofrecer a un cliente.
+        comp = paqueterias.cotizar_en_todos(destino, paquete,
+                                            espera_max=skydropx.ESPERA_MAX_GUIA_S,
+                                            filtrar=not es_admin)
+    except Exception:
+        logger.exception('Cotizador: no se pudo cotizar a %s', cp)
+        return {'enabled': False, 'cobertura': True, 'pais': pais, 'opciones': [],
+                'detail': 'La paquetería no respondió. Vuelve a intentar en un minuto.'}
+    if not comp['opciones']:
+        motivos = '; '.join(f"{p['nombre']}: {p['detalle']}"
+                            for p in comp['proveedores'] if p.get('detalle'))
+        return {'enabled': True, 'cobertura': True, 'pais': pais, 'opciones': [],
+                'peso_kg': paquete['peso_kg'], 'proveedores': comp['proveedores'],
+                'detail': f'Sin tarifas para el CP {cp}. {motivos}'.strip()[:300]}
+    # De más barata a más cara, y la primera gana. Se ordena AQUÍ aunque
+    # `cotizar_en_todos` ya lo haga: el orden es lo que decide qué se recomienda y qué
+    # cuesta, y no puede depender de que otro módulo se acuerde de ordenar.
+    ordenadas = sorted(comp['opciones'], key=lambda o: float(o.get('precio') or 0))
+    mejor = ordenadas[0]
+    costo = float(mejor.get('precio') or 0)
+    # ⛔ LA POLÍTICA NO SE TOCA AQUÍ, SE CONSULTA. Es la MISMA función que cobra en el
+    # checkout (`envios.cobro_de_envio_al_cliente`), con los mismos tres números de la
+    # casa. Si algún día cambia la regla, esta pantalla cambia sola.
+    cliente_paga = envios.cobro_de_envio_al_cliente(costo, mercancia, FREE_SHIPPING_FROM,
+                                                    tarifa_plana=SHIPPING_FLAT)
+    absorbe = envios.envio_que_absorbe_la_casa(costo, cliente_paga)
+    resp = {
+        'enabled': True,
+        'cobertura': True,
+        'pais': pais,
+        'detail': '',
+        'peso_kg': paquete['peso_kg'],
+        'piezas': piezas,
+        'paquete': paquete,
+        'quoted_at': now_iso(),
+        'opciones': [{'carrier': o.get('paqueteria', ''), 'service': o.get('servicio', ''),
+                      'days': o.get('dias', 0), 'price': o.get('precio', 0),
+                      'provider': o.get('proveedor', 'skydropx'),
+                      'provider_name': o.get('proveedor_nombre', 'Skydropx'),
+                      'recomendada': o is mejor,
+                      'para_el_cliente': skydropx.permitida(o.get('paqueteria_id', ''))
+                                         and skydropx.dentro_del_plazo(o.get('dias'))}
+                     for o in ordenadas],
+        'cobro': {
+            'mercancia': mercancia,
+            'cliente_paga': cliente_paga,
+            'gratis': cliente_paga <= 0 and costo > 0,
+            'envio_gratis_desde': FREE_SHIPPING_FROM,
+            'tarifa_plana': SHIPPING_FLAT,
+            'falta_para_gratis': round(max(0.0, FREE_SHIPPING_FROM - mercancia), 2),
+            'se_cobra_envio': COBRAR_ENVIO,
+            # Renglones que el catálogo del servidor no reconoció. Con uno solo, el
+            # importe de compra va corto y lo que dice «paga el cliente» no es de fiar.
+            'productos_sin_precio': sin_precio,
+        },
+        # ⛔ DE AQUÍ PARA ABAJO, SÓLO EL ADMIN. Es lo que le cuesta a la casa.
+        'casa': {
+            'costo_guia': round(costo, 2),
+            'absorbe': absorbe,
+            'tope_absorcion': envios.tope_que_absorbe_la_casa(mercancia),
+            'fuera_de_tope': envios.absorcion_fuera_de_tope(costo, mercancia, cliente_paga),
+            'tope_guia_automatica': envios.TOPE_GUIA_AUTOMATICA_MXN,
+            'se_compra_sola': costo <= envios.TOPE_GUIA_AUTOMATICA_MXN,
+        },
+        'proveedores': comp['proveedores'],
+        'ahorro': paqueterias.ahorro(comp),
+    }
+    await _guardar_en_el_historial(payload, quien, resp, cp, pais)
+    return resp
+
+
+async def _guardar_en_el_historial(payload, quien: dict, resp: dict, cp: str, pais: str):
+    """Apunta la consulta para que no haya que repetirla. Falla en silencio a propósito.
+
+    Si la base no acepta el apunte, la cotización YA está hecha y en pantalla: tumbar
+    la respuesta por no poder guardar el historial sería cambiar una molestia por un
+    error.
+    """
+    mejor = (resp.get('opciones') or [{}])[0]
+    cobro = resp.get('cobro') or {}
+    try:
+        await db[COLECCION_COTIZADOR].insert_one({
+            'id': str(uuid.uuid4()),
+            'user_id': quien.get('id', ''),
+            'user_role': quien.get('role', ''),
+            'postal_code': cp,
+            'state': payload.state or '',
+            'city': payload.city or '',
+            'country': pais,
+            'mode': (payload.mode or 'items').strip().lower(),
+            'peso_kg': resp.get('peso_kg', 0),
+            'piezas': resp.get('piezas', 0),
+            'mercancia': cobro.get('mercancia', 0),
+            'carrier': mejor.get('carrier', ''),
+            'service': mejor.get('service', ''),
+            'days': mejor.get('days', 0),
+            'price': mejor.get('price', 0),
+            'cliente_paga': cobro.get('cliente_paga', 0),
+            'opciones_n': len(resp.get('opciones') or []),
+            'created_at': now_iso(),
+        })
+    except Exception:
+        logger.exception('Cotizador: no se pudo guardar la consulta de %s', cp)
+
+
+async def _historial_del_cotizador(quien: dict, todo: bool) -> dict:
+    """Las últimas consultas. El admin ve todas; el distribuidor SÓLO las suyas.
+
+    El filtro por `user_id` no es cortesía: el historial de otro distribuidor diría a
+    dónde y cuánto vende, que no es asunto suyo.
+    """
+    filtro = {} if todo else {'user_id': quien.get('id', '')}
+    docs = await db[COLECCION_COTIZADOR].find(filtro, {'_id': 0}) \
+        .sort('created_at', -1).to_list(HISTORIAL_COTIZADOR)
+    return {'historial': docs}
+
+
+@api_router.post('/admin/shipping/cotizador')
+async def cotizador_envios_admin(payload: CotizadorEnvioRequest,
+                                 admin=Depends(get_current_admin)):
+    """«¿Cuánto cuesta mandar esto a tal CP?», con los números de la casa a la vista."""
+    return await _cotizar_para_el_cotizador(payload, admin, es_admin=True)
+
+
+@api_router.get('/admin/shipping/cotizador/historial')
+async def cotizador_envios_admin_historial(admin=Depends(get_current_admin)):
+    return await _historial_del_cotizador(admin, todo=True)
+
+
+@api_router.post('/distributor/shipping/cotizador')
+async def cotizador_envios_distribuidor(payload: CotizadorEnvioRequest,
+                                        dist=Depends(get_current_distributor)):
+    """El mismo cotizador para el distribuidor, recortado a lo que puede ver.
+
+    ⛔ EL RECORTE LO HACE EL SERVIDOR, no la pantalla. Ocultar un dato con CSS es
+    dejarlo servido en la consola del navegador: el costo que la casa absorbe nunca
+    sale de esta ruta (ver `_solo_lo_del_distribuidor` y test_cotizador_envios.py).
+    """
+    completa = await _cotizar_para_el_cotizador(payload, dist, es_admin=False)
+    return _solo_lo_del_distribuidor(completa)
+
+
+@api_router.get('/distributor/shipping/cotizador/historial')
+async def cotizador_envios_distribuidor_historial(dist=Depends(get_current_distributor)):
+    return await _historial_del_cotizador(dist, todo=False)
 
 
 @api_router.post('/admin/orders/{order_id}/guia')

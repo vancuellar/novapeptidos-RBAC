@@ -282,6 +282,43 @@ def paquete_del_pedido(items, pflags: dict | None = None) -> dict:
     }
 
 
+def paquete_manual(peso_kg, largo_cm=0, ancho_cm=0, alto_cm=0) -> dict:
+    """Un bulto CUALQUIERA, capturado a mano en el cotizador. Mismas llaves que arriba.
+
+    ⛔ ESTE ES EL ÚNICO CAMINO EN EL QUE EL PESO LO PONE UNA PERSONA, y sólo puede
+    existir porque lo que produce es una respuesta en pantalla: «¿cuánto costaría
+    mandar esto?». NUNCA toca un pedido ni un cobro — el checkout pesa contra el
+    catálogo con `paquete_del_pedido` y no mira nada de aquí. El día que alguien
+    quiera cobrar con este peso, la respuesta es no.
+
+    Lo que no venga o venga en basura se cae a algo defendible en vez de reventar:
+    el mínimo que cobran todas las paqueterías (1 kg) y las medidas de la caja que
+    le tocaría a ese peso. Una medida en cero haría que la paquetería cotizara
+    contra nada y luego recobrara en el mostrador.
+    """
+    def _num(v):
+        try:
+            n = float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return n if n > 0 else 0.0
+
+    peso = max(PESO_MINIMO_KG, _num(peso_kg))
+    caja = caja_para(peso)
+    bulto = {
+        'largo_cm': _num(largo_cm) or caja['largo_cm'],
+        'ancho_cm': _num(ancho_cm) or caja['ancho_cm'],
+        'alto_cm': _num(alto_cm) or caja['alto_cm'],
+    }
+    return {
+        'peso_kg': round(peso, 2),
+        **bulto,
+        'caja': 'capturado a mano',
+        'peso_contenido_kg': round(peso, 2),
+        'peso_volumetrico_kg': peso_volumetrico(bulto),
+    }
+
+
 # =========================================================================
 #  EL EMPAQUE DE VERDAD: cuántas piezas caben en lo que Christián TIENE
 # =========================================================================

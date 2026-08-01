@@ -436,6 +436,35 @@ class ShippingQuoteRequest(BaseModel):
     country: str = 'MX'
 
 
+class CotizadorEnvioRequest(BaseModel):
+    """Lo que el COTIZADOR manda: a dónde va y qué se manda, sin pedido de por medio.
+
+    ⛔ NO ES EL CHECKOUT Y NO COBRA NADA. Aquí sí se acepta un peso capturado a mano,
+    y sólo por eso: lo que sale de este camino es una respuesta en pantalla, jamás un
+    cargo. La cotización se guarda en su PROPIA colección (`shipping_cotizador`) para
+    que ningún id de aquí pueda colarse en un pedido — el checkout sigue leyendo
+    únicamente las suyas, calculadas por el servidor contra el catálogo real.
+
+    `mode`:
+      · 'items'  → se eligen productos y cantidades; el peso Y el importe de mercancía
+        los saca el SERVIDOR del catálogo, exactamente como en el checkout.
+      · 'manual' → un bulto cualquiera: peso y medidas a mano. El importe de mercancía
+        se teclea porque no hay productos de donde sacarlo; es un "qué pasaría si".
+    """
+    postal_code: str = ''
+    state: str = ''
+    city: str = ''
+    country: str = 'MX'
+    mode: str = 'items'
+    items: List[OrderItem] = []
+    peso_kg: float = 0.0
+    largo_cm: float = 0.0
+    ancho_cm: float = 0.0
+    alto_cm: float = 0.0
+    # Sólo se mira en 'manual'. En 'items' el servidor lo calcula y este campo se ignora.
+    merchandise_mxn: float = 0.0
+
+
 class RemitenteUpdate(BaseModel):
     """La dirección de quien despacha, capturada desde Admin → Envíos.
 
