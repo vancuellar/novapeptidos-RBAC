@@ -52,7 +52,13 @@ PERMITIDAS = {
     # El motor del chat. No cobra ni cotiza: vive aquí por lo mismo que las
     # demás — para poder pegarlo desde el teléfono. Mientras no estén, el chat
     # sigue con Gemini exactamente como hoy (ver `modelo_ia.py`).
+    #
+    # ⛔ `GEMINI_API_KEY` NO está aquí a propósito: `ai_assistant` la lee UNA vez
+    # al arrancar, así que pegarla desde el panel no la encendería y el Admin
+    # mostraría "configurada" sobre una llave que no se usa. Ésa sigue en el
+    # `.env` del servidor.
     'OPENAI_API_KEY',
+    'MOONSHOT_API_KEY',
     'ANTHROPIC_API_KEY',
 }
 

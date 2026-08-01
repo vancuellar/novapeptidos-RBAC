@@ -42,6 +42,9 @@ from ai_assistant import build_chat, stream_reply, extract_lab_report, interpret
 # ⛔ CHAT IA DE NEGOCIO (admin + distribuidores). El candado por rol vive ahí: el
 # contexto que recibe el modelo se arma según quién pregunta. Ver chat_negocio.py.
 import chat_negocio
+# El motor del chat es intercambiable por variable de entorno, y de aquí salen
+# también los avisos de "no pude responder" en los tres idiomas. Ver modelo_ia.py.
+import modelo_ia
 # La red de abajo del formato: lo que el modelo escriba en Markdown y la pantalla
 # no necesite, se limpia antes de salir — sin partir un marcador a la mitad
 # cuando la respuesta llega en chorrito. Ver texto_ia.py.
@@ -6979,14 +6982,15 @@ async def ai_chat(payload: ChatInput, user=Depends(get_optional_user)):
                 yield cola
         except Exception as e:
             logger.error(f'AI chat error: {e}')
-            # 429 = cuota de Gemini agotada (plan gratis: 20/dia). Mensaje honesto
-            # en vez de un error tecnico: el usuario sabe que es demanda, no su culpa.
-            if '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e):
-                err = ('Nuestro asistente esta recibiendo mucha demanda en este momento. '
-                       'Intenta de nuevo en unos minutos o escribenos a hola@exygenlabs.com '
-                       'y con gusto te ayudamos.')
-            else:
-                err = 'Lo siento, ocurrio un error al procesar tu mensaje. Intenta de nuevo.'
+            # Mensaje honesto en vez de un error tecnico: el usuario sabe que es
+            # demanda, no su culpa. El texto vive en `modelo_ia.AVISOS`, en los
+            # tres idiomas y SIN nombrar al proveedor — ver el porque alli.
+            clase = modelo_ia.clase_de_error(e)
+            # Al cliente le da igual si falta una llave: para el es lo mismo que
+            # una caida. Lo de la llave se le dice a Christian en el panel.
+            if clase == 'sin_llave':
+                clase = 'generico'
+            err = modelo_ia.aviso('tienda', clase, payload.language)
             collected = err
             yield err
         finally:
@@ -7030,14 +7034,9 @@ async def chat_history(session_id: str):
 #   3. La conversación se guarda y se lee por `user_id`: nadie ve la de nadie.
 
 # La conversación previa que se le recuerda al modelo. Corta a propósito: cada
-# vuelta re-manda el catálogo entero, y con la cuota gratis de Gemini (20/día)
-# un historial largo no compra nada.
+# vuelta re-manda el catálogo entero, y una vuelta larga se paga por token en
+# cualquier proveedor.
 NEGOCIO_HISTORIAL = 8
-
-
-def _negocio_sin_cuota(e) -> bool:
-    """¿El error es la cuota de Gemini agotada? (plan gratis: 20 al día)."""
-    return '429' in str(e) or 'RESOURCE_EXHAUSTED' in str(e)
 
 
 @api_router.post('/business/chat')
@@ -7088,16 +7087,10 @@ async def business_chat(payload: ChatInput, user=Depends(get_current_distributor
             logger.error(f'Chat de negocio: {e}')
             # Sin llave o sin cuota NO se truena: se degrada con un mensaje claro.
             # El asesor es una ayuda, no la caja — que se caiga en silencio con un
-            # error técnico en pantalla es peor que decir qué pasó.
-            if _negocio_sin_cuota(e):
-                err = ('Se acabó la cuota del asistente por hoy (el plan gratuito de '
-                       'Google da 20 consultas al día). Vuelve a intentar mañana, o '
-                       'avísale a Christián para activar el plan de pago.')
-            elif 'GEMINI_API_KEY' in str(e):
-                err = ('El asistente todavía no tiene su llave configurada en el '
-                       'servidor. Avísale a Christián.')
-            else:
-                err = 'No pude responder en este momento. Intenta de nuevo en un minuto.'
+            # error técnico en pantalla es peor que decir qué pasó. Aquí SÍ se
+            # distingue lo de la llave: quien lee esto es de la casa y puede
+            # arreglarlo. Los textos, en los tres idiomas, en `modelo_ia.AVISOS`.
+            err = modelo_ia.aviso('panel', modelo_ia.clase_de_error(e), payload.language)
             collected = err
             yield err
         finally:

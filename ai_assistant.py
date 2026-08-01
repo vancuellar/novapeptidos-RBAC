@@ -1,6 +1,10 @@
+import logging
 import os
+
 from google import genai
 from google.genai import types
+
+logger = logging.getLogger(__name__)
 
 # Capa gratuita de Google (Gemini). Genera la llave en https://aistudio.google.com/apikey
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY') or os.environ.get('GOOGLE_API_KEY')
@@ -317,39 +321,100 @@ _FALLBACK_REPLY = (
 )
 
 
-async def stream_reply(chat: dict, message: str):
-    """Async generator yielding text chunks.
+async def _gemini(system: str, message: str):
+    """El motor de Google, como cualquier otro: system + mensaje -> trozos.
 
-    El motor por omisión es Gemini y se sirve aquí mismo. Si `AI_PROVIDER` pide
-    otro (GPT o Claude), la llamada se va a `modelo_ia.py` — la capa fina que
-    hace que cambiar de proveedor sea pegar una llave y no reprogramar. Ver ese
-    archivo para el porqué.
+    Sale de `stream_reply` para que el respaldo lo pueda llamar por su nombre. El
+    modelo lo decide `modelo_ia.modelo('gemini')`, que sin configurar nada
+    devuelve el mismo `AI_MODEL_NAME` de siempre.
     """
     import modelo_ia
-    if modelo_ia.proveedor() != 'gemini':
-        async for trozo in modelo_ia.responder(chat['system_message'], message):
-            yield trozo
-        return
-
     if not GEMINI_API_KEY:
-        raise RuntimeError('GEMINI_API_KEY is not configured.')
+        raise modelo_ia.FaltaConfiguracion('GEMINI_API_KEY is not configured.')
 
     client = genai.Client(api_key=GEMINI_API_KEY)
     stream = await client.aio.models.generate_content_stream(
-        model=AI_MODEL_NAME,
+        model=modelo_ia.modelo('gemini') or AI_MODEL_NAME,
         contents=message,
         config=types.GenerateContentConfig(
-            system_instruction=chat['system_message'],
+            system_instruction=system,
             safety_settings=_SAFETY_OFF,
         ),
     )
-
-    produced = False
     async for event in stream:
         chunk = getattr(event, 'text', None)
         if chunk:
-            produced = True
             yield chunk
-    # Gemini no entregó nada (bloqueo/candidato vacío): rechazo on-brand en vez de error.
-    if not produced:
+
+
+async def _motor(cual: str, system: str, message: str):
+    """Un motor cualquiera, por nombre. Gemini aquí, los demás en `modelo_ia`."""
+    import modelo_ia
+    if cual == 'gemini':
+        async for trozo in _gemini(system, message):
+            yield trozo
+    else:
+        async for trozo in modelo_ia.responder(system, message, cual=cual):
+            yield trozo
+
+
+async def stream_reply(chat: dict, message: str):
+    """Async generator yielding text chunks. Con motor de respaldo.
+
+    El motor por omisión es Gemini. Si `AI_PROVIDER` pide otro (GPT, Kimi o
+    Claude), se usa ése y —si se cae— se contesta con el de respaldo antes que
+    dejar al cliente hablándole a una pared. Ver `modelo_ia.cadena()`.
+
+    TRES REGLAS DEL RESPALDO, y las tres tienen su porqué:
+
+    1. **Si ya salió texto, NO se cambia de motor.** El chat va en chorrito y el
+       cliente ya está leyendo: empalmarle encima la respuesta de otro modelo
+       produce un Frankenstein a media frase, que es peor que un error honesto.
+       Con texto ya entregado, el error sube tal cual.
+
+    2. **Si lo que falta es la llave o el nombre del modelo, NO hay respaldo.**
+       Eso es un `.env` mal pegado, no el clima. Taparlo con Gemini haría que el
+       chat corriera meses en el motor equivocado sin que nadie lo notara. Sube
+       `FaltaConfiguracion` y el panel dice qué pegar.
+
+    3. **El sobre es EL MISMO para los dos motores.** El respaldo recibe el
+       `system_message` que ya venía armado por rol (ver `chat_negocio.py`): el
+       candado del distribuidor no depende de qué proveedor conteste, porque el
+       costo nunca entró al sobre.
+    """
+    import modelo_ia
+    system = chat['system_message']
+    motores = modelo_ia.cadena()
+    ultimo_error = None
+
+    for i, cual in enumerate(motores):
+        queda_respaldo = i + 1 < len(motores)
+        entregado = False
+        try:
+            async for trozo in _motor(cual, system, message):
+                entregado = True
+                yield trozo
+        except modelo_ia.FaltaConfiguracion:
+            raise                       # regla 2: un error de despliegue se ve
+        except Exception as e:
+            if entregado:
+                raise                   # regla 1: no se empalma a media frase
+            ultimo_error = e
+            if queda_respaldo:
+                logger.warning('El motor "%s" falló (%s). Contesto con el respaldo "%s".',
+                               cual, e, motores[i + 1])
+                continue
+            raise
+        if entregado:
+            return
+        # No falló y no entregó nada: bloqueo duro o candidato vacío.
+        if queda_respaldo:
+            logger.warning('El motor "%s" no entregó texto. Paso al respaldo "%s".',
+                           cual, motores[i + 1])
+            continue
+        # Último motor y sin texto: rechazo on-brand, nunca un error crudo.
         yield _FALLBACK_REPLY
+        return
+
+    if ultimo_error is not None:        # pragma: no cover - el bucle ya relanza
+        raise ultimo_error
