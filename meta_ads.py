@@ -64,6 +64,28 @@ def _num(v):
         return 0.0
 
 
+# ⛔ LAS CONVERSACIONES DE WHATSAPP NO SE ESTABAN LEYENDO (2026-07-31).
+#
+# La semana del 25 al 31 de julio se gastaron $237 USD y Meta reportó 110
+# conversaciones de WhatsApp a $39 MXN cada una — pero el panel no las veía: se
+# leían `link_click`, `landing_page_view` y `purchase`, y nada más. Justo el
+# número que compró casi todo el presupuesto era el que no salía en el tablero.
+#
+# Meta las manda con nombres distintos según la versión y el canal, y a veces con
+# ventana pegada al nombre (`_7d`). Se toma el MAYOR, nunca la suma: son ventanas
+# del MISMO hecho (la de 7 días incluye la de 1) y sumarlas contaría doble.
+CONVERSACIONES = (
+    'onsite_conversion.messaging_conversation_started_7d',
+    'onsite_conversion.total_messaging_connection',
+    'onsite_conversion.messaging_first_reply',
+)
+
+
+def _conversaciones(acts):
+    """Cuántas conversaciones de mensajería abrió este anuncio."""
+    return int(max((acts.get(k, 0) for k in CONVERSACIONES), default=0))
+
+
 def _index(headers):
     """Mapa campo -> nombre real de la columna, sin importar idioma ni mayúsculas."""
     low = {(h or '').strip().lower(): h for h in headers}
@@ -130,6 +152,9 @@ def summarize(rows):
     clicks = sum(r['clicks'] for r in rows)
     link_clicks = sum(r.get('link_clicks', 0) for r in rows)
     landings = sum(r.get('landing_page_views', 0) for r in rows)
+    # Las conversaciones SÍ se suman entre campañas (son anuncios distintos); lo que
+    # no se suma es una campaña consigo misma, y de eso se encarga `_conversaciones`.
+    conversaciones = sum(r.get('conversaciones', 0) for r in rows)
     impressions = sum(r['impressions'] for r in rows)
     purchases = sum(r['purchases'] for r in rows)
     value = sum(r['purchase_value'] for r in rows)
@@ -143,6 +168,11 @@ def summarize(rows):
         'clicks': clicks,
         'link_clicks': link_clicks,
         'landing_page_views': landings,
+        # Lo que de verdad se compró esta semana: 110 conversaciones y cero compras.
+        'conversaciones': conversaciones,
+        # Lo que cuesta abrir UNA conversación. Es el número contra el que hay que
+        # comparar lo que esa conversación acaba vendiendo (panel de WhatsApp).
+        'costo_conversacion': round(spend / conversaciones, 2) if conversaciones else 0.0,
         # El CPC honesto es sobre los clics AL ENLACE, no sobre todos.
         'cpc': round(spend / link_clicks, 4) if link_clicks else (round(spend / clicks, 4) if clicks else 0.0),
         # De cada 100 que le dieron clic al enlace, cuantos llegaron a ver la
@@ -353,6 +383,7 @@ async def fetch_live(days=30):
         link_clicks = int(_num(d.get('inline_link_clicks')) or acts.get('link_click', 0))
         landings = int(acts.get('landing_page_view', 0))
         rows.append({
+            'conversaciones': _conversaciones(acts),
             'campaign': d.get('campaign_name', ''),
             'campaign_id': d.get('campaign_id', ''),
             'ctr': _num(d.get('ctr')),

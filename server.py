@@ -3445,6 +3445,12 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         shipping_over_cap=fuera_de_tope,
         total=total,
         referred_by=referrer['id'] if referrer else None,
+        # ⛔ EL TEXTO DEL CUPÓN SE ESCRIBE EN EL PEDIDO (2026-07-31). Antes el vínculo
+        # sólo existía al revés (`discount_codes.used_order`), que se llena al QUEMAR
+        # el cupón — y un cupón de campaña multiuso no se quema nunca. Sin esta línea,
+        # un código de WhatsApp repartido en cien conversaciones podía vender y aun así
+        # aparecer en el panel como «mandado y jamás usado».
+        coupon_code=(coupon.get('code') or '') if coupon else '',
         commission=commission,
         commissions=commissions,
         points_used=points_used,
@@ -7569,14 +7575,38 @@ async def admin_view_as(user_id: str, admin=Depends(get_current_admin)):
 # ----------------- Embudo de venta / efectividad de publicidad -----------------
 EVENT_TYPES = ('visit', 'product_view', 'add_to_cart', 'checkout_start', 'purchase')
 
+# Los tres aparatos, en palabras que Christián lee sin traducir. Nada más entra:
+# lo que llegue raro cae en '' (desconocido) y se cuenta aparte, nunca se inventa.
+DEVICES = ('telefono', 'tableta', 'computadora')
+
+# Ancho máximo que se cree. Arriba de esto es un monitor gigante o un navegador
+# mintiendo; se recorta en vez de rechazar el evento, porque medir NUNCA debe
+# tirar un dato bueno por culpa de uno raro.
+SCREEN_MAX = 10000
+
 
 @api_router.post('/events')
 async def track_event(payload: TrackEvent):
     """Registra un paso del embudo. Publico y anonimo: sirve para saber si la
-    gente que llega (sobre todo de publicidad) esta comprando o donde se cae."""
+    gente que llega (sobre todo de publicidad) esta comprando o donde se cae.
+
+    🔒 LO QUE ESTE ENDPOINT NO GUARDA, A PROPÓSITO. No toca `Request`: no ve ni
+    guarda la IP, ni el User-Agent, ni ninguna cabecera. Lo único nuevo desde el
+    2026-07-31 es AGREGADO —categoría de aparato y ancho de pantalla— que es lo
+    que Christián autorizó para poder decidir con datos. Sin huella digital.
+    """
     if payload.type not in EVENT_TYPES:
         raise HTTPException(status_code=400, detail='Tipo de evento no valido')
     doc = payload.model_dump()
+    # El navegador ya manda el aparato clasificado; aquí sólo se comprueba que sea
+    # uno de los tres. Un valor inventado en el navegador no puede crear una
+    # categoría nueva en el panel y ensuciar el corte que se va a comparar.
+    doc['device'] = doc.get('device') if doc.get('device') in DEVICES else ''
+    try:
+        doc['screen_w'] = max(0, min(SCREEN_MAX, int(doc.get('screen_w') or 0)))
+    except (TypeError, ValueError):
+        doc['screen_w'] = 0
+    doc['ref_code'] = str(doc.get('ref_code') or '').strip().upper()[:40]
     doc['id'] = str(uuid.uuid4())
     doc['created_at'] = now_iso()
     await db.events.insert_one(doc)
@@ -7999,6 +8029,220 @@ async def admin_marketing_resumen(days: int = 30, admin=Depends(get_current_mark
     }
 
 
+# ================= ¿LAS CONVERSACIONES DE WHATSAPP VENDEN? =================
+#
+# ⛔ EL AGUJERO QUE ESTO TAPA (Christián, 2026-07-31). La semana del 25 al 31 de
+# julio: $237 USD gastados, 110 conversaciones de WhatsApp a $39 MXN cada una, y
+# CERO compras atribuidas por Meta. Las 3 ventas reales llegaron por otro lado.
+# Nadie sabía si esas 110 conversaciones se volvieron ventas — y sin saberlo,
+# subir o bajar el presupuesto es adivinar.
+#
+# POR QUÉ UN CÓDIGO Y NO UN ENLACE. Una conversación de WhatsApp no tiene URL
+# donde pegar un `utm`, no deja `fbclid` y no comparte cookie con el sitio: para
+# Meta y para el píxel, esa venta nace de la nada. El cupón es lo ÚNICO que viaja
+# con la persona desde el chat hasta el carrito.
+#
+# POR QUÉ REUTILIZABLE Y NO UNO POR CONVERSACIÓN. Se consideró un código distinto
+# por cada chat (atribución perfecta: conversación ↔ venta). Se descartó porque a
+# 110 conversaciones por semana obliga a Mónica a administrar un inventario de
+# códigos dentro de WhatsApp Web, y el día que se equivoque de renglón la venta se
+# atribuye al chat de otra persona — o sea, un dato peor que ninguno. Un código
+# por ANUNCIO, siempre el mismo, no se puede teclear mal y contesta la pregunta
+# que importa: ¿de qué anuncio salió la venta? La granularidad por conversación
+# queda disponible (`cantidad > 0`) para cuando haya volumen que la justifique.
+#
+# 🔒 EL PREFIJO ES DE LA CASA. `WA-` + el anuncio. Nunca el nombre de quien lo
+# reparte: los códigos dejaron de delatar al distribuidor el 2026-07-31, y éstos
+# nacen ya cumpliendo esa regla.
+WA_PREFIJO = 'WA'
+
+
+def _texto_wa(campana: str, mes: str = '') -> str:
+    """`WA-RETA-JUL`: prefijo de la casa, anuncio, mes.
+
+    Corto a propósito: lo teclea un cliente en el carrito después de leerlo en un
+    chat, y cada letra de más es un cupón que «no funciona» y una venta que se cae
+    sin que nadie se entere. Ocho letras del anuncio es el techo — si el anuncio se
+    llama largo, conviene nombrarlo corto al crearlo ('Reta' mejor que
+    'Retatrutida julio 2026'). Es la misma forma que `director.py` ya le dicta a la
+    IA para los anuncios de WhatsApp (`WA-RETA-JUL`).
+    """
+    base = marketing.slug(campana).upper().replace('-', '')[:8] or 'GRAL'
+    return '-'.join(x for x in (WA_PREFIJO, base, mes.upper()[:4]) if x)
+
+
+class WhatsAppCode(BaseModel):
+    campana: str                    # el anuncio: 'Retatrutida', 'Asesoria'
+    discount_rate: float = 0.10
+    expires_days: int = 30
+    # 0 = UN código de campaña, reutilizable (lo normal: Mónica pega el mismo en
+    # todos los chats de ese anuncio). N = N códigos de un solo uso, uno por
+    # conversación, para cuando se quiera el detalle fino.
+    cantidad: int = 0
+    min_order: float = 0            # compra mínima, si se quiere poner piso
+    mes: str = ''                   # 'JUL' — para no reciclar el código del mes pasado
+    note: str = ''
+
+
+@api_router.post('/admin/marketing/whatsapp/codigos')
+async def admin_crear_codigos_whatsapp(payload: WhatsAppCode,
+                                       admin=Depends(get_current_marketing)):
+    """Crea el (o los) código(s) que Mónica reparte en el chat de un anuncio."""
+    if not (payload.campana or '').strip():
+        raise HTTPException(status_code=400, detail='Dime de qué anuncio es el código.')
+    # Mismo techo que todo lo demás. Un cupón de WhatsApp no es una puerta trasera
+    # al 50%: `tasa_de_cupon` lo volvería a topar al cobrar, y un panel que promete
+    # un descuento que el checkout no da es peor que no tener panel.
+    rate = max(0.05, min(TECHO_DESCUENTO, payload.discount_rate))
+    expira = (datetime.now(timezone.utc)
+              + timedelta(days=max(1, payload.expires_days))).isoformat()
+    base = _texto_wa(payload.campana, payload.mes)
+    cuantos = max(0, min(500, int(payload.cantidad or 0)))
+    ahora = now_iso()
+
+    def _doc(code, single):
+        return {
+            'id': str(uuid.uuid4()), 'code': code, 'kind': 'coupon',
+            'user_id': None,                 # se reparte en un chat, no por cuenta
+            'discount_rate': rate,
+            'min_order': float(payload.min_order or 0),
+            'active': True, 'used': False,
+            # ⛔ `single_use: False` en el código de campaña. `_apartar_cupon` no lo
+            # quema, así que sirve las veces que haga falta — y por eso mismo NO
+            # puede dejar rastro en `used_order`. Su atribución vive en el pedido
+            # (`orders.coupon_code`), que es lo que se añadió hoy.
+            'single_use': bool(single),
+            'campana_wa': marketing.slug(payload.campana),
+            'note': (payload.note or f'Conversaciones de WhatsApp · {payload.campana}')[:200],
+            'created_by': 'whatsapp', 'created_at': ahora, 'expires_at': expira,
+        }
+
+    codigos = []
+    if cuantos:
+        for _ in range(cuantos):
+            code = f'{base}-{"".join(random.choices(string.ascii_uppercase + string.digits, k=4))}'
+            while await db.discount_codes.find_one({'code': code}):
+                code = f'{base}-{"".join(random.choices(string.ascii_uppercase + string.digits, k=4))}'
+            doc = _doc(code, True)
+            await db.discount_codes.insert_one(doc)
+            codigos.append(code)
+    else:
+        # Ya existe el de este anuncio: se devuelve el mismo en vez de crear un gemelo.
+        # Si no, cada clic del botón partiría las ventas del mismo anuncio en dos filas.
+        ya = await db.discount_codes.find_one({'code': base, 'active': True}, {'_id': 0, 'code': 1})
+        if not ya:
+            await db.discount_codes.insert_one(_doc(base, False))
+        codigos.append(base)
+
+    return {'codigos': codigos, 'discount_rate': rate, 'expires_at': expira,
+            'reutilizable': not cuantos,
+            # El renglón listo para copiar y pegar en el chat.
+            'mensaje': (f'Te dejo {codigos[0]} para que apliques {round(rate * 100)}% '
+                        f'de descuento en exygenlabs.com')}
+
+
+def _enlaces_de_retatrutida():
+    """Los enlaces que Christián pega en Meta para mandar a la FICHA, no a la portada.
+
+    ⛔ POR QUÉ LA FICHA. Retatrutida se lleva 68 de las 118 vistas de producto de la
+    semana (58%). Mandar ese clic a la portada le cobra al visitante dos toques más
+    para llegar a lo que venía buscando, y ahí es donde se cae el embudo: de visita a
+    ficha sólo pasa el 8.7%.
+
+    ⛔ Y POR QUÉ ETIQUETADOS. Un enlace sin `utm` cae en «sin etiquetar» para siempre
+    y esa campaña nunca podrá tener un costo por cliente. `{{site_source_name}}` es la
+    macro oficial de Meta: se rellena sola con `fb` / `ig` / `msg`, que es lo que
+    `marketing.es_de_meta` ya reconoce. Christián los pega; aquí no se toca Meta.
+    """
+    base = f'{SITE_URL.rstrip("/")}/producto/retatrutida/'
+    comun = 'utm_source={{site_source_name}}&utm_medium=paid'
+    return [
+        {'para': 'Anuncio de tráfico a la ficha de Retatrutida',
+         'url': f'{base}?{comun}&utm_campaign=retatrutida-ficha&utm_content={{{{ad_id}}}}'},
+        {'para': 'Anuncio de Reels (el más barato esta semana)',
+         'url': f'{base}?{comun}&utm_campaign=retatrutida-reels&utm_content={{{{ad_id}}}}'},
+        {'para': 'Campo «Parámetros de URL del sitio web» (sólo los parámetros)',
+         'url': f'{comun}&utm_campaign=retatrutida-ficha&utm_content={{{{ad_id}}}}'},
+    ]
+
+
+@api_router.get('/admin/marketing/whatsapp')
+async def admin_whatsapp(days: int = 7, admin=Depends(get_current_marketing)):
+    """¿Las conversaciones de WhatsApp se vuelven ventas? Cierra el círculo.
+
+    Conversaciones (Meta) → códigos entregados → códigos usados → pesos cobrados.
+    """
+    desde = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat()
+    filas, estado = await _meta_filas(days)
+    conversaciones = sum(f.get('conversaciones', 0) for f in filas)
+    gasto = sum(float(f.get('spend', 0) or 0) for f in filas)
+
+    cupones = await db.discount_codes.find(
+        {'created_by': 'whatsapp'}, {'_id': 0}).to_list(5000)
+    # Las ventas se buscan por el TEXTO escrito en el pedido. Es lo que hace que un
+    # código de campaña reutilizable pueda demostrar que vendió: antes del
+    # 2026-07-31 el único rastro era `used_order`, que sólo llenan los de un uso.
+    textos = [c['code'] for c in cupones if c.get('code')]
+    pedidos = await db.orders.find(
+        {'coupon_code': {'$in': textos}, 'created_at': {'$gte': desde},
+         'status': {'$nin': list(NO_CUENTAN)}},
+        {'_id': 0, 'order_number': 1, 'coupon_code': 1, 'total': 1, 'status': 1,
+         'paid': 1, 'first_order': 1}).to_list(5000) if textos else []
+
+    grupos = {}
+    for c in cupones:
+        campana = c.get('campana_wa') or 'sin anuncio'
+        g = grupos.setdefault(campana, {
+            'campana': campana, 'codigos': [], 'entregados': 0, 'usados': 0,
+            'pedidos': 0, 'clientes_nuevos': 0, 'cobrado_mxn': 0.0, 'por_cobrar_mxn': 0.0,
+            'reutilizable': False, 'vigente_hasta': ''})
+        g['entregados'] += 1
+        if not c.get('single_use', True):
+            g['reutilizable'] = True
+        if c.get('code') not in g['codigos']:
+            g['codigos'].append(c.get('code'))
+        g['vigente_hasta'] = max(g['vigente_hasta'], c.get('expires_at') or '')
+
+    por_codigo = {c['code']: (c.get('campana_wa') or 'sin anuncio') for c in cupones if c.get('code')}
+    usados_por_campana = {}
+    for o in pedidos:
+        campana = por_codigo.get(o.get('coupon_code'))
+        g = grupos.get(campana)
+        if not g:
+            continue
+        g['pedidos'] += 1
+        g['cobrado_mxn'] += cobrado_de(o)
+        g['por_cobrar_mxn'] += por_cobrar_de(o)
+        if o.get('first_order'):
+            g['clientes_nuevos'] += 1
+        usados_por_campana.setdefault(campana, set()).add(o.get('coupon_code'))
+    for campana, g in grupos.items():
+        g['usados'] = len(usados_por_campana.get(campana, ()))
+        g['cobrado_mxn'] = round(g['cobrado_mxn'])
+        g['por_cobrar_mxn'] = round(g['por_cobrar_mxn'])
+
+    filas_wa = sorted(grupos.values(), key=lambda g: -g['cobrado_mxn'])
+    ventas = sum(g['pedidos'] for g in filas_wa)
+    cobrado = sum(g['cobrado_mxn'] for g in filas_wa)
+    return {
+        **estado,
+        'dias': days,
+        'conversaciones': conversaciones,
+        'gasto_usd': round(gasto, 2),
+        'costo_conversacion_usd': round(gasto / conversaciones, 2) if conversaciones else 0,
+        'campanas': filas_wa,
+        'ventas': ventas,
+        'cobrado_mxn': cobrado,
+        # ⛔ DE CADA 100 CONVERSACIONES, CUÁNTAS COMPRARON. Es LA cifra que decide si
+        # se sube o se baja el presupuesto de WhatsApp. Cero con códigos repartidos
+        # significa que no venden; cero SIN códigos repartidos no significa nada —por
+        # eso `medible` viaja al lado y el panel no deja confundir las dos cosas.
+        'conversion': round(ventas / conversaciones * 100, 2) if conversaciones else 0,
+        'medible': bool(filas_wa),
+        'enlaces_retatrutida': _enlaces_de_retatrutida(),
+    }
+
+
 @api_router.get('/admin/marketing/campana/{campaign_id}')
 async def admin_marketing_campana(campaign_id: str, days: int = 30,
                                   admin=Depends(get_current_marketing)):
@@ -8361,6 +8605,71 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
     }
 
 
+# Cajones de ancho de pantalla. No son arbitrarios: 375 es el iPhone de siempre y
+# 390-430 los actuales, así que el corte de 480 separa «teléfono» de todo lo demás
+# sin partir a los teléfonos en dos. 1024 es donde la portada deja de apilarse.
+ANCHOS = (
+    ('hasta 480 px (teléfono)', 0, 480),
+    ('481-768 px (teléfono ancho / tableta)', 481, 768),
+    ('769-1024 px (tableta / laptop chica)', 769, 1024),
+    ('más de 1024 px (monitor)', 1025, 10 ** 9),
+)
+
+
+def _embudo_por_dispositivo(evs):
+    """El embudo partido en teléfono / tableta / computadora, y los anchos.
+
+    ⛔ EL DISPOSITIVO ES DE LA SESIÓN, NO DEL EVENTO. Una misma sesión manda cinco
+    eventos y todos traen el mismo aparato, así que contar eventos multiplicaría por
+    cinco a quien navega mucho. Se resuelve UNA vez por sesión —con el primer evento
+    que sí lo diga— y ese aparato manda para todos sus pasos. Es la misma regla que
+    ya usa `sesion_origen` para el utm, y por lo mismo: si no, el teléfono que sólo
+    mira la portada y el escritorio que recorre seis fichas pesarían igual.
+
+    Devuelve (filas por dispositivo, filas por ancho, sesiones sin dispositivo).
+    """
+    ses_device, ses_ancho = {}, {}
+    for e in sorted(evs, key=lambda x: x.get('created_at', '')):
+        sid = e.get('session_id')
+        if not sid:
+            continue
+        d = e.get('device')
+        if d in DEVICES and sid not in ses_device:
+            ses_device[sid] = d
+        w = e.get('screen_w') or 0
+        if w and sid not in ses_ancho:
+            ses_ancho[sid] = int(w)
+
+    filas = []
+    for d in DEVICES:
+        pasos = {t: set() for t in EVENT_TYPES}
+        for e in evs:
+            sid = e.get('session_id')
+            if ses_device.get(sid) != d:
+                continue
+            if e.get('type') in pasos:
+                pasos[e['type']].add(sid)
+        vis = len(pasos['visit'])
+        filas.append({
+            'dispositivo': d,
+            'visitas': vis,
+            'embudo': [{'paso': t, 'sesiones': len(pasos[t])} for t in EVENT_TYPES],
+            # EL número que Christián va a comparar: hoy, sumando todo, es 8.7%.
+            'visita_a_ficha': round(len(pasos['product_view']) / vis * 100, 1) if vis else 0,
+            'conversion': round(len(pasos['purchase']) / vis * 100, 2) if vis else 0,
+        })
+    filas.sort(key=lambda f: -f['visitas'])
+
+    anchos = []
+    for etiqueta, lo, hi in ANCHOS:
+        n = sum(1 for w in ses_ancho.values() if lo <= w <= hi)
+        anchos.append({'rango': etiqueta, 'sesiones': n})
+
+    # Sesiones que existen pero no dicen aparato: las de antes de que esto se midiera.
+    todas = {e.get('session_id') for e in evs if e.get('session_id')}
+    return filas, anchos, len(todas - set(ses_device))
+
+
 @api_router.get('/admin/funnel')
 async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
     """Embudo + origen del trafico. Responde: llega gente? compra? de donde viene?"""
@@ -8473,10 +8782,26 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
     top_vistos = sorted([{'producto': k, 'vistas': v} for k, v in vistos.items()],
                         key=lambda x: -x['vistas'])[:10]
 
+    por_dispositivo, anchos, sin_dispositivo = _embudo_por_dispositivo(evs)
+
     return {
         'dias': days,
         'embudo': embudo,
         'conversion_total': round(compras / visitas * 100, 2),
+        # ⛔ EL CORTE QUE FALTABA (Christián, 2026-07-31). El 8.7% de visita→ficha es un
+        # PROMEDIO de teléfonos y computadoras juntos, y lo que se cambió esta semana
+        # —adelgazar la portada móvil— sólo se ve en la mitad de teléfono. Sin este
+        # desglose no hay forma honesta de decir si sirvió.
+        'por_dispositivo': por_dispositivo,
+        # Cómo de ancha es la pantalla de quien entra: ¿la portada se está viendo a
+        # 375 px o a 1,400? Responde la pregunta de para cuál diseñar primero.
+        'anchos': anchos,
+        # ⛔ LA LÍNEA HONESTA. Las sesiones de ANTES de que se midiera el aparato
+        # (todo lo anterior al 2026-07-31) no traen dispositivo, y meterlas en
+        # 'computadora' sería inventar. Se cuentan aparte y a la vista: mientras
+        # este número sea grande, el corte por dispositivo todavía no se puede
+        # comparar contra el 8.7% de la semana pasada.
+        'sin_dispositivo': sin_dispositivo,
         'ingreso': round(ingreso),
         'por_cobrar': round(ingreso_por_cobrar),
         # Compras cuyo pedido ya no existe (se borró). No son ingreso ni deuda, pero se

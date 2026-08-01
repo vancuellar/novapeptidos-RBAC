@@ -319,6 +319,20 @@ class Order(BaseModel):
     paid: bool = False
     paid_at: Optional[str] = None
     referred_by: Optional[str] = None   # id del distribuidor cuyo código se usó (si aplica)
+    # ⛔ EL TEXTO DEL CUPÓN, ESCRITO EN EL PEDIDO (2026-07-31).
+    #
+    # Hasta hoy el vínculo cupón→venta vivía SÓLO al revés, en el cupón
+    # (`used_order`), y eso sólo funciona con cupones de UN SOLO USO: se queman al
+    # cobrarse y guardan el pedido que se los llevó. Un cupón de CAMPAÑA —el mismo
+    # texto repartido en cien conversaciones de WhatsApp— no se quema nunca, así
+    # que no tenía dónde apuntar sus ventas: `_ventas_por_cupon` lo contaba como
+    # «mandado y jamás usado» aunque hubiera vendido.
+    #
+    # Con el texto aquí, la pregunta que Christián no podía contestar —«¿las 110
+    # conversaciones de WhatsApp se volvieron ventas?»— se contesta con un conteo,
+    # y sirve igual para los de un solo uso. Es un CÓDIGO, no una persona: no dice
+    # de quién es (por eso el prefijo público es de la casa, no del distribuidor).
+    coupon_code: str = ''
     commission: float = 0               # tajada del VENDEDOR en esta orden (MXN) — compat
     # Pirámide: reparto completo bloqueado al crear la orden. Cada fila es
     # {distributor_id, role: 'seller'|'override', rate, amount(MXN)}. Los reportes
@@ -696,3 +710,24 @@ class TrackEvent(BaseModel):
     fbclid: str = ''
     referrer: str = ''
     landing_path: str = ''
+    # ---- Los tres datos que Christián autorizó el 2026-07-31 ----
+    #
+    # ⛔ POR QUÉ HACÍAN FALTA. Hasta hoy el sitio no guardaba NADA de esto, así que
+    # dos preguntas de dinero no se podían contestar con datos propios:
+    #   1. «¿la mayoría entra por teléfono?» — sólo se deducía de dónde se compran
+    #      los anuncios, o sea que era adivinar;
+    #   2. «¿sirvió adelgazar la portada móvil?» — sin el corte por dispositivo, el
+    #      8.7% de visita→ficha es un promedio que esconde justo lo que se cambió.
+    #
+    # 🔒 PRIVACIDAD (misma orden de Christián). Sólo lo AGREGADO: la categoría del
+    # aparato y el ancho. NO se guarda IP, NO se guarda el User-Agent, NO se calcula
+    # huella digital del visitante. `device` viaja YA CLASIFICADO desde el navegador
+    # precisamente para no tener que guardar aquí el texto del User-Agent —que sí es
+    # huella— y clasificarlo después.
+    device: str = ''       # telefono | tableta | computadora | '' (eventos de antes de hoy)
+    screen_w: int = 0      # ancho del navegador en px: 375 en un teléfono, 1400 en un monitor
+    # El `?ref=` del distribuidor. Ya existía en el carrito (`np_dist_code`) pero
+    # nunca llegaba a la medición: una visita traída por María era indistinguible de
+    # una visita directa hasta que alguien COMPRABA. Es un CÓDIGO, no una persona:
+    # no revela de quién es (regla de los códigos sin nombre, 2026-07-31).
+    ref_code: str = ''
