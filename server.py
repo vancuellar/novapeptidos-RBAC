@@ -1676,51 +1676,85 @@ async def shipping_quote(payload: ShippingQuoteRequest):
     }
 
 
+def _opcion_express(opciones):
+    """La opción EXPRESS de una lista ya filtrada y ordenada (días, luego precio):
+    la primera que promete 1-2 días. Si ninguna lo promete, la más rápida que haya
+    — al cliente se le cumple con lo mejor que exista ese día."""
+    for o in (opciones or []):
+        try:
+            d = int(o.get('dias') or 0)
+        except (TypeError, ValueError):
+            d = 0
+        if 0 < d <= envios.DIAS_MAXIMOS_EXPRESS:
+            return o
+    return (opciones or [None])[0]
+
+
 async def _envio_del_pedido(payload, paid_merchandise, pflags):
     """Cuánto se le cobra de envío a este pedido, y con qué cotización.
 
     ⛔ EL PRECIO LO PONE EL SERVIDOR. El monto de envío que venga en la petición se
-    ignora por completo, igual que se ignoran los precios de los productos: sale de
-    la cotización que el propio servidor guardó, y solo si sigue siendo válida para
-    este CP y este peso. Si no lo es, se vuelve a cotizar aquí mismo.
+    ignora por completo, igual que se ignoran los precios de los productos.
+
+    ✅ LA ESTRATEGIA DEL 2026-08-02 (Christián): el cliente ya no escoge paquetería
+    — escoge el TIPO. El cobro es POLÍTICA, no cotización:
+
+        estándar  = $250 abajo de la mínima; desde $2,500 INCLUIDO, con el piso
+                    de absorción (la casa come hasta $250 o el 5%, lo mayor;
+                    el excedente de una guía monstruosa lo paga el cliente);
+        express   = lo anterior + $150, SIEMPRE.
+
+    Skydropx se sigue consultando, pero POR DENTRO: para saber lo que la guía
+    cuesta de verdad (el candado del excedente y los reportes de absorción) y
+    para dejar apuntado qué servicio comprar al pagarse (rápido si es express).
+    Si la paquetería no contesta, la política cobra igual con el costo estimado
+    de la casa — el cobro ya no depende de que un tercero conteste a tiempo.
 
     Devuelve (lo que paga el cliente, lo que se guarda en el pedido).
     """
+    es_express = bool(getattr(payload, 'shipping_express', False))
+    extra = envios.EXTRA_EXPRESS_MXN if es_express else 0.0
+    if not COBRAR_ENVIO:
+        return 0, {}
     if not envio_se_cotiza():
         # El camino de siempre: la tarifa plana dormida detrás de COBRAR_ENVIO. La
         # línea se escribe TAL CUAL porque hay pruebas que la buscan literal — es el
         # candado que impide que alguien vuelva a dejar el envío sin interruptor.
         shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0
-        return shipping, {}
+        return round(shipping + extra), ({'express': True} if es_express else {})
     cp = (payload.customer.postal_code or '').strip()
     paquete = envios.paquete_del_pedido(payload.items, pflags)
-    opcion = await _cotizacion_valida(payload.shipping_quote_id, cp, paquete['peso_kg'])
-    if not opcion:
-        # Cotización vencida, ausente, de otro CP o de otro peso: se cotiza de nuevo
-        # AQUÍ, con el carrito de verdad. Se toma la más barata de las permitidas.
-        try:
-            frescas = skydropx.cotizar(cp, paquete, destino={
-                'province': getattr(payload.customer, 'state', '') or '',
-                'city': getattr(payload.customer, 'city', '') or '',
-                'country': getattr(payload.customer, 'country', 'MX') or 'MX'})
-        except Exception:
-            logger.exception('Skydropx: no se pudo recotizar el pedido a %s', cp)
-            frescas = []
-        if not frescas:
-            return 0, {}                # sin cotización no se inventa un cargo
-        doc = await _guardar_cotizacion(cp, paquete, frescas)
-        opcion = dict(doc['opciones'][0], peso_kg=paquete['peso_kg'], paquete=paquete)
-    costo = float(opcion.get('precio') or 0)
-    cobrado = envios.cobro_de_envio_al_cliente(costo, paid_merchandise, FREE_SHIPPING_FROM)
+    try:
+        frescas = skydropx.cotizar(cp, paquete, destino={
+            'province': getattr(payload.customer, 'state', '') or '',
+            'city': getattr(payload.customer, 'city', '') or '',
+            'country': getattr(payload.customer, 'country', 'MX') or 'MX'})
+    except Exception:
+        logger.exception('Skydropx: no se pudo cotizar el pedido a %s', cp)
+        frescas = []
+    # Estándar: la MÁS BARATA de las permitidas (todas cumplen el plazo de 5 días;
+    # el cliente paga política, así que el ahorro de la guía es de la casa).
+    # Express: la primera que promete 1-2 días.
+    if es_express:
+        opcion = _opcion_express(frescas) or {}
+    else:
+        opcion = (min(frescas, key=lambda o: float(o.get('precio') or 0))
+                  if frescas else {})
+    # Sin tarifas no se inventa un costo de guía: se usa el estimado de la casa.
+    costo = float(opcion.get('precio') or 0) or float(COSTO_GUIA_ESTIMADO)
+    base = envios.cobro_de_envio_al_cliente(costo, paid_merchandise, FREE_SHIPPING_FROM,
+                                            tarifa_plana=SHIPPING_FLAT)
+    cobrado = round(base + extra)
     guardado = {
         'carrier': opcion.get('paqueteria', ''),
         'service': opcion.get('servicio', ''),
         'service_code': opcion.get('servicio_codigo', ''),
         'days': opcion.get('dias', 0),
+        'express': es_express,
         'cost': round(costo, 2),
         'charged': cobrado,
-        'peso_kg': opcion.get('peso_kg'),
-        'paquete': opcion.get('paquete') or paquete,
+        'peso_kg': paquete.get('peso_kg'),
+        'paquete': paquete,
         'postal_code': cp,
         'quoted_at': now_iso(),
     }
@@ -2703,8 +2737,11 @@ async def comprar_guia_del_pedido(order: dict, avisar: bool = True) -> dict | No
         # Doble cotizador: pregunta en Skydropx y en enviosinternacionales.com y compra
         # la más barata de las permitidas. Con uno solo encendido se comporta como antes.
         # ⛔ FRENO 2 va aquí dentro, entre cotizar y pagar.
-        guia = paqueterias.guia_para(destino, paquete, quote.get('service_code', ''),
-                                     tope_mxn=envios.TOPE_GUIA_AUTOMATICA_MXN)
+        # El tope de gasto depende del TIPO de envío: express paga guías más caras
+        # ($600) porque el cliente ya pagó su extra; estándar se queda en $400.
+        guia = paqueterias.guia_para(
+            destino, paquete, quote.get('service_code', ''),
+            tope_mxn=envios.tope_guia_automatica(order.get('shipping_express')))
     except paqueterias.TopeDeGastoExcedido as tope:
         logger.warning('Envio: la guia de %s cuesta $%s y el tope automatico es $%s. '
                        'NO se compra; se le pregunta a Christian.',
@@ -3831,7 +3868,10 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # `shipping_absorbed` para que el regalo se pueda sumar después. Ya pasó el piso
     # de rentabilidad de arriba: aquí sólo se aplica lo que allá se autorizó.
     if _envio_de_cortesia:
-        shipping = 0
+        # La cortesía regala el envío ESTÁNDAR. Si el cliente además quiere
+        # express, el extra sí se cobra — el regalo no se agranda solo (2026-08-02).
+        shipping = round(envios.EXTRA_EXPRESS_MXN) \
+            if getattr(payload, 'shipping_express', False) else 0
     total = paid_merchandise + shipping
     # Lo que la guia cuesta DE VERDAD. Sin cotizacion de Skydropx no es cero: es la
     # tarifa plana, que es lo que la paqueteria cobra igual. Se calculaba con
@@ -3933,6 +3973,7 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         gift_shipping=bool(_envio_de_cortesia),
         shared_cart_token=(getattr(payload, 'shared_cart_token', '') or '')[:64],
         shipping=shipping,
+        shipping_express=bool(getattr(payload, 'shipping_express', False)),
         shipping_quote=shipping_quote,
         shipping_cost=costo_guia,
         # Lo que la casa se comió del envío. Sin este número nadie sabe cuánto
@@ -4215,6 +4256,11 @@ async def payments_config():
             'free_shipping_from': FREE_SHIPPING_FROM,
             'shipping_cap_rate': TOPE_ENVIO_SOBRE_COMPRA,
             'shipping_cost_estimate': COSTO_GUIA_ESTIMADO,
+            # LA ESTRATEGIA DEL 2026-08-02: el piso de absorción (la casa come
+            # hasta $250 o el 5%, lo mayor) y el extra del express. La pantalla
+            # REPITE la cuenta con estos números; el cobro lo hace el servidor.
+            'shipping_absorb_floor': envios.PISO_ABSORCION_MXN,
+            'shipping_express_extra': envios.EXTRA_EXPRESS_MXN,
             # Cotización real por CP y peso (Skydropx). Apagada: el checkout ni
             # pregunta y la pantalla se ve EXACTAMENTE como hoy.
             'shipping_quote_enabled': envio_se_cotiza()}

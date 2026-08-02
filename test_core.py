@@ -1327,16 +1327,17 @@ def test_envio_se_cobra_en_pedidos_chicos():
 
 
 def test_envio_gratis_desde_el_umbral():
-    """⚠️ OJO CON LO QUE "GRATIS" QUIERE DECIR DESDE EL 2026-07-31.
+    """GRATIS PAREJO DESDE $2,500 (Christián, 2026-08-02).
 
-    La compra mínima ($2,500) ya no regala el envío: PRENDE el beneficio. De ahí en
-    adelante la casa absorbe la guía hasta el 5% de lo que el cliente pagó y él pone
-    la diferencia. Con una guía de $250, el 5% no la tapa hasta los $5,000 — así que
-    entre $2,500 y $5,000 el cobro es parcial y baja solo conforme sube el ticket."""
-    assert shipping_for(FREE_SHIPPING_FROM) == 125       # antes: 0
-    assert shipping_for(3000) == 100
-    assert shipping_for(5000) == 0                       # aquí sí, gratis de verdad
+    El piso de absorción —la casa come hasta $250 o el 5%, lo mayor— tapa la guía
+    normal completa desde la compra mínima. La franja parcial de $2,500-$5,000 que
+    dejó el 5% a secas ya no existe; el excedente sólo aparece con guías monstruosas
+    (ver test_envios.py)."""
+    assert shipping_for(FREE_SHIPPING_FROM) == 0
+    assert shipping_for(3000) == 0
+    assert shipping_for(5000) == 0
     assert shipping_for(10000) == 0
+    assert shipping_for(3000, costo_real=600) == 350     # el candado del monstruo
 
 
 def test_envio_se_mide_sobre_lo_que_el_cliente_PAGA():
@@ -1773,11 +1774,15 @@ def test_la_casa_nunca_absorbe_mas_del_tope_de_la_compra():
     assert shipping_for(FREE_SHIPPING_FROM - 1) == SHIPPING_FLAT
     assert shipping_for(0) == SHIPPING_FLAT
     # De la mínima para arriba, lo que la casa pone nunca pasa de su tope.
+    # Desde el 2026-08-02 el tope lleva PISO: max($250, 5% de la compra). La casa
+    # nunca absorbe más que eso, con la guía que sea.
     for compra in (FREE_SHIPPING_FROM, 3000, 4000, 5000, FREE_SHIPPING_FROM * 4, 50000):
-        cobrado = shipping_for(compra)
-        absorbido = envios.envio_que_absorbe_la_casa(COSTO_GUIA_ESTIMADO, cobrado)
-        assert absorbido <= compra * TOPE_ENVIO_SOBRE_COMPRA + 1e-9, \
-            f'en una compra de ${compra:,} la casa absorbe ${absorbido:,.0f}: pasa del tope'
+        for guia in (COSTO_GUIA_ESTIMADO, 600, 4000):
+            cobrado = shipping_for(compra, costo_real=guia)
+            absorbido = envios.envio_que_absorbe_la_casa(guia, cobrado)
+            tope = max(envios.PISO_ABSORCION_MXN, compra * TOPE_ENVIO_SOBRE_COMPRA)
+            assert absorbido <= tope + 1e-9, \
+                f'en una compra de ${compra:,} la casa absorbe ${absorbido:,.0f}: pasa del tope'
     # Y donde el tope ya tapa la guía completa, el cliente no paga nada.
     assert shipping_for(COSTO_GUIA_ESTIMADO / TOPE_ENVIO_SOBRE_COMPRA) == 0
 
@@ -1799,8 +1804,8 @@ def test_el_pedido_cobra_250_parejo():
     assert COBRAR_ENVIO is True, 'el pedido dejó de cobrar envío sin que nadie lo pidiera'
     assert SHIPPING_FLAT == 250
     assert shipping_for(1000) == 250        # pedido chico: paga la tarifa plana
-    assert shipping_for(3000) == 100        # arriba de $2,500: la casa pone su 5% ($150)
-    assert shipping_for(5000) == 0          # aquí el 5% ya tapa la guía completa
+    assert shipping_for(3000) == 0          # desde $2,500: incluido (piso de absorción)
+    assert shipping_for(5000) == 0
 
 
 def test_el_cobro_del_pedido_respeta_el_interruptor():
@@ -1831,9 +1836,13 @@ def test_el_cobro_del_pedido_respeta_el_interruptor():
         'la compra automática de guías se apagó sin que nadie lo pidiera'
     assert envios.TOPE_GUIA_AUTOMATICA_MXN == 400, \
         'el tope de gasto automático cambió: eso es una decisión de dinero de Christián'
+    # 2026-08-02: el express tiene SU tope ($600, decidido por Christián) y la
+    # compra automática pasa por `tope_guia_automatica(...)`, que elige entre los dos.
+    assert envios.TOPE_GUIA_AUTOMATICA_EXPRESS_MXN == 600, \
+        'el tope express cambió: eso es una decisión de dinero de Christián'
     assert envios.empaques(), \
         'sin tabla de empaques la guía se cotizaría contra medidas inventadas'
-    assert 'tope_mxn=envios.TOPE_GUIA_AUTOMATICA_MXN' in src, \
+    assert 'tope_mxn=envios.tope_guia_automatica(' in src, \
         'la compra automática dejó de pasar el tope de gasto: puede comprar una guía de $900 sola'
     assert 'empaque = envios.empaque_para(piezas)' in src, \
         'la compra automática dejó de mirar en qué empaque cabe: vuelve el recobro por sobrepeso'
@@ -1849,8 +1858,8 @@ def test_el_sitio_se_entera_de_que_no_se_cobra_envio():
 def test_la_regla_de_envio_sigue_viva_para_el_dia_que_se_reactive():
     from server import shipping_for, SHIPPING_FLAT, FREE_SHIPPING_FROM
     assert shipping_for(FREE_SHIPPING_FROM - 1) == SHIPPING_FLAT
-    # Cruzar la mínima ya no vale $0: vale que la casa empiece a poner su 5%.
-    assert 0 < shipping_for(FREE_SHIPPING_FROM) < SHIPPING_FLAT
+    # Cruzar la mínima vale INCLUIDO (2026-08-02): el piso de absorción tapa la guía.
+    assert shipping_for(FREE_SHIPPING_FROM) == 0
 
 
 # --------------------------------------------------------------------------
@@ -2146,7 +2155,14 @@ def test_el_navegador_no_puede_poner_el_envio_del_pedido():
     # El monto sigue saliendo del servidor: la tarifa plana con su interruptor, o la
     # cotización que el propio servidor guardó y revalidó.
     assert 'shipping = shipping_for(' in envio, 'el envío ya no lo calcula el servidor'
-    assert '_cotizacion_valida(' in envio, 'la cotización guardada ya no se revalida'
+    # 2026-08-02: ya no hay cotización elegida por el cliente que revalidar — el
+    # cobro es POLÍTICA (`cobro_de_envio_al_cliente` con la tarifa de la casa) y
+    # Skydropx sólo aporta el COSTO real. Lo que se vigila es que la política siga
+    # siendo la que cobra.
+    assert 'envios.cobro_de_envio_al_cliente(' in envio, \
+        'el envío dejó de salir de la política de la casa'
+    assert 'tarifa_plana=SHIPPING_FLAT' in envio, \
+        'abajo de la mínima dejó de cobrarse la tarifa de la casa'
     assert 'await _envio_del_pedido(' in cuerpo, 'el pedido ya no le pregunta al servidor'
 
 

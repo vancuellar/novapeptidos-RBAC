@@ -255,6 +255,11 @@ class OrderCreate(BaseModel):
     # servidor va por el precio a la cotización que ÉL guardó. Ver `shipping_quotes`
     # en server.py. Lo que el navegador mande en `shipping` se sigue ignorando.
     shipping_quote_id: Optional[str] = None
+    # ⛔ EL CLIENTE YA NO ESCOGE PAQUETERÍA (Christián, 2026-08-02): escoge el TIPO.
+    # ESTÁNDAR (3-5 días hábiles, $250 o incluido según el importe) o EXPRESS
+    # (1-2 días hábiles, +$150 SIEMPRE). Del navegador viaja sólo esta bandera;
+    # el monto lo pone el servidor con la regla de la casa (`_envio_del_pedido`).
+    shipping_express: bool = False
     # EL CARRITO COMPARTIDO que le mandó su distribuidora por WhatsApp. Viaja el
     # TOKEN, nunca el regalo ni su valor: el servidor abre el documento, revalida el
     # obsequio contra el ROI de ESTE pedido y sólo entonces lo aplica. Un token
@@ -326,6 +331,10 @@ class Order(BaseModel):
     gift_shipping: bool = False         # la guía fue de cortesía
     shared_cart_token: str = ''
     shipping: float
+    # El TIPO de envío que eligió el cliente (2026-08-02): express = 1-2 días
+    # hábiles con su extra ya cobrado en `shipping`. Lo lee la compra automática
+    # de la guía (elige servicio rápido y su tope de gasto es el de express).
+    shipping_express: bool = False
     total: float
     status: str = 'pendiente'   # pendiente | confirmado | enviado | entregado | cancelado
     # ⛔ PAGADO ES OTRA COSA QUE ENTREGADO (Christián, 2026-07-29).

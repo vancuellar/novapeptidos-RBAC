@@ -300,16 +300,16 @@ def test_arriba_de_la_minima_y_envio_barato_sale_gratis(entorno):
 
 def test_arriba_de_la_minima_con_envio_caro_el_cliente_paga_la_diferencia(entorno,
                                                                           monkeypatch):
-    """$3,000 de mercancía con una guía de $600: la casa pone su 5% ($150) y el
-    cliente los otros $450. Es la regla que dictó Christián, y aquí se ve en pesos."""
+    """$3,000 de mercancía con una guía de $600: la casa pone su PISO ($250 — el
+    mayor entre $250 y el 5%, regla del 2026-08-02) y el cliente los otros $350."""
     caras = [dict(TARIFAS[0], precio=600.0)]
     monkeypatch.setattr(paqueterias, 'cotizar_en_todos',
                         lambda d, p, **k: {'opciones': [dict(t) for t in caras],
                                            'proveedores': PROVEEDORES, 'cotizaciones': {}})
     d = cotiza(entorno, ADMIN, RUTA_ADMIN, mode='manual', peso_kg=1,
                merchandise_mxn=3000).json()
-    assert d['cobro']['cliente_paga'] == 450
-    assert d['casa']['absorbe'] == 150.0
+    assert d['cobro']['cliente_paga'] == 350
+    assert d['casa']['absorbe'] == 250.0
     assert d['casa']['fuera_de_tope'] == 0
 
 

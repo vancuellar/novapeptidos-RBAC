@@ -58,6 +58,16 @@ COMPRAR_GUIA_AL_PAGAR = True
 # escondido dentro de una función.
 TOPE_GUIA_AUTOMATICA_MXN = 400.0
 
+# El mismo freno para un pedido EXPRESS (Christián, 2026-08-02): las guías de
+# 1-2 días cuestan más y $400 las dejaría casi todas esperando su visto bueno.
+# El estándar se queda en $400.
+TOPE_GUIA_AUTOMATICA_EXPRESS_MXN = 600.0
+
+
+def tope_guia_automatica(es_express: bool) -> float:
+    """Cuánto puede gastar el servidor solo en UNA guía, según el tipo de envío."""
+    return TOPE_GUIA_AUTOMATICA_EXPRESS_MXN if es_express else TOPE_GUIA_AUTOMATICA_MXN
+
 
 # ------------------------------------------------------------------- el peso
 # ⚠️ PENDIENTE DE CHRISTIAN: capturar el peso REAL de cada producto.
@@ -500,6 +510,27 @@ COMPRA_MINIMA_ENVIO_GRATIS = 2500
 # Para cambiarlo: esta línea, nada más. No hay otro lugar donde se decida.
 CLIENTE_PAGA_EL_ENVIO_COMPLETO_AL_PASAR_EL_TOPE = False
 
+# ✅ LA ESTRATEGIA DEL 2026-08-02, dictada por Christián con todas sus letras:
+#
+#   · El cliente YA NO ESCOGE paquetería: la casa la elige. Él ve dos cosas:
+#     ESTÁNDAR (3-5 días hábiles) y EXPRESS (1-2 días hábiles).
+#   · Estándar: $250 parejo abajo de la compra mínima; INCLUIDO desde $2,500.
+#   · EL PISO DE ABSORCIÓN: desde la mínima, la casa absorbe la guía hasta
+#     $250 **o el 5% de la compra, LO QUE SEA MAYOR**. Con guías reales de
+#     $139-$165 esto es «gratis parejo desde $2,500»; el excedente sólo existe
+#     para la guía monstruosa que un día salga en $800 o $4,000 (su ejemplo:
+#     compra de $40,000 → la casa absorbe hasta $2,000).
+#   · Express: EXTRA_EXPRESS_MXN encima de lo anterior, y SE COBRA SIEMPRE,
+#     incluido el pedido con envío gratis. ⛔ Nunca se promete «1 día»: en
+#     México no existe (sus palabras); la realidad son 36-48 horas hábiles y
+#     por eso la promesa en pantalla es «1-2 días hábiles».
+PISO_ABSORCION_MXN = 250.0
+EXTRA_EXPRESS_MXN = 150.0
+
+# El plazo que define un servicio EXPRESS al elegir la guía (días prometidos por
+# la paquetería). El estándar sigue siendo DIAS_MAXIMOS_ENTREGA (5) de skydropx.py.
+DIAS_MAXIMOS_EXPRESS = 2
+
 
 def cobro_de_envio_al_cliente(costo_envio: float, mercancia_pagada: float,
                               envio_gratis_desde: float,
@@ -547,7 +578,13 @@ def cobro_de_envio_al_cliente(costo_envio: float, mercancia_pagada: float,
         # Una tarifa en negativo o con basura NO puede dejar el envío regalado: se
         # cae al costo de la guía, que es el número que protege a la casa.
         return round(plana) if plana >= 0 else round(costo)
-    tope = mercancia * TOPE_ENVIO_SOBRE_COMPRA
+    # EL PISO DE ABSORCIÓN (Christián, 2026-08-02): la casa absorbe hasta $250 o
+    # el 5% de la compra, lo que sea MAYOR. Sin el piso, entre $2,500 y $5,000
+    # había una franja donde el cliente pagaba un pico ($40-$125) y el «gratis
+    # desde $2,500» era letra chica. Con el piso, la guía normal ($139-$250) sale
+    # gratis parejo desde la mínima, y el 5% sólo entra a proteger a la casa
+    # cuando la guía es monstruosa en un pedido grande.
+    tope = max(PISO_ABSORCION_MXN, mercancia * TOPE_ENVIO_SOBRE_COMPRA)
     if costo <= tope:
         return 0.0
     if CLIENTE_PAGA_EL_ENVIO_COMPLETO_AL_PASAR_EL_TOPE:
@@ -558,16 +595,17 @@ def cobro_de_envio_al_cliente(costo_envio: float, mercancia_pagada: float,
 def tope_que_absorbe_la_casa(mercancia_pagada: float) -> float:
     """El MÁXIMO de envío que la casa está dispuesta a comerse en un pedido.
 
-    Es el 5% de lo que el cliente pagó de mercancía, y ni un peso más (era 10% hasta
-    el 2026-07-31). Palabras de Christian: «si una compra por 2,500 genera un costo de
-    envío de $500 ni en pedo lo pago». Un pedido de $179 tiene un tope de $8.95 — por
-    eso nunca puede llevar envío gratis.
+    Desde el 2026-08-02: $250 o el 5% de lo que pagó de mercancía, LO QUE SEA
+    MAYOR (el mismo piso de `cobro_de_envio_al_cliente` — si este espejo no lo
+    llevara, los reportes gritarían «fuera de tope» por guías que la regla nueva
+    sí absorbe). Palabras de Christian sobre el 5%: «si una compra por 2,500
+    genera un costo de envío de $500 ni en pedo lo pago».
     """
     try:
         mercancia = max(0.0, float(mercancia_pagada or 0))
     except (TypeError, ValueError):
         mercancia = 0.0
-    return round(mercancia * TOPE_ENVIO_SOBRE_COMPRA, 2)
+    return round(max(PISO_ABSORCION_MXN, mercancia * TOPE_ENVIO_SOBRE_COMPRA), 2)
 
 
 def envio_que_absorbe_la_casa(costo_envio: float, cobrado_al_cliente: float) -> float:

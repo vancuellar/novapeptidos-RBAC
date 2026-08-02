@@ -506,34 +506,33 @@ def test_compra_grande_con_envio_barato_va_gratis():
     assert envios.cobro_de_envio_al_cliente(250, 5000, 2500) == 0
 
 
-def test_el_tope_del_5_por_ciento_es_exacto():
-    assert envios.cobro_de_envio_al_cliente(150, 3000, 2500) == 0      # justo el 5%
-    assert envios.cobro_de_envio_al_cliente(151, 3000, 2500) > 0       # un peso más, ya no
+def test_el_piso_de_absorcion_es_250_o_el_5_por_ciento_lo_mayor():
+    """LA REGLA DEL 2026-08-02 (Christián): desde la mínima, la casa absorbe la guía
+    hasta $250 o el 5% de la compra, LO QUE SEA MAYOR. Con guías reales de $139-$250
+    eso es «gratis parejo desde $2,500» — la franja parcial de antes ya no existe."""
+    assert envios.PISO_ABSORCION_MXN == 250
+    assert envios.cobro_de_envio_al_cliente(250, 2500, 2500) == 0      # piso: 250
+    assert envios.cobro_de_envio_al_cliente(250, 3000, 2500) == 0
+    assert envios.cobro_de_envio_al_cliente(250, 4000, 2500) == 0
+    assert envios.cobro_de_envio_al_cliente(165, 2600, 2500) == 0      # la guía real
+    # El piso es exacto: $251 de guía en una compra chica ya deja $1 al cliente.
+    assert envios.cobro_de_envio_al_cliente(251, 2500, 2500) == 1
 
 
-def test_entre_la_minima_y_el_5_por_ciento_el_cobro_es_PARCIAL():
-    """⚠️ LA CONSECUENCIA QUE HAY QUE TENER PRESENTE. Con una guía de $250, bajar el
-    tope al 5% mueve el "gratis de verdad" de $2,500 a $5,000. En medio no se cobra
-    todo ni nada: se cobra la diferencia, y baja sola conforme sube el ticket."""
-    assert envios.cobro_de_envio_al_cliente(250, 2500, 2500) == 125    # casa: 125
-    assert envios.cobro_de_envio_al_cliente(250, 3000, 2500) == 100    # casa: 150
-    assert envios.cobro_de_envio_al_cliente(250, 4000, 2500) == 50     # casa: 200
-    assert envios.cobro_de_envio_al_cliente(250, 5000, 2500) == 0      # casa: 250
-
-
-def test_arriba_del_tope_el_cliente_paga_SOLO_la_diferencia():
-    """DECIDIDO por Christian el 2026-07-28 y ratificado el 2026-07-31: "el cliente
-    paga la diferencia y la casa absorbe hasta el [tope] del costo del envío máximo".
-    Pedido de $3,000 con envío de $600: la casa pone $150 (su 5%) y el cliente $450."""
+def test_arriba_del_piso_el_cliente_paga_SOLO_la_diferencia():
+    """El candado del paquete monstruoso (su ejemplo: compra de $40,000 con guía de
+    $4,000 → la casa absorbe hasta $2,000 y el cliente pone el resto). En compras
+    donde el 5% no llega a $250, manda el piso de $250."""
     assert envios.CLIENTE_PAGA_EL_ENVIO_COMPLETO_AL_PASAR_EL_TOPE is False
-    assert envios.cobro_de_envio_al_cliente(600, 3000, 2500) == 450
+    assert envios.cobro_de_envio_al_cliente(4000, 40000, 2500) == 2000   # casa: 2000 (5%)
+    assert envios.cobro_de_envio_al_cliente(600, 3000, 2500) == 350      # casa: 250 (piso)
 
 
-def test_la_casa_nunca_absorbe_mas_del_5_por_ciento():
-    """Es el otro lado de la misma regla: por cara que salga la guía, la casa se
-    queda topada en el 5% de la compra."""
-    assert envios.cobro_de_envio_al_cliente(2000, 3000, 2500) == 1850   # casa: 150
-    assert envios.cobro_de_envio_al_cliente(160, 3000, 2500) == 10      # casa: 150
+def test_la_casa_nunca_absorbe_mas_del_piso():
+    """El otro lado de la misma regla: por cara que salga la guía, la casa se queda
+    topada en max($250, 5% de la compra)."""
+    assert envios.cobro_de_envio_al_cliente(2000, 3000, 2500) == 1750   # casa: 250
+    assert envios.cobro_de_envio_al_cliente(2000, 10000, 2500) == 1500  # casa: 500 (5%)
 
 
 def test_la_tarifa_plana_es_un_PRECIO_y_solo_manda_abajo_de_la_minima():
@@ -543,9 +542,9 @@ def test_la_tarifa_plana_es_un_PRECIO_y_solo_manda_abajo_de_la_minima():
     # Abajo de la mínima manda la tarifa, no el costo.
     assert envios.cobro_de_envio_al_cliente(400, 879, 2500, tarifa_plana=219) == 219
     assert envios.cobro_de_envio_al_cliente(80, 879, 2500, tarifa_plana=219) == 219
-    # Arriba de la mínima la tarifa no pinta nada: ahí manda el 5% contra el costo real.
+    # Arriba de la mínima la tarifa no pinta nada: ahí manda el piso contra el costo real.
     assert envios.cobro_de_envio_al_cliente(120, 3000, 2500, tarifa_plana=219) == 0
-    assert envios.cobro_de_envio_al_cliente(250, 3000, 2500, tarifa_plana=219) == 100
+    assert envios.cobro_de_envio_al_cliente(600, 3000, 2500, tarifa_plana=219) == 350
     # Sin tarifa: el comportamiento de siempre, se cobra la guía completa.
     assert envios.cobro_de_envio_al_cliente(400, 879, 2500) == 400
     # Y una tarifa con basura no puede dejar el envío en un número raro.
@@ -594,35 +593,41 @@ PFLAGS = {'a': {'id': 'a', 'name': 'BPC-157'}}
 
 
 def test_el_envio_que_manda_el_navegador_se_ignora(db, con_llave, monkeypatch):
-    """El pedido dice que el envío cuesta $1. El servidor cobra los $52.45 que él
-    mismo cotizó y guardó. Es la regla que ya costó dinero cuando no existía."""
+    """El pedido dice que el envío cuesta $1. El servidor cobra la POLÍTICA de la
+    casa (2026-08-02): $250 parejo abajo de la mínima. Y la guía real ($52.45, la
+    más barata de las permitidas) queda guardada como COSTO, que es otro número."""
     _falsear_skydropx(monkeypatch)
     payload = _pedido(shipping_mentiroso=1)
     cobrado, guardado = asyncio.run(server._envio_del_pedido(payload, 1000, PFLAGS))
-    assert cobrado == 52                       # el precio real, no el del navegador
-    assert guardado['cost'] == 52.45
-    assert guardado['carrier'] == 'FedEx'
+    assert cobrado == 250                      # la política, no el navegador
+    assert guardado['cost'] == 52.45           # lo que la guía cuesta de verdad
+    assert guardado['express'] is False
 
 
 def test_un_id_de_cotizacion_inventado_no_regala_el_envio(db, con_llave, monkeypatch):
     _falsear_skydropx(monkeypatch)
     payload = _pedido(quote_id='me-lo-invente', shipping_mentiroso=0)
     cobrado, _ = asyncio.run(server._envio_del_pedido(payload, 1000, PFLAGS))
-    assert cobrado == 52                       # recotiza; no cobra cero por creerle
+    assert cobrado == 250                      # la política; no cobra cero por creerle
 
 
-def test_la_cotizacion_guardada_manda_sobre_la_recotizacion(db, con_llave, monkeypatch):
-    """El cliente eligió el Express de Estafeta ($186.90). Se le cobra ESO, no la
-    más barata: eligió y el servidor respeta lo que él mismo le enseñó."""
+def test_el_cliente_ya_no_escoge_paqueteria_escoge_el_tipo(db, con_llave, monkeypatch):
+    """LA ESTRATEGIA DEL 2026-08-02: el id de cotización que mande el navegador ya
+    no decide el precio — el cliente escoge ESTÁNDAR o EXPRESS y la casa escoge la
+    paquetería. Express: +$150 SIEMPRE, y el servicio apuntado es uno de 1-2 días."""
     _falsear_skydropx(monkeypatch)
-    quote = asyncio.run(server._guardar_cotizacion(
-        '64000', envios.paquete_del_pedido(_pedido().items, PFLAGS),
-        skydropx.cotizar('64000', {'peso_kg': 1})))
-    express = next(o for o in quote['opciones'] if o['precio'] == 186.9)
-    payload = _pedido(quote_id=express['opcion_id'])
-    cobrado, guardado = asyncio.run(server._envio_del_pedido(payload, 1000, PFLAGS))
-    assert cobrado == 187
-    assert guardado['service_code'] == 'estafeta_next_day'
+    normal = _pedido()
+    cobrado, guardado = asyncio.run(server._envio_del_pedido(normal, 1000, PFLAGS))
+    assert cobrado == 250
+    exp = _pedido()
+    exp.shipping_express = True
+    cobrado_exp, guardado_exp = asyncio.run(server._envio_del_pedido(exp, 1000, PFLAGS))
+    assert cobrado_exp == 400                  # 250 + 150
+    assert guardado_exp['express'] is True
+    assert 0 < int(guardado_exp['days'] or 0) <= envios.DIAS_MAXIMOS_EXPRESS
+    # Y en una compra con envío incluido, el extra se cobra igual.
+    incluido, _ = asyncio.run(server._envio_del_pedido(exp, 5000, PFLAGS))
+    assert incluido == 150
 
 
 def test_una_cotizacion_de_OTRO_codigo_postal_no_sirve(db, con_llave, monkeypatch):
@@ -666,10 +671,17 @@ def test_una_cotizacion_de_paqueteria_no_permitida_no_se_cobra(db, con_llave, mo
         quote['opciones'][0]['opcion_id'], '64000', 1.0)) is None
 
 
-def test_si_la_paqueteria_no_contesta_no_se_inventa_un_cargo(db, con_llave, monkeypatch):
+def test_si_la_paqueteria_no_contesta_la_politica_cobra_igual(db, con_llave, monkeypatch):
+    """Antes, con Skydropx caída, el pedido salía con envío $0 — la casa regalaba la
+    guía por una falla ajena. Con la política del 2026-08-02 el cobro no depende de
+    que un tercero conteste: manda la regla de la casa con su costo estimado."""
     _falsear_skydropx(monkeypatch, fallos={'/quotations': RuntimeError('caida')})
     cobrado, guardado = asyncio.run(server._envio_del_pedido(_pedido(), 1000, PFLAGS))
-    assert cobrado == 0 and guardado == {}
+    assert cobrado == 250                     # la tarifa de la casa, no $0
+    assert guardado['cost'] == server.COSTO_GUIA_ESTIMADO
+    # Y arriba de la mínima sigue saliendo incluido, como promete la página.
+    gratis, _ = asyncio.run(server._envio_del_pedido(_pedido(), 5000, PFLAGS))
+    assert gratis == 0
 
 
 def test_la_cotizacion_en_el_checkout_va_SIEMPRE_prendida():
@@ -1082,9 +1094,10 @@ def test_la_tarifa_que_se_cobra_y_el_costo_de_la_guia_son_DOS_numeros():
     gratis empezaría en $4,000 en vez de $5,000 sin que nadie lo decidiera."""
     assert server.SHIPPING_FLAT == 250          # lo que se COBRA abajo de la mínima
     assert server.COSTO_GUIA_ESTIMADO == 250    # lo que la guía CUESTA
-    # Bajar la tarifa NO mueve el punto donde el envío es gratis de verdad.
+    # Bajar la tarifa NO mueve el punto donde el envío es gratis de verdad, ni el
+    # piso de absorción: una guía de $600 deja $350 al cliente, con la tarifa que sea.
     assert envios.cobro_de_envio_al_cliente(250, 5000, 2500, tarifa_plana=200) == 0
-    assert envios.cobro_de_envio_al_cliente(250, 4000, 2500, tarifa_plana=200) == 50
+    assert envios.cobro_de_envio_al_cliente(600, 4000, 2500, tarifa_plana=200) == 350
 
 
 def test_los_numeros_de_envio_se_pueden_mover_sin_desplegar():
@@ -1110,36 +1123,39 @@ def test_un_pedido_de_179_NUNCA_lleva_envio_gratis():
     """$250 de guía sobre $179 de mercancía es el 140% del pedido."""
     assert server.shipping_for(179) == server.SHIPPING_FLAT
     assert envios.cobro_de_envio_al_cliente(250, 179, server.FREE_SHIPPING_FROM) == 250
-    assert envios.tope_que_absorbe_la_casa(179) == 8.95
+    # El tope de absorción sólo pinta ARRIBA de la mínima; abajo el pedido paga su
+    # tarifa. El piso de $250 no regala nada aquí (regla del 2026-08-02).
+    assert envios.tope_que_absorbe_la_casa(179) == 250
 
 
 def test_una_guia_cara_ya_no_se_regala_por_pasar_el_umbral():
-    """$2,600 de compra con una guía REAL de $500: el 19%. No va gratis.
-    Antes `shipping_for` devolvía 0 para cualquier compra arriba de $2,500,
-    costara lo que costara la guía."""
-    # La casa absorbe su 5% ($130) y el cliente paga los otros $370.
-    assert server.shipping_for(2600, costo_real=500) == 370
-    # Y ni siquiera la guía de $250 cabe ya en el 5% de $2,600 ($130).
-    assert server.shipping_for(2600, costo_real=250) == 120
-    assert server.shipping_for(2600, costo_real=120) == 0      # el 4.6%: sí cabe
+    """$2,600 de compra con una guía REAL de $500: la casa absorbe su piso ($250,
+    que es mayor que el 5% = $130) y el cliente paga los otros $250. Antes
+    `shipping_for` devolvía 0 para cualquier compra arriba de $2,500."""
+    assert server.shipping_for(2600, costo_real=500) == 250
+    # La guía normal cabe completa en el piso: gratis parejo desde la mínima.
+    assert server.shipping_for(2600, costo_real=250) == 0
+    assert server.shipping_for(2600, costo_real=120) == 0
 
 
 def test_lo_que_la_casa_absorbe_y_cuanto_se_pasa_del_tope():
-    # Pedido de $179, guía de $250, envío regalado: la casa se come los $250 enteros.
+    # Pedido de $179, guía de $250, envío regalado: la casa se come los $250 enteros
+    # — cabe en el piso, así que no cuenta como "fuera de tope" (ya no se grita).
     assert envios.envio_que_absorbe_la_casa(250, 0) == 250
-    assert envios.absorcion_fuera_de_tope(250, 179, 0) == 241.05    # 250 − 8.95
-    # Pedido de $3,000 con guía de $250 regalada: el 5% son $150, se pasa por $100.
-    assert envios.absorcion_fuera_de_tope(250, 3000, 0) == 100
-    # Pero cobrando lo que manda la política nueva ($100), la casa se queda en su tope.
-    assert envios.absorcion_fuera_de_tope(250, 3000, 100) == 0
+    assert envios.absorcion_fuera_de_tope(250, 179, 0) == 0
+    # Una guía de $500 regalada en un pedido de $179: se pasa del piso por $250.
+    assert envios.absorcion_fuera_de_tope(500, 179, 0) == 250
+    # Pedido de $3,000 con guía de $250 regalada: cabe en el piso, cero exceso.
+    assert envios.absorcion_fuera_de_tope(250, 3000, 0) == 0
     # Y si el cliente la pagó completa, la casa no absorbe nada.
     assert envios.envio_que_absorbe_la_casa(250, 250) == 0
     assert envios.absorcion_fuera_de_tope(250, 179, 250) == 0
 
 
 def test_las_funciones_del_tope_no_revientan_con_basura():
-    assert envios.tope_que_absorbe_la_casa(None) == 0
-    assert envios.tope_que_absorbe_la_casa('x') == 0
+    # Con basura, el tope cae al PISO de la casa ($250), nunca a un número roto.
+    assert envios.tope_que_absorbe_la_casa(None) == 250
+    assert envios.tope_que_absorbe_la_casa('x') == 250
     assert envios.envio_que_absorbe_la_casa(None, None) == 0
     assert envios.envio_que_absorbe_la_casa('a', 'b') == 0
     assert envios.absorcion_fuera_de_tope(None, None, None) == 0
@@ -1154,15 +1170,23 @@ def test_el_pedido_guarda_lo_que_la_casa_absorbe_aunque_no_cobre_envio():
     costo_guia = server.COSTO_GUIA_ESTIMADO
     assert cobrado == 250
     assert envios.envio_que_absorbe_la_casa(costo_guia, cobrado) == 0
-    # Pedido de $3,000: el cliente pone $100 y la casa absorbe sus $150 — su tope
-    # exacto. Y queda registrado, que es de lo que se trata.
-    assert server.shipping_for(3000) == 100
-    assert envios.envio_que_absorbe_la_casa(costo_guia, 100) == 150
-    assert envios.absorcion_fuera_de_tope(costo_guia, 3000, 100) == 0
-    # Pedido de $5,000: gratis de verdad, y los $250 los absorbe la casa dentro del 5%.
-    assert server.shipping_for(5000) == 0
+    # Pedido de $3,000: GRATIS PAREJO (2026-08-02) — la guía de $250 cabe en el
+    # piso de absorción y la casa se la come entera, registrada y dentro de regla.
+    assert server.shipping_for(3000) == 0
     assert envios.envio_que_absorbe_la_casa(costo_guia, 0) == 250
+    assert envios.absorcion_fuera_de_tope(costo_guia, 3000, 0) == 0
+    # Pedido de $5,000: igual de gratis, igual de registrado.
+    assert server.shipping_for(5000) == 0
     assert envios.absorcion_fuera_de_tope(costo_guia, 5000, 0) == 0
+
+
+def test_el_express_suma_su_extra_siempre():
+    """EXPRESS (Christián, 2026-08-02): +$150 encima del estándar, SIEMPRE — también
+    cuando el envío estándar va incluido. Y sus dos números viven en envios.py."""
+    assert envios.EXTRA_EXPRESS_MXN == 150
+    assert envios.DIAS_MAXIMOS_EXPRESS == 2
+    assert envios.tope_guia_automatica(False) == 400
+    assert envios.tope_guia_automatica(True) == 600
 
 
 # ==========================================================================
