@@ -5679,12 +5679,24 @@ async def distributor_quote_email(payload: QuoteEmailRequest,
     # Antes el `reply_to` era su correo personal: bastaba con que el cliente
     # picara "Responder" para ver de quién era el código. Ahora contesta la
     # atención de la casa, y al distribuidor se le avisa por dentro (abajo).
-    salio = await send_quote_email(
+    salio, motivo = await send_quote_email(
         payload.email, cotizacion,
         language=payload.language or dist.get('language'),
         reply_to=ATENCION_CORREO)
     if not salio:
-        raise HTTPException(status_code=502, detail='No se pudo enviar la cotización')
+        # ⛔ EL MOTIVO VIAJA A LA PANTALLA (Christián, 2026-08-01). «No se pudo,
+        # intenta de nuevo» era falso cuando el correo está APAGADO en el servidor:
+        # ahí no hay nada que reintentar. La pantalla lo dice con esas palabras y
+        # ofrece WhatsApp y el enlace del carrito, que sí funcionan.
+        if motivo == 'apagado':
+            raise HTTPException(status_code=503, detail={
+                'error': 'correo_apagado',
+                'mensaje': ('El envío de correo está apagado en el servidor '
+                            '(EMAIL_ENABLED). Comparte por WhatsApp o con el enlace '
+                            'del carrito mientras tanto.')})
+        raise HTTPException(status_code=502, detail={
+            'error': 'correo_rechazado',
+            'mensaje': 'El proveedor de correo rechazó el envío. No salió nada.'})
     # El aviso POR DENTRO: el distribuidor sabe que su cotización salió y a quién,
     # sin que su nombre ni su correo hayan viajado al cliente. Si la campanita
     # falla, la cotización ya salió y eso no se deshace.

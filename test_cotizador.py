@@ -539,3 +539,40 @@ def test_el_freno_suelta_al_pasar_la_hora(como, correo):
 def test_una_cotizacion_kilometrica_se_rechaza(como, correo):
     largo = dict(CUERPO, items=[{'product_id': 'p-reta', 'quantity': 1}] * 41)
     assert como(DIST).post(RUTA_CORREO, json=largo).status_code == 400
+
+
+# ------------------------------------------------- el correo no puede FINGIR
+# Christián, 2026-08-01: «Le di click a compartir por email pero NO recibí nada
+# en mi email.» El botón sí llamaba al servidor y el servidor sí contestaba que
+# no había salido — pero contestaba lo MISMO cuando el envío estaba apagado que
+# cuando el proveedor lo rechazaba, y la pantalla lo traducía a un «intenta de
+# nuevo» que en el primer caso es falso: reintentar no enciende nada.
+def test_con_el_correo_apagado_lo_dice_con_esas_palabras(como, monkeypatch):
+    """503 y `correo_apagado`. No es un fallo pasajero y no se arregla insistiendo."""
+    monkeypatch.setenv('EMAIL_ENABLED', 'false')
+    monkeypatch.setattr(server, '_COTIZACIONES_MANDADAS', {})
+    r = como(DIST).post(RUTA_CORREO, json=CUERPO)
+    assert r.status_code == 503
+    assert r.json()['detail']['error'] == 'correo_apagado'
+
+
+def test_si_el_proveedor_rechaza_se_dice_que_no_salio(como, monkeypatch):
+    """502 y `correo_rechazado`. Lo que NO puede pasar es contestar 'enviada'."""
+    import emails
+    monkeypatch.setenv('EMAIL_ENABLED', 'true')
+    monkeypatch.setattr(server, '_COTIZACIONES_MANDADAS', {})
+
+    def _truena(*_a, **_k):
+        raise RuntimeError('SES MessageRejected: address is not verified')
+
+    monkeypatch.setattr(emails, '_send_email_sync', _truena)
+    r = como(DIST).post(RUTA_CORREO, json=CUERPO)
+    assert r.status_code == 502
+    assert r.json()['detail']['error'] == 'correo_rechazado'
+
+
+def test_cuando_sale_de_verdad_contesta_que_salio(como, correo):
+    """La otra mitad de la promesa: si salió, se dice que salió."""
+    r = como(DIST).post(RUTA_CORREO, json=CUERPO)
+    assert r.status_code == 200 and r.json()['sent'] is True
+    assert correo['to'] == 'cliente@x.mx'

@@ -1635,14 +1635,23 @@ def _quote_email_html(copy, quote):
 
 
 async def send_quote_email(to_address, quote, language=None, reply_to=None):
-    """Manda la cotización al cliente del distribuidor. Devuelve True si salió.
+    """Manda la cotización al cliente del distribuidor. Devuelve (salio, motivo).
 
     A diferencia de los demás correos, este SÍ informa el fracaso: no va colgado
     de una compra en segundo plano, sino de un botón que alguien acaba de pulsar,
-    y decirle 'enviada' cuando no salió es mentirle en la cara."""
+    y decirle 'enviada' cuando no salió es mentirle en la cara.
+
+    ⛔ Y EL MOTIVO IMPORTA (Christián, 2026-08-01: «le di click a compartir por email
+    pero NO recibí nada»). No es lo mismo que el envío esté APAGADO en el servidor
+    —donde reintentar no sirve de nada y hay que encenderlo— que un rechazo del
+    proveedor. Antes las dos cosas salían como el mismo «intenta de nuevo», que en el
+    primer caso era falso. Motivos: 'apagado' | 'rechazado' | '' (salió).
+    """
     if not email_enabled():
-        logger.info('EMAIL_ENABLED != true, skipping quote email to %s', to_address)
-        return False
+        logger.warning('EMAIL_ENABLED != true: la cotización para %s NO se mandó. '
+                       'El botón del cotizador no puede funcionar hasta que se '
+                       'encienda EMAIL_ENABLED en el servidor.', to_address)
+        return False, 'apagado'
     lang = normalize_language(language)
     copy = QUOTE_COPY[lang]
     folio = str(quote.get('folio', '') or '').strip()
@@ -1651,7 +1660,7 @@ async def send_quote_email(to_address, quote, language=None, reply_to=None):
         await asyncio.to_thread(_send_email_sync, to_address, subject,
                                 _quote_email_html(copy, quote), reply_to)
         logger.info('Quote email sent to %s (folio=%s, lang=%s)', to_address, folio, lang)
-        return True
+        return True, ''
     except Exception:
         logger.exception('Failed to send quote email to %s', to_address)
-        return False
+        return False, 'rechazado'
