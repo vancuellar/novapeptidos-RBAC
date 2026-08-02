@@ -275,7 +275,8 @@ LLAVES_PUBLICAS = (
 # Los CUATRO datos que el distribuidor capturó por su cliente, y nada más. Misma
 # técnica que arriba: se arma desde cero, así que un campo nuevo en el documento
 # —el `gift_code`, por ejemplo— no se cuela por esta puerta tampoco.
-LLAVES_DE_CONTACTO = ('client_name', 'client_email', 'client_phone', 'client_address')
+LLAVES_DE_CONTACTO = ('client_name', 'client_email', 'client_phone', 'client_address',
+                      'client_city', 'client_state', 'client_zip')
 
 
 def datos_de_contacto(doc) -> dict:
@@ -292,6 +293,12 @@ def datos_de_contacto(doc) -> dict:
         'email': str(doc.get('client_email') or '')[:120],
         'phone': str(doc.get('client_phone') or '')[:40],
         'address': str(doc.get('client_address') or '')[:200],
+        # El domicilio POR CAMPOS (Christián, 2026-08-02): ciudad, estado y CP
+        # dedicados, como en el checkout — con ellos el prellenado llena la
+        # dirección completa y el envío se cotiza con el CP real.
+        'city': str(doc.get('client_city') or '')[:80],
+        'state': str(doc.get('client_state') or '')[:60],
+        'postal_code': str(doc.get('client_zip') or '')[:10],
     }
 
 

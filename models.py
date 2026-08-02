@@ -639,6 +639,12 @@ class ShareCartRequest(BaseModel):
     client_email: Optional[str] = ''
     client_phone: Optional[str] = ''
     client_address: Optional[str] = ''
+    # El domicilio POR CAMPOS (Christián, 2026-08-02): ciudad, estado y CP como
+    # en el checkout. Con el CP el cotizador ya cotiza el envío con las reglas
+    # de la casa, y el prellenado del cliente llena la dirección completa.
+    client_city: Optional[str] = ''
+    client_state: Optional[str] = ''
+    client_zip: Optional[str] = ''
     discount: float = Field(0, ge=0, le=1)
     language: Optional[str] = None
     folio: Optional[str] = ''

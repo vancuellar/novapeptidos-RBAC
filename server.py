@@ -6048,7 +6048,10 @@ async def _resolver_carrito(doc):
     # proporcionó una dirección»). El carrito enseña «se calcula al pagar»
     # (`shipping_pending`) y el checkout lo cobra como siempre, ya con el
     # domicilio enfrente. El envío de CORTESÍA es gratis con o sin dirección.
-    sin_direccion = not str(doc.get('client_address') or '').strip()
+    # Con el CP basta para cotizar (Christián, 2026-08-02): «necesitamos por lo
+    # menos saber el Zip Code». Sin CP y sin calle, se cotiza por separado.
+    sin_direccion = not (str(doc.get('client_address') or '').strip()
+                         or str(doc.get('client_zip') or '').strip())
     envio = 0
     envio_pendiente = False
     if COBRAR_ENVIO and lineas and not envio_de_cortesia:
@@ -6143,6 +6146,11 @@ async def distributor_cart_share(payload: ShareCartRequest,
         'client_email': (payload.client_email or '').strip()[:120],
         'client_phone': (payload.client_phone or '').strip()[:40],
         'client_address': (payload.client_address or '').strip()[:200],
+        # El domicilio POR CAMPOS (Christián, 2026-08-02): con el CP el envío se
+        # cotiza de verdad y el checkout del cliente llega con todo puesto.
+        'client_city': (payload.client_city or '').strip()[:80],
+        'client_state': (payload.client_state or '').strip()[:60],
+        'client_zip': (payload.client_zip or '').strip()[:10],
         'language': (payload.language or dist.get('language') or 'es')[:5],
         'discount_asked': max(0.0, float(payload.discount or 0)),
         'items': [{'product_id': i.product_id, 'quantity': int(i.quantity)}
@@ -6198,7 +6206,8 @@ def _hay_datos_privados_del_cliente(doc) -> bool:
     """
     doc = doc or {}
     return any((str(doc.get(k) or '')).strip()
-               for k in ('client_email', 'client_phone', 'client_address'))
+               for k in ('client_email', 'client_phone', 'client_address',
+                         'client_city', 'client_state', 'client_zip'))
 
 
 # Cuántas veces se puede preguntar por los datos de UN carrito. No es una regla de

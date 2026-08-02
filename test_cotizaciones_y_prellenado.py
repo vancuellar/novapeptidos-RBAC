@@ -228,8 +228,11 @@ def test_con_la_segunda_llave_salen_los_cuatro_datos(como):
     assert clave, 'no se repartió la segunda llave'
     r = _sin_sesion().post(f'{ABRIR}/{token}/datos', json={'clave': clave})
     assert r.status_code == 200, r.text
+    # Desde el 2026-08-02 el domicilio también viaja POR CAMPOS (ciudad,
+    # estado, CP); en este carrito van vacíos porque no se capturaron.
     assert r.json() == {'full_name': NOMBRE, 'email': CORREO,
-                        'phone': TELEFONO, 'address': DOMICILIO}
+                        'phone': TELEFONO, 'address': DOMICILIO,
+                        'city': '', 'state': '', 'postal_code': ''}
     # Y no se queda en ninguna caché por el camino.
     assert r.headers.get('cache-control') == 'no-store'
 
@@ -319,7 +322,8 @@ def test_el_recorte_arma_desde_cero_y_no_copia_lo_de_adentro():
     fuera = regalos.datos_de_contacto({
         'client_name': 'Ana', 'client_email': 'a@x.mx', 'gift_code': 'DGIFT-SECRETO',
         'client_notas_internas': 'costo 400', 'prefill_key': 'llave'})
-    assert set(fuera) == {'full_name', 'email', 'phone', 'address'}
+    assert set(fuera) == {'full_name', 'email', 'phone', 'address',
+                          'city', 'state', 'postal_code'}
     assert 'DGIFT' not in json.dumps(fuera)
 
 
@@ -565,3 +569,36 @@ def test_una_accion_inventada_rebota(como):
     cli = como(DIST)
     token = cli.post(COMPARTIR, json=CARRITO).json()['token']
     assert cli.post(LOTE, json={'tokens': [token], 'accion': 'quemar'}).status_code == 400
+
+
+# ======================================================================
+#  ENCARGO 5 (2026-08-02) — EL DOMICILIO POR CAMPOS
+# ======================================================================
+def test_ciudad_estado_y_cp_se_guardan_y_prellenan(como):
+    cli = como(DIST)
+    r = cli.post(COMPARTIR, json={**CARRITO, 'client_city': 'Tijuana',
+                                  'client_state': 'Baja California',
+                                  'client_zip': '22000'}).json()
+    datos = cli.post(f"/api/carrito/{r['token']}/datos",
+                     json={'clave': r['prefill_key']}).json()
+    assert datos['city'] == 'Tijuana'
+    assert datos['state'] == 'Baja California'
+    assert datos['postal_code'] == '22000'
+
+
+def test_el_cp_ni_la_ciudad_salen_por_la_ruta_publica(como):
+    cli = como(DIST)
+    r = cli.post(COMPARTIR, json={**CARRITO, 'client_city': 'Tijuana',
+                                  'client_zip': '22000'}).json()
+    publico = json.dumps(_sin_sesion().get(f"/api/carrito/{r['token']}").json(),
+                         ensure_ascii=False)
+    assert 'Tijuana' not in publico and '22000' not in publico
+
+
+def test_con_solo_el_cp_el_envio_YA_se_cotiza(como):
+    """«Necesitamos por lo menos saber el Zip Code» (Christián, 2026-08-02): con
+    CP y sin calle, el carrito ya trae su envío en vez de «se cotiza aparte»."""
+    cuerpo = como(DIST).post(COMPARTIR, json={
+        'discount': 0.0, 'items': [{'product_id': 'p-reta', 'quantity': 1}],
+        'gifts': [], 'client_zip': '22000'}).json()
+    assert cuerpo['shipping_pending'] is False
