@@ -614,7 +614,7 @@ def test_un_id_de_cotizacion_inventado_no_regala_el_envio(db, con_llave, monkeyp
 def test_el_cliente_ya_no_escoge_paqueteria_escoge_el_tipo(db, con_llave, monkeypatch):
     """LA ESTRATEGIA DEL 2026-08-02: el id de cotización que mande el navegador ya
     no decide el precio — el cliente escoge ESTÁNDAR o EXPRESS y la casa escoge la
-    paquetería. Express: +$150 SIEMPRE, y el servicio apuntado es uno de 1-2 días."""
+    paquetería (el servicio apuntado para express es uno de 1-2 días)."""
     _falsear_skydropx(monkeypatch)
     normal = _pedido()
     cobrado, guardado = asyncio.run(server._envio_del_pedido(normal, 1000, PFLAGS))
@@ -622,12 +622,40 @@ def test_el_cliente_ya_no_escoge_paqueteria_escoge_el_tipo(db, con_llave, monkey
     exp = _pedido()
     exp.shipping_express = True
     cobrado_exp, guardado_exp = asyncio.run(server._envio_del_pedido(exp, 1000, PFLAGS))
-    assert cobrado_exp == 400                  # 250 + 150
+    assert cobrado_exp == 400                  # abajo de la mínima: 250 + 150
     assert guardado_exp['express'] is True
     assert 0 < int(guardado_exp['days'] or 0) <= envios.DIAS_MAXIMOS_EXPRESS
-    # Y en una compra con envío incluido, el extra se cobra igual.
-    incluido, _ = asyncio.run(server._envio_del_pedido(exp, 5000, PFLAGS))
-    assert incluido == 150
+
+
+def test_express_dentro_del_presupuesto_va_GRATIS_total(db, con_llave, monkeypatch):
+    """LA REGLA V2 (Christián, 2026-08-02, «¿va?»): desde la mínima, si el costo
+    REAL de la guía express al CP del cliente cabe en max($250, 5% de la compra),
+    la casa absorbe TODO — ni los $150 se cobran. La guía express de la cotización
+    falsa cuesta $186.90: cabe en el presupuesto de $250 de una compra de $5,000."""
+    _falsear_skydropx(monkeypatch)
+    exp = _pedido()
+    exp.shipping_express = True
+    cobrado, guardado = asyncio.run(server._envio_del_pedido(exp, 5000, PFLAGS))
+    assert cobrado == 0
+    assert guardado['express'] is True
+    # Su ejemplo con números: compra de $30,000 → presupuesto $1,500; la guía
+    # express real ($186.90 aquí) cabe con todo y sobra → $0.
+    assert asyncio.run(server._envio_del_pedido(exp, 30000, PFLAGS))[0] == 0
+
+
+def test_express_caro_cobra_SOLO_el_excedente(db, con_llave, monkeypatch):
+    """Si la guía express real se pasa del presupuesto, el cliente paga la
+    diferencia — no la guía entera ni la diferencia más $150."""
+    cara = [{'paqueteria': 'Estafeta', 'paqueteria_id': 'estafeta',
+             'servicio': 'Next Day', 'servicio_codigo': 'estafeta_next_day',
+             'dias': 1, 'precio': 700.0}]
+    monkeypatch.setattr(skydropx, 'cotizar', lambda *a, **k: [dict(o) for o in cara])
+    exp = _pedido()
+    exp.shipping_express = True
+    # Compra de $3,000: presupuesto max(250, 150) = 250 → paga 700 − 250 = 450.
+    assert asyncio.run(server._envio_del_pedido(exp, 3000, PFLAGS))[0] == 450
+    # Compra de $30,000: presupuesto 1,500 → la de $700 cabe → $0.
+    assert asyncio.run(server._envio_del_pedido(exp, 30000, PFLAGS))[0] == 0
 
 
 def test_una_cotizacion_de_OTRO_codigo_postal_no_sirve(db, con_llave, monkeypatch):
@@ -1180,9 +1208,10 @@ def test_el_pedido_guarda_lo_que_la_casa_absorbe_aunque_no_cobre_envio():
     assert envios.absorcion_fuera_de_tope(costo_guia, 5000, 0) == 0
 
 
-def test_el_express_suma_su_extra_siempre():
-    """EXPRESS (Christián, 2026-08-02): +$150 encima del estándar, SIEMPRE — también
-    cuando el envío estándar va incluido. Y sus dos números viven en envios.py."""
+def test_los_numeros_del_express_viven_en_envios():
+    """EXPRESS (Christián, 2026-08-02): +$150 abajo de la mínima; desde la mínima
+    manda la regla v2 (el costo real contra el presupuesto — ver
+    test_express_dentro_del_presupuesto_va_GRATIS_total)."""
     assert envios.EXTRA_EXPRESS_MXN == 150
     assert envios.DIAS_MAXIMOS_EXPRESS == 2
     assert envios.tope_guia_automatica(False) == 400

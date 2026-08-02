@@ -1676,6 +1676,34 @@ async def shipping_quote(payload: ShippingQuoteRequest):
     }
 
 
+def _COSTO_ESTIMADO_EXPRESS() -> float:
+    """Lo que cuesta una guía EXPRESS cuando la paquetería no contestó: el estimado
+    de la casa más los ~$150 que el servicio rápido cuesta de más en la vida real
+    (el mismo número del extra, y no es casualidad: de ahí salió)."""
+    return float(COSTO_GUIA_ESTIMADO) + float(envios.EXTRA_EXPRESS_MXN)
+
+
+def _cobro_express(paid_merchandise: float, costo_real: float | None) -> int:
+    """Cuánto paga el cliente por un envío EXPRESS. La regla v2 (Christián,
+    2026-08-02, con estas palabras: «si el costo total... no pasa de 5% en total,
+    la casa absorbe el costo total, ¿va?»):
+
+      · Abajo de la mínima: tarifa plana + extra ($250 + $150 = $400).
+      · Desde $2,500: el costo REAL de la guía express al CP del cliente se mide
+        contra el presupuesto de absorción — max($250, 5% de la compra). Si cabe,
+        GRATIS TOTAL (ni los $150 se cobran); si se pasa, paga SOLO el excedente.
+        Su ejemplo: compra de $30,000, guía express de ~$700 → cliente paga $0.
+
+    `costo_real=None` = la paquetería no contestó: se usa el estimado express de
+    la casa, que es lo que impide regalar un express por una falla ajena."""
+    costo = float(costo_real) if costo_real else _COSTO_ESTIMADO_EXPRESS()
+    base = envios.cobro_de_envio_al_cliente(costo, paid_merchandise, FREE_SHIPPING_FROM,
+                                            tarifa_plana=SHIPPING_FLAT)
+    if float(paid_merchandise or 0) < float(FREE_SHIPPING_FROM):
+        return round(base + envios.EXTRA_EXPRESS_MXN)
+    return round(base)
+
+
 def _opcion_express(opciones):
     """La opción EXPRESS de una lista ya filtrada y ordenada (días, luego precio):
     la primera que promete 1-2 días. Si ninguna lo promete, la más rápida que haya
@@ -1713,7 +1741,6 @@ async def _envio_del_pedido(payload, paid_merchandise, pflags):
     Devuelve (lo que paga el cliente, lo que se guarda en el pedido).
     """
     es_express = bool(getattr(payload, 'shipping_express', False))
-    extra = envios.EXTRA_EXPRESS_MXN if es_express else 0.0
     if not COBRAR_ENVIO:
         return 0, {}
     if not envio_se_cotiza():
@@ -1721,7 +1748,9 @@ async def _envio_del_pedido(payload, paid_merchandise, pflags):
         # línea se escribe TAL CUAL porque hay pruebas que la buscan literal — es el
         # candado que impide que alguien vuelva a dejar el envío sin interruptor.
         shipping = shipping_for(paid_merchandise) if COBRAR_ENVIO else 0
-        return round(shipping + extra), ({'express': True} if es_express else {})
+        if es_express:
+            shipping = _cobro_express(paid_merchandise, None)
+        return round(shipping), ({'express': True} if es_express else {})
     cp = (payload.customer.postal_code or '').strip()
     paquete = envios.paquete_del_pedido(payload.items, pflags)
     try:
@@ -1737,14 +1766,16 @@ async def _envio_del_pedido(payload, paid_merchandise, pflags):
     # Express: la primera que promete 1-2 días.
     if es_express:
         opcion = _opcion_express(frescas) or {}
+        costo = float(opcion.get('precio') or 0) or None
+        cobrado = _cobro_express(paid_merchandise, costo)
+        costo = costo if costo is not None else _COSTO_ESTIMADO_EXPRESS()
     else:
         opcion = (min(frescas, key=lambda o: float(o.get('precio') or 0))
                   if frescas else {})
-    # Sin tarifas no se inventa un costo de guía: se usa el estimado de la casa.
-    costo = float(opcion.get('precio') or 0) or float(COSTO_GUIA_ESTIMADO)
-    base = envios.cobro_de_envio_al_cliente(costo, paid_merchandise, FREE_SHIPPING_FROM,
-                                            tarifa_plana=SHIPPING_FLAT)
-    cobrado = round(base + extra)
+        # Sin tarifas no se inventa un costo de guía: se usa el estimado de la casa.
+        costo = float(opcion.get('precio') or 0) or float(COSTO_GUIA_ESTIMADO)
+        cobrado = round(envios.cobro_de_envio_al_cliente(
+            costo, paid_merchandise, FREE_SHIPPING_FROM, tarifa_plana=SHIPPING_FLAT))
     guardado = {
         'carrier': opcion.get('paqueteria', ''),
         'service': opcion.get('servicio', ''),
@@ -3871,10 +3902,14 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # `shipping_absorbed` para que el regalo se pueda sumar después. Ya pasó el piso
     # de rentabilidad de arriba: aquí sólo se aplica lo que allá se autorizó.
     if _envio_de_cortesia:
-        # La cortesía regala el envío ESTÁNDAR. Si el cliente además quiere
-        # express, el extra sí se cobra — el regalo no se agranda solo (2026-08-02).
-        shipping = round(envios.EXTRA_EXPRESS_MXN) \
-            if getattr(payload, 'shipping_express', False) else 0
+        # La cortesía regala el envío ESTÁNDAR; el regalo no se agranda solo. Si el
+        # cliente además quiere express: abajo de la mínima paga el extra ($150);
+        # desde la mínima aplica la regla v2 igual que a cualquiera — el cobro ya
+        # calculado ES sólo el excedente sobre el presupuesto, así que se queda.
+        if not getattr(payload, 'shipping_express', False):
+            shipping = 0
+        elif paid_merchandise < FREE_SHIPPING_FROM:
+            shipping = round(envios.EXTRA_EXPRESS_MXN)
     total = paid_merchandise + shipping
     # Lo que la guia cuesta DE VERDAD. Sin cotizacion de Skydropx no es cero: es la
     # tarifa plana, que es lo que la paqueteria cobra igual. Se calculaba con
