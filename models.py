@@ -619,11 +619,32 @@ class ShareCartRequest(BaseModel):
     calcula el servidor y los vuelve a calcular al cobrar.
     """
     client_name: Optional[str] = ''
+    # LOS DATOS DEL CLIENTE que el distribuidor ya capturó en el cotizador
+    # (Christián, 2026-08-01): «Cuando el cliente abre el link de la cotización, su
+    # nombre, email, teléfono, dirección, NADA se guardó.» Se guardan para
+    # PRELLENARLE el checkout y ahorrarle teclearlo todo otra vez.
+    #
+    # ⛔ NO SALEN por `GET /carrito/{token}`, que es público. Salen sólo por
+    # `POST /carrito/{token}/datos`, que exige la segunda llave del enlace.
+    # Todos opcionales: si ella no los llenó, el checkout se comporta como siempre.
+    client_email: Optional[str] = ''
+    client_phone: Optional[str] = ''
+    client_address: Optional[str] = ''
     discount: float = Field(0, ge=0, le=1)
     language: Optional[str] = None
     folio: Optional[str] = ''
     items: List[QuoteLine] = Field(default_factory=list)
     gifts: List[GiftLine] = Field(default_factory=list)
+
+
+class PrellenadoRequest(BaseModel):
+    """La segunda llave del enlace, para leer los datos de contacto de ESE carrito.
+
+    Va en el CUERPO de un POST y no en la dirección a propósito: así no se escribe
+    en los registros del servidor ni en el historial del navegador. Ver
+    `regalos.nueva_clave_de_prellenado` para el porqué completo.
+    """
+    clave: str = Field('', max_length=200)
 
 
 # ---------- Distributors ----------

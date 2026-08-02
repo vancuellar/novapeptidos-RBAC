@@ -10,6 +10,7 @@ import string
 import re
 import json
 import io
+import secrets                  # comparar la llave del prellenado en tiempo constante
 import unicodedata            # para comparar nombres sin acentos al buscar duplicados
 import html as html_lib          # para escapar lo que va en los avisos internos
 # `csv` a secas chocaría con el parámetro `csv=1` de /admin/envios/costo-real, que es
@@ -18,7 +19,7 @@ import csv as csv_mod
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from database import db, client
 from models import (
     RegisterInput, LoginInput, ForgotPasswordInput, ResetPasswordInput,
@@ -31,7 +32,7 @@ from models import (
     ProtocolInput, ProtocolUpdate, PerfilSalud, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput, AceptarAcuerdoInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
-    QuoteEmailRequest, ShareCartRequest,
+    QuoteEmailRequest, ShareCartRequest, PrellenadoRequest,
 )
 from auth import (
     hash_password, verify_password, create_token, create_view_as_token, deny_view_as,
@@ -5907,8 +5908,21 @@ async def distributor_cart_share(payload: ShareCartRequest,
         'gift_code': regalos.nuevo_codigo_de_obsequio(),
         'distributor_id': dist['id'],
         'ref': (dist.get('distributor_code') or '').strip(),
+        # ⛔ LA SEGUNDA LLAVE — la que abre los datos del cliente y NADA MÁS.
+        # Viaja en el FRAGMENTO del enlace (`#d=`), que el navegador no manda a
+        # ningún servidor: no queda en los registros ni en el `Referer`. Se guarda
+        # tal cual y sólo vuelve a salir por dos puertas: la respuesta de ESTE
+        # endpoint (a la distribuidora que lo acaba de crear) y su lista de
+        # cotizaciones (para poder reenviar el mismo enlace sin rearmarlo).
+        # Ver `regalos.nueva_clave_de_prellenado`.
+        'prefill_key': regalos.nueva_clave_de_prellenado(),
         'folio': (payload.folio or '').strip()[:32],
         'client_name': (payload.client_name or '').strip()[:80],
+        # Los otros tres datos del cliente. ⛔ NO salen por `/carrito/{token}`:
+        # esa ruta es pública y se arma con la lista blanca de `vista_publica`.
+        'client_email': (payload.client_email or '').strip()[:120],
+        'client_phone': (payload.client_phone or '').strip()[:40],
+        'client_address': (payload.client_address or '').strip()[:200],
         'language': (payload.language or dist.get('language') or 'es')[:5],
         'discount_asked': max(0.0, float(payload.discount or 0)),
         'items': [{'product_id': i.product_id, 'quantity': int(i.quantity)}
@@ -5929,13 +5943,111 @@ async def distributor_cart_share(payload: ShareCartRequest,
             'permitido': privado['veredicto']['permitido'],
             'exceso': privado['veredicto']['exceso'],
         })
+    # LA FOTO DEL MOMENTO, para la LISTA de cotizaciones del panel (Christián,
+    # 2026-08-01: «necesito que las cotizaciones generadas se guarden en el panel del
+    # distribuidor»). Es sólo para pintar la tabla sin volver a tasar 200 carritos
+    # contra el catálogo en cada carga. ⛔ NO es lo que se cobra: al abrir el enlace y
+    # al pasar por la caja, el precio se recalcula siempre (ver `_resolver_carrito`).
+    doc['snapshot'] = _foto_del_carrito(publico)
     await db[COLECCION_CARRITOS].insert_one(dict(doc))
     site = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+    # EL ENLACE LLEVA LA SEGUNDA LLAVE EN EL FRAGMENTO. `#d=` y no `?d=`: el
+    # fragmento es la única parte de una dirección que el navegador NO manda al
+    # servidor, así que la llave no queda escrita en ningún registro de acceso ni
+    # se le filtra a terceros por la cabecera `Referer`.
+    clave = doc['prefill_key'] if _hay_datos_privados_del_cliente(doc) else ''
     return {
         'token': doc['token'],
-        'url': f"{site}/carrito/{doc['token']}",
+        # `prefill_key` viaja SÓLO a la distribuidora autenticada que acaba de armar
+        # el carrito, para que su pantalla pueda pegar el fragmento en los dos
+        # enlaces (ver y pagar). Al cliente nunca se le manda por ninguna ruta.
+        'prefill_key': clave,
+        'url': f"{site}/carrito/{doc['token']}" + (f'#d={clave}' if clave else ''),
         **publico,
     }
+
+
+def _hay_datos_privados_del_cliente(doc) -> bool:
+    """¿Hace falta repartir la segunda llave con este carrito?
+
+    Sólo si hay algo PRIVADO que abrir: correo, teléfono o domicilio. El NOMBRE no
+    cuenta — ya viaja en la vista pública desde el primer día («Cotización para
+    Ana»), así que pedir un secreto para leerlo sería teatro. Y si no hay nada que
+    prellenar, el enlace sale limpio: un secreto que no abre nada es un secreto de
+    más rodando por WhatsApp.
+    """
+    doc = doc or {}
+    return any((str(doc.get(k) or '')).strip()
+               for k in ('client_email', 'client_phone', 'client_address'))
+
+
+# Cuántas veces se puede preguntar por los datos de UN carrito. No es una regla de
+# negocio: es el freno que impide que alguien con el token en la mano se ponga a
+# probar claves. Con 192 bits de clave no le alcanzaría la vida, pero un freno que
+# se ve en la bitácora es lo que convierte un intento en un aviso.
+PRELLENADOS_POR_HORA = 30
+_PRELLENADOS_PEDIDOS = {}
+
+
+def _puede_pedir_prellenado(token, ahora=None):
+    import time as _t
+    ahora = ahora if ahora is not None else _t.time()
+    marcas = [m for m in _PRELLENADOS_PEDIDOS.get(token, []) if ahora - m < 3600]
+    if len(marcas) >= PRELLENADOS_POR_HORA:
+        _PRELLENADOS_PEDIDOS[token] = marcas
+        return False
+    marcas.append(ahora)
+    _PRELLENADOS_PEDIDOS[token] = marcas
+    return True
+
+
+@api_router.post('/carrito/{token}/datos')
+async def datos_del_carrito_compartido(token: str, payload: PrellenadoRequest,
+                                       respuesta: Response):
+    """LOS DATOS DEL CLIENTE PARA PRELLENAR SU CHECKOUT. Exige la segunda llave.
+
+    Encargo de Christián (2026-08-01): «Cuando el cliente abre el link de la
+    cotización, su nombre, email, teléfono, dirección, NADA se guardó. Necesito que
+    corrijas esto si el distribuidor ya lo llenó por él.»
+
+    ⛔ POR QUÉ ESTO NO ES UNA FUGA, Y POR QUÉ NO VA EN `GET /carrito/{token}`:
+
+      1. `GET /carrito/{token}` no cambió ni una coma. Quien pruebe tokens al azar
+         saca exactamente lo que sacaba ayer: productos y precios. CERO datos
+         personales. Es el antecedente de la casa —el domicilio que salía con sólo
+         el número de pedido— y no se repite.
+      2. Aquí hacen falta DOS secretos independientes: el token (128 bits, en la
+         ruta) y la clave (192 bits, en el fragmento). El fragmento no viaja al
+         servidor, así que ni siquiera quien lea los registros de acceso completos
+         tiene con qué abrir esto.
+      3. Se compara en tiempo constante (`compare_digest`), con freno por token y
+         con la respuesta marcada `no-store` para que no quede en ninguna caché.
+      4. Sale lo JUSTO: cuatro campos armados desde cero con lista blanca
+         (`regalos.datos_de_contacto`). Ni el código del obsequio, ni quién es la
+         distribuidora, ni un peso.
+      5. Muere con el carrito: vencido (30 días) contesta 410 como el resto.
+
+    Y contesta 404 —no 403— cuando la clave no cuadra: a quien anda probando no se
+    le confirma que ese token exista.
+    """
+    respuesta.headers['Cache-Control'] = 'no-store'
+    tok = (token or '').strip()
+    clave = (payload.clave or '').strip()
+    if not tok or not clave:
+        raise HTTPException(status_code=404, detail='No hay datos para ese carrito')
+    if not _puede_pedir_prellenado(tok):
+        logger.warning('PRELLENADO frenado por ritmo en el carrito %s', tok[:8])
+        raise HTTPException(status_code=429, detail='Demasiados intentos. Espera un momento.')
+    doc = await db[COLECCION_CARRITOS].find_one({'token': tok}, {'_id': 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail='No hay datos para ese carrito')
+    if doc.get('expires_at') and doc['expires_at'] < now_iso():
+        raise HTTPException(status_code=410, detail='Ese carrito ya venció.')
+    guardada = str(doc.get('prefill_key') or '')
+    if not guardada or not secrets.compare_digest(guardada, clave):
+        logger.warning('PRELLENADO con clave que no cuadra en el carrito %s', tok[:8])
+        raise HTTPException(status_code=404, detail='No hay datos para ese carrito')
+    return regalos.datos_de_contacto(doc)
 
 
 @api_router.get('/carrito/{token}')
@@ -5955,6 +6067,200 @@ async def abrir_carrito_compartido(token: str):
         raise HTTPException(status_code=410, detail='Ese carrito ya venció. Pídele uno nuevo a quien te lo mandó.')
     _privado, publico = await _resolver_carrito(doc)
     return publico
+
+
+# ==========================================================================
+#  MIS COTIZACIONES  —  la lista que se guarda en el panel del distribuidor
+# ==========================================================================
+# Encargo de Christián (2026-08-01), textual: «necesito que las cotizaciones
+# generadas se guarden en el panel del distribuidor por si necesita reenviarlas, que
+# no las tenga que volver a generar de cero. Y, una vez pagadas dejan de ser
+# cotizaciones y se transforman en ventas.»
+#
+# ⛔ EL ESTADO NO SE GUARDA: SE DEDUCE. Se mira si existe un pedido con ESTE token
+# (`orders.shared_cart_token`) y si ese pedido está cobrado (`cobrado.esta_pagado`,
+# la misma respuesta que usan todos los reportes). Guardar un campo `estado` en el
+# carrito obligaría a acordarse de moverlo en los CINCO caminos por los que un
+# pedido se paga (webhook de tarjeta, de cripto, el admin marcando el SPEI, el
+# cambio de estado, el marcado a mano); el día que uno se olvide, el panel enseña
+# una cotización que ya se vendió. Deducirlo no se puede desincronizar.
+#
+# ⛔ Y NO SE DUPLICA: una cotización pagada deja de contar como cotización y sale de
+# la lista como VENTA, con su número de pedido — un solo renglón, no dos.
+ESTADO_COTIZACION = 'cotizacion'   # todavía es un papel
+ESTADO_PEDIDO = 'pedido'           # el cliente ya compró, falta que entre el dinero
+ESTADO_VENTA = 'venta'             # cobrado: ya no es cotización
+
+# Cuántas cotizaciones se enseñan. Un distribuidor puede armar 120 al día, así que
+# sin tope esto crecería sin fin; con esto se ven las últimas semanas de trabajo.
+MAX_COTIZACIONES_EN_LISTA = 200
+
+
+def _foto_del_carrito(publico) -> dict:
+    """La FOTO del carrito para la lista: sólo números, ni un producto ni un código."""
+    return {
+        'list_total': publico.get('list_total') or 0,
+        'discount': publico.get('discount') or 0,
+        'discount_rate': publico.get('discount_rate') or 0,
+        'shipping': publico.get('shipping') or 0,
+        'total': publico.get('total') or 0,
+        'lines': len(publico.get('lines') or []),
+        'gifts': len(publico.get('gifts') or []),
+    }
+
+
+def _renglon_de_cotizacion(doc, pedido, site):
+    """UN renglón de la lista, armado DESDE CERO con lista blanca.
+
+    ⛔ Misma técnica que `regalos.vista_publica`, y por lo mismo: el documento del
+    carrito guarda el código interno del obsequio, y un `dict(doc)` con dos llaves
+    borradas se filtra el día que alguien guarde un campo nuevo. Aquí lo que no está
+    escrito no sale — ni siquiera para la propia distribuidora.
+    """
+    foto = doc.get('snapshot') or {}
+    token = doc.get('token') or ''
+    clave = doc.get('prefill_key') or ''
+    # El enlace se REARMA aquí, con su fragmento, para que reenviar sea copiar y
+    # pegar en vez de volver a generar la cotización desde cero.
+    fragmento = f'#d={clave}' if (clave and _hay_datos_privados_del_cliente(doc)) else ''
+    pedido = pedido or {}
+    hay_pedido = bool(pedido.get('order_number'))
+    pagado = esta_pagado(pedido) if hay_pedido else False
+    return {
+        'token': token,
+        'folio': doc.get('folio') or '',
+        # Los datos del cliente: SUYOS, los tecleó ella. No se recortan aquí porque
+        # esta ruta ya exige su sesión y sólo devuelve SUS carritos.
+        **regalos.datos_de_contacto(doc),
+        'created_at': doc.get('created_at') or '',
+        'expires_at': doc.get('expires_at') or '',
+        'vencida': bool(doc.get('expires_at') and doc['expires_at'] < now_iso()),
+        'total': foto.get('total') or 0,
+        'list_total': foto.get('list_total') or 0,
+        'discount': foto.get('discount') or 0,
+        'discount_rate': foto.get('discount_rate') or 0,
+        'shipping': foto.get('shipping') or 0,
+        'lines': foto.get('lines') or 0,
+        'gifts': foto.get('gifts') or 0,
+        'estado': (ESTADO_VENTA if pagado else ESTADO_PEDIDO) if hay_pedido else ESTADO_COTIZACION,
+        'order_number': pedido.get('order_number') or '',
+        'order_total': pedido.get('total') or 0,
+        'order_status': pedido.get('status') or '',
+        'paid_at': pedido.get('paid_at') or '',
+        'url': f'{site}/carrito/{token}{fragmento}',
+    }
+
+
+@api_router.get('/distributor/quotes')
+async def distributor_quotes(dist=Depends(get_current_distributor)):
+    """MIS COTIZACIONES. Sólo las suyas — nunca las de otro.
+
+    El filtro es `distributor_id` contra el id del token, no un parámetro de la
+    dirección: no hay forma de pedir las de otra persona porque no hay dónde
+    escribirlo. El "ver como" del admin entra (es de lectura) y ve las del
+    distribuidor que está mirando, que es justo lo que se espera de esa herramienta.
+    """
+    docs = await db[COLECCION_CARRITOS].find(
+        {'distributor_id': dist['id']}, {'_id': 0}).sort(
+        'created_at', -1).to_list(MAX_COTIZACIONES_EN_LISTA)
+    # LOS CARRITOS DE ANTES DE HOY no traen foto: se les saca una ahora y se guarda,
+    # para que esto pase una sola vez por carrito y no en cada carga del panel.
+    for doc in docs:
+        if not doc.get('snapshot'):
+            try:
+                _privado, publico = await _resolver_carrito(doc)
+            except Exception:
+                logger.exception('No se pudo tasar el carrito %s para la lista',
+                                 (doc.get('token') or '')[:8])
+                continue
+            doc['snapshot'] = _foto_del_carrito(publico)
+            await db[COLECCION_CARRITOS].update_one(
+                {'token': doc.get('token')}, {'$set': {'snapshot': doc['snapshot']}})
+    tokens = [d.get('token') for d in docs if d.get('token')]
+    pedidos = await db.orders.find(
+        {'shared_cart_token': {'$in': tokens}},
+        {'_id': 0, 'shared_cart_token': 1, 'order_number': 1, 'total': 1,
+         'status': 1, 'paid': 1, 'paid_at': 1}).to_list(len(tokens) + 50) if tokens else []
+    # Si un token trajo dos pedidos (el cliente pagó dos veces), manda el COBRADO: la
+    # cotización se convirtió en venta y eso es lo que ella tiene que ver.
+    por_token = {}
+    for p in pedidos:
+        tk = p.get('shared_cart_token')
+        if tk not in por_token or (esta_pagado(p) and not esta_pagado(por_token[tk])):
+            por_token[tk] = p
+    site = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+    filas = [_renglon_de_cotizacion(d, por_token.get(d.get('token')), site) for d in docs]
+    return {
+        'quotes': filas,
+        'cotizaciones': sum(1 for f in filas if f['estado'] == ESTADO_COTIZACION),
+        'pedidos': sum(1 for f in filas if f['estado'] == ESTADO_PEDIDO),
+        'ventas': sum(1 for f in filas if f['estado'] == ESTADO_VENTA),
+        'vendido': sum(f['order_total'] for f in filas if f['estado'] == ESTADO_VENTA),
+    }
+
+
+class ReenvioDeCotizacion(BaseModel):
+    email: EmailStr
+    language: Optional[str] = None
+
+
+@api_router.post('/distributor/quotes/{token}/email')
+async def reenviar_cotizacion(token: str, payload: ReenvioDeCotizacion,
+                              dist=Depends(get_current_distributor)):
+    """REENVIAR por correo una cotización YA GUARDADA, sin rearmarla.
+
+    Del cuerpo sólo viaja a quién. Qué productos, cuántos y cuánto descuento salen
+    del documento que ella guardó, y el PRECIO lo vuelve a poner el servidor contra
+    el catálogo de hoy — igual que al armarla. Una cotización de hace tres semanas se
+    reenvía con los precios de hoy, que son los que la caja va a cobrar.
+    """
+    deny_view_as(dist)          # espiar un panel no puede mandar correos desde él
+    doc = await db[COLECCION_CARRITOS].find_one(
+        {'token': (token or '').strip(), 'distributor_id': dist['id']}, {'_id': 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail='Esa cotización no existe')
+    if not _puede_mandar_cotizacion(dist['id']):
+        raise HTTPException(status_code=429,
+                            detail='Demasiadas cotizaciones seguidas. Espera un momento.')
+    items = [_Renglon(i.get('product_id'), i.get('quantity') or 1)
+             for i in (doc.get('items') or [])]
+    catalogo = await _catalogo_de(items)
+    tope_dist = max(pyramid.discount_tiers_de(dist) or [0])
+    lineas, lista_total, total = _armar_cotizacion(
+        items, max(0.0, float(doc.get('discount_asked') or 0)), tope_dist, catalogo)
+    if not lineas:
+        raise HTTPException(status_code=400, detail='Ninguno de esos productos se puede cotizar')
+    site = os.environ.get('SITE_URL', 'https://exygenlabs.com')
+    clave = doc.get('prefill_key') or ''
+    fragmento = f'#d={clave}' if (clave and _hay_datos_privados_del_cliente(doc)) else ''
+    # ⛔ El enlace del correo es EL DEL CARRITO GUARDADO, no un `?pedido=` nuevo: así
+    # el cliente abre exactamente la misma cotización —con sus cortesías y su
+    # prellenado— en vez de un carrito parecido sin nada de eso.
+    cotizacion = {
+        'folio': doc.get('folio') or '',
+        **{k: (doc.get(k) or '') for k in regalos.LLAVES_DE_CONTACTO},
+        'code': (dist.get('distributor_code') or '').strip(),
+        'link': f'{site}/carrito/{doc.get("token")}{fragmento}',
+        'lines': lineas,
+        'list_total': lista_total,
+        'savings': max(0.0, lista_total - total),
+        'total': total,
+    }
+    salio, motivo = await send_quote_email(
+        payload.email, cotizacion,
+        language=payload.language or doc.get('language') or dist.get('language'),
+        reply_to=ATENCION_CORREO)
+    if not salio:
+        if motivo == 'apagado':
+            raise HTTPException(status_code=503, detail={
+                'error': 'correo_apagado',
+                'mensaje': ('El envío de correo está apagado en el servidor '
+                            '(EMAIL_ENABLED). Comparte por WhatsApp o con el enlace '
+                            'del carrito mientras tanto.')})
+        raise HTTPException(status_code=502, detail={
+            'error': 'correo_rechazado',
+            'mensaje': 'El proveedor de correo rechazó el envío. No salió nada.'})
+    return {'sent': True, 'total': total, 'lines': len(lineas)}
 
 
 @api_router.post('/distributor/codes/rotate')

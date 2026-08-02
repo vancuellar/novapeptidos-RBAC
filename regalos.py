@@ -81,6 +81,29 @@ def nuevo_token_de_carrito() -> str:
     return secrets.token_hex(16)
 
 
+def nueva_clave_de_prellenado() -> str:
+    """LA SEGUNDA LLAVE del carrito compartido: la que abre los datos del cliente.
+
+    Encargo de Christián (2026-08-01): «Cuando el cliente abre el link de la
+    cotización, su nombre, email, teléfono, dirección, NADA se guardó. Necesito que
+    corrijas esto si el distribuidor ya lo llenó por él.»
+
+    ⛔ POR QUÉ SON DOS SECRETOS Y NO UNO. El token del carrito viaja en la RUTA
+    (`/carrito/<token>`) y por eso queda escrito en los registros del servidor, del
+    proxy y de cualquier intermediario. Esta clave viaja en el FRAGMENTO del enlace
+    (`#d=<clave>`), la única parte de una dirección que el navegador NO manda a
+    ningún servidor: no aparece en registros, ni en la cabecera `Referer` que se le
+    filtra a terceros. Así, quien tenga el registro del servidor tiene el token —con
+    el que ya podía ver productos y precios— pero JAMÁS lo que hace falta para leer
+    un nombre, un teléfono o un domicilio.
+
+    Y quien pruebe tokens al azar no saca nada: los datos personales no salen por
+    `GET /carrito/{token}` (ver `vista_publica`, lista blanca), sólo por la ruta que
+    exige esta clave. Adivinar las dos es adivinar 128 + 192 bits.
+    """
+    return secrets.token_urlsafe(24)
+
+
 # ------------------------------------------------------------ qué vale un regalo
 def valor_de_obsequios(obsequios, precio_de, costo_envio=0.0) -> float:
     """Cuánto DINERO regala este carrito, a precio de lista. En pesos.
@@ -236,11 +259,40 @@ def limpiar_obsequios(crudos, existe_producto) -> list:
 # CERO: lo que no esté escrito aquí abajo no sale, aunque mañana alguien guarde un
 # campo nuevo en el documento. Al revés —borrando `gift_code` de una copia— el día
 # que se agregue `gift_code_anterior` o `gift_note` se filtra sin que nadie lo note.
+#
+# ⛔ Y AQUÍ NO ENTRAN NI EL CORREO, NI EL TELÉFONO, NI EL DOMICILIO DEL CLIENTE
+# (2026-08-01). Se guardan en el documento —para prellenarle el checkout— pero esta
+# ruta es PÚBLICA y sin sesión: si salieran por aquí, probar tokens al azar sería
+# una cosecha de domicilios. Salen por `datos_de_contacto`, que exige la segunda
+# llave. `client_name` sí queda: es lo que ya se pintaba («Cotización para Ana») y
+# sin él la pantalla no puede saludar a nadie.
 LLAVES_PUBLICAS = (
     'token', 'folio', 'client_name', 'currency',
     'lines', 'gifts', 'list_total', 'discount', 'discount_rate',
     'shipping', 'shipping_free', 'total', 'ref', 'expires_at',
 )
+
+# Los CUATRO datos que el distribuidor capturó por su cliente, y nada más. Misma
+# técnica que arriba: se arma desde cero, así que un campo nuevo en el documento
+# —el `gift_code`, por ejemplo— no se cuela por esta puerta tampoco.
+LLAVES_DE_CONTACTO = ('client_name', 'client_email', 'client_phone', 'client_address')
+
+
+def datos_de_contacto(doc) -> dict:
+    """Los datos del cliente con los que se PRELLENA el checkout.
+
+    ⛔ Quien llama es responsable de haber comprobado la segunda llave ANTES. Esta
+    función no autoriza nada: sólo recorta. Devuelve los nombres que usa el
+    formulario del checkout, no los del documento, para que la pantalla no tenga que
+    traducir nada (y para que un campo nuevo del documento no se cuele por parecido).
+    """
+    doc = doc or {}
+    return {
+        'full_name': str(doc.get('client_name') or '')[:80],
+        'email': str(doc.get('client_email') or '')[:120],
+        'phone': str(doc.get('client_phone') or '')[:40],
+        'address': str(doc.get('client_address') or '')[:200],
+    }
 
 
 def vista_publica(doc) -> dict:
