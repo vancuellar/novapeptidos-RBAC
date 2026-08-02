@@ -1712,3 +1712,32 @@ def test_la_lista_de_pedidos_del_distribuidor_LLEVA_la_guia(db, monkeypatch):
     # Y la privacidad del cliente sigue en pie: ni correo, ni teléfono, ni domicilio.
     for prohibido in ('customer_email', 'customer_phone', 'address', 'items'):
         assert prohibido not in fila
+
+
+# ==========================================================================
+#  El código postal sugiere ciudad y estado (Christián, 2026-08-02)
+# ==========================================================================
+def test_nominatim_da_ciudad_y_estado():
+    cuerpo = [{'address': {'postcode': '22000', 'county': 'Municipio de Tijuana',
+                           'state': 'Baja California'}}]
+    assert server._ciudad_estado_de_nominatim(cuerpo) == {
+        'found': True, 'city': 'Tijuana', 'state': 'Baja California'}
+
+
+def test_nominatim_con_city_directa():
+    cuerpo = [{'address': {'city': 'Mérida', 'state': 'Yucatán'}}]
+    r = server._ciudad_estado_de_nominatim(cuerpo)
+    assert r['city'] == 'Mérida' and r['state'] == 'Yucatán'
+
+
+def test_nominatim_vacio_o_roto_no_revienta():
+    assert server._ciudad_estado_de_nominatim([]) == {'found': False, 'city': '', 'state': ''}
+    assert server._ciudad_estado_de_nominatim(None)['found'] is False
+    assert server._ciudad_estado_de_nominatim([{'sin': 'address'}])['found'] is False
+
+
+def test_un_cp_que_no_es_cp_rebota(db, monkeypatch):
+    from fastapi.testclient import TestClient
+    cli = TestClient(server.app)
+    assert cli.get('/api/cp/abc').status_code == 400
+    assert cli.get('/api/cp/1234').status_code == 400

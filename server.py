@@ -1627,6 +1627,74 @@ async def _cotizacion_valida(opcion_id: str, cp: str, peso_kg: float):
     return dict(opcion, peso_kg=doc.get('peso_kg'), paquete=doc.get('paquete') or {})
 
 
+# ---------------- el código postal sugiere la ciudad y el estado ----------------
+# Encargo de Christián (2026-08-02): «If he enters the zip code, that should
+# assist User with suggesting the rest of the address.» La fuente es Nominatim
+# (OpenStreetMap), que para un CP mexicano devuelve municipio y estado; si no
+# contesta, se cae a Zippopotam, que al menos trae el estado. Con caché en
+# memoria: un CP no cambia de ciudad entre visitas, y así a los proveedores
+# gratuitos se les pega UNA vez por CP, no una por tecla.
+_CP_CACHE = {}
+_CP_NADA = {'found': False, 'city': '', 'state': ''}
+
+
+def _ciudad_estado_de_nominatim(cuerpo) -> dict:
+    """Saca (ciudad, estado) del JSON de Nominatim. Pura, para poderla probar."""
+    try:
+        addr = (cuerpo or [])[0].get('address') or {}
+    except (IndexError, AttributeError, TypeError):
+        return dict(_CP_NADA)
+    ciudad = addr.get('city') or addr.get('town') or addr.get('county') or ''
+    # «Municipio de Tijuana» → «Tijuana»: el campo del checkout es la ciudad.
+    for sobra in ('Municipio de ', 'Municipality of '):
+        if ciudad.startswith(sobra):
+            ciudad = ciudad[len(sobra):]
+    estado = addr.get('state') or ''
+    if not (ciudad or estado):
+        return dict(_CP_NADA)
+    return {'found': True, 'city': ciudad.strip(), 'state': estado.strip()}
+
+
+@api_router.get('/cp/{cp}')
+async def sugerir_por_cp(cp: str):
+    """Ciudad y estado desde el código postal. Público y de sólo lectura.
+
+    Nunca revienta hacia el checkout: sin respuesta de las fuentes se contesta
+    `found: False` y el cliente simplemente teclea su ciudad como siempre."""
+    cp = (cp or '').strip()
+    if not (cp.isdigit() and len(cp) == 5):
+        raise HTTPException(status_code=400, detail='El código postal son 5 dígitos')
+    if cp in _CP_CACHE:
+        return _CP_CACHE[cp]
+    import requests as _rq
+    out = dict(_CP_NADA)
+    try:
+        r = _rq.get('https://nominatim.openstreetmap.org/search',
+                    params={'postalcode': cp, 'country': 'mx', 'format': 'json',
+                            'addressdetails': 1, 'limit': 1},
+                    headers={'User-Agent': 'ExygenLabs/1.0 (soporte@exygenlabs.com)'},
+                    timeout=5)
+        if r.ok:
+            out = _ciudad_estado_de_nominatim(r.json())
+    except Exception:
+        logger.info('CP %s: Nominatim no contestó; probando Zippopotam', cp)
+    if not out['found']:
+        try:
+            r = _rq.get(f'https://api.zippopotam.us/MX/{cp}', timeout=5)
+            if r.ok:
+                lugares = (r.json() or {}).get('places') or []
+                estado = (lugares[0].get('state') or '').strip() if lugares else ''
+                if estado:
+                    out = {'found': True, 'city': '', 'state': estado}
+        except Exception:
+            logger.info('CP %s: Zippopotam tampoco contestó', cp)
+    # Sólo se guarda lo ENCONTRADO: un «no» de hoy puede ser un timeout, no un CP
+    # inexistente, y cachearlo dejaría ese CP mudo hasta el próximo despliegue.
+    if out['found']:
+        _CP_CACHE[cp] = out
+    return out
+
+
 @api_router.post('/shipping/quote')
 async def shipping_quote(payload: ShippingQuoteRequest):
     """El checkout pregunta cuánto cuesta mandar ESTE carrito a ESE código postal.
