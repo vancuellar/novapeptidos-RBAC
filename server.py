@@ -2738,10 +2738,13 @@ async def comprar_guia_del_pedido(order: dict, avisar: bool = True) -> dict | No
         # la más barata de las permitidas. Con uno solo encendido se comporta como antes.
         # ⛔ FRENO 2 va aquí dentro, entre cotizar y pagar.
         # El tope de gasto depende del TIPO de envío: express paga guías más caras
-        # ($600) porque el cliente ya pagó su extra; estándar se queda en $400.
+        # ($600) porque el cliente ya pagó su extra; estándar se queda en $400. Y un
+        # pedido EXPRESS sólo compra servicios de 1-2 días — si ninguno cabe en el
+        # tope, no se degrada a uno lento en silencio: le pregunta a Christián.
         guia = paqueterias.guia_para(
             destino, paquete, quote.get('service_code', ''),
-            tope_mxn=envios.tope_guia_automatica(order.get('shipping_express')))
+            tope_mxn=envios.tope_guia_automatica(order.get('shipping_express')),
+            dias_max=envios.DIAS_MAXIMOS_EXPRESS if order.get('shipping_express') else None)
     except paqueterias.TopeDeGastoExcedido as tope:
         logger.warning('Envio: la guia de %s cuesta $%s y el tope automatico es $%s. '
                        'NO se compra; se le pregunta a Christian.',

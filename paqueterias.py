@@ -149,7 +149,8 @@ class TopeDeGastoExcedido(RuntimeError):
 
 
 def guia_para(destino: dict, paquete: dict, servicio_codigo: str = '',
-              tope_mxn: float | None = None) -> dict:
+              tope_mxn: float | None = None,
+              dias_max: int | None = None) -> dict:
     """De cero a guía en un solo llamado: cotiza en los DOS, elige y compra la mejor.
 
     Es el camino automático, el que corre solo cuando un pago se confirma. Aplica las
@@ -175,8 +176,22 @@ def guia_para(destino: dict, paquete: dict, servicio_codigo: str = '',
     comp = cotizar_en_todos(destino, paquete, espera_max=skydropx.ESPERA_MAX_GUIA_S,
                             filtrar=True)
     tarifas = comp['opciones']
+    # ⛔ UN PEDIDO EXPRESS NO SE DEGRADA SOLO (Christián, 2026-08-02). `dias_max`
+    # recorta las tarifas al plazo que el cliente PAGÓ (1-2 días para express):
+    # sin este filtro, una guía express arriba del tope caía a «la más barata que
+    # quepa» — que puede ser una de 4-5 días — y el cliente pagó su extra para
+    # recibir rápido. Si ninguna rápida cabe, se detiene y se le pregunta al
+    # dueño, que es lo que él pidió. Un 0 en días es «no dijo», no «hoy»: fuera.
+    if dias_max:
+        def _dias(t):
+            try:
+                return int(t.get('dias') or 0)
+            except (TypeError, ValueError):
+                return 0
+        tarifas = [t for t in tarifas if 0 < _dias(t) <= int(dias_max)]
     if not tarifas:
-        raise RuntimeError('Ningun proveedor devolvio tarifas de las paqueterias permitidas')
+        raise RuntimeError('Ningun proveedor devolvio tarifas de las paqueterias permitidas'
+                           + (f' con entrega en {dias_max} dias o menos' if dias_max else ''))
     elegida = next((t for t in tarifas
                     if servicio_codigo and t['servicio_codigo'] == servicio_codigo),
                    tarifas[0])

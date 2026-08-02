@@ -323,3 +323,25 @@ def test_el_remitente_es_el_MISMO_para_los_dos(con_remitente):
     """La casa despacha desde una sola dirección. Dos remitentes distintos según la
     paquetería es la forma perfecta de imprimir una guía con la dirección de nadie."""
     assert EI.remitente() == skydropx.remitente()
+
+
+def test_guia_para_express_solo_compra_servicios_rapidos(sky, ei, con_remitente):
+    """⛔ UN PEDIDO EXPRESS NO SE DEGRADA SOLO (Christián, 2026-08-02). Con
+    `dias_max=2`, las tarifas de 3 días quedan fuera aunque sean más baratas: se
+    compra la rápida más barata (FedEx 2 días, $179.20 de Skydropx)."""
+    guia = paqueterias.guia_para(DESTINO, PAQUETE, dias_max=2)
+    assert guia['costo'] == 179.20
+
+
+def test_guia_para_express_sin_tarifas_rapidas_NO_compra_lenta(sky, ei, con_remitente):
+    """Si ninguna tarifa cumple el plazo express, no se compra una lenta en
+    silencio: revienta y el pedido espera el visto bueno del dueño."""
+    with pytest.raises(RuntimeError):
+        paqueterias.guia_para(DESTINO, PAQUETE, dias_max=1)
+
+
+def test_guia_para_express_respeta_el_tope_sin_caer_a_una_lenta(sky, ei, con_remitente):
+    """El freno de gasto sigue vivo dentro del plazo: si la única rápida se pasa
+    del tope, se detiene (TopeDeGastoExcedido) — no compra la lenta barata."""
+    with pytest.raises(paqueterias.TopeDeGastoExcedido):
+        paqueterias.guia_para(DESTINO, PAQUETE, tope_mxn=100, dias_max=2)
