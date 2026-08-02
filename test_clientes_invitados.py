@@ -240,3 +240,79 @@ def test_sin_sesion_no_hay_nada(monkeypatch):
     c = TestClient(server.app)
     assert c.get('/api/admin/customers').status_code == 401
     assert c.get('/api/admin/clientes/duplicados').status_code == 401
+
+
+# ================================================================== el filtro
+# TOTALES POR PERIODO en la lista de clientes del DISTRIBUIDOR (Christián,
+# 2026-08-01): «totales de comisión por cliente, con filtro de fecha: semana,
+# 30 días, mes, año, todo». El corte recorta lo que se SUMA, no la lista.
+def _hace(dias):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(days=dias)).isoformat()
+
+
+@pytest.fixture
+def como_con_periodos(monkeypatch):
+    """María con una clienta invitada que tiene un pedido RECIENTE (hace 2 días,
+    $1,200 de comisión) y uno VIEJO (hace 400 días — fuera de semana, 30 días y
+    del año calendario en curso, siempre—, $500)."""
+    reciente = {**P1, 'id': 'pr', 'order_number': 'EX-R', 'created_at': _hace(2)}
+    viejo = {**P1, 'id': 'pv', 'order_number': 'EX-V', 'created_at': _hace(400),
+             'total': 2000,
+             'commissions': [{'distributor_id': 'u-maria', 'amount': 500, 'role': 'seller'}]}
+    monkeypatch.setattr(server, 'db', _FakeDB(
+        users=[ADMIN, MARIA], orders=[reciente, viejo],
+        discount_codes=[], points=[], client_notes=[],
+    ))
+
+    def _factory(user):
+        server.app.dependency_overrides[auth.get_current_user] = lambda: dict(user)
+        return TestClient(server.app)
+
+    yield _factory
+    server.app.dependency_overrides.clear()
+
+
+def _brenda_con(como_con_periodos, periodo):
+    r = como_con_periodos(MARIA).get(f'/api/distributor/clients?periodo={periodo}')
+    assert r.status_code == 200
+    return _por_id(r.json())[ID_BRENDA]
+
+
+def test_todo_suma_los_dos_pedidos(como_con_periodos):
+    b = _brenda_con(como_con_periodos, 'todo')
+    assert b['orders_count'] == 2
+    assert b['my_earnings'] == 1700
+    assert b['total_spent'] == 4827 + 2000
+
+
+def test_la_semana_solo_trae_lo_reciente(como_con_periodos):
+    b = _brenda_con(como_con_periodos, 'semana')
+    assert b['orders_count'] == 1
+    assert b['my_earnings'] == 1200
+
+
+def test_30_dias_igual(como_con_periodos):
+    assert _brenda_con(como_con_periodos, '30dias')['my_earnings'] == 1200
+
+
+def test_el_ano_deja_fuera_lo_del_ano_pasado(como_con_periodos):
+    assert _brenda_con(como_con_periodos, 'ano')['my_earnings'] == 1200
+
+
+def test_el_cliente_sin_compras_en_el_periodo_no_desaparece(como_con_periodos):
+    # El filtro recorta los totales, no la lista: la clienta sigue ahí aunque
+    # sus pedidos queden fuera de la ventana.
+    r = como_con_periodos(MARIA).get('/api/distributor/clients?periodo=semana').json()
+    assert ID_BRENDA in _por_id(r)
+
+
+def test_cliente_desde_no_cambia_con_el_filtro(como_con_periodos):
+    # «Cliente desde» es su primera compra DE SIEMPRE, no la primera del periodo.
+    todo = _brenda_con(como_con_periodos, 'todo')
+    semana = _brenda_con(como_con_periodos, 'semana')
+    assert semana['created_at'] == todo['created_at']
+
+
+def test_un_periodo_con_basura_es_todo(como_con_periodos):
+    assert _brenda_con(como_con_periodos, 'lo-que-sea')['my_earnings'] == 1700

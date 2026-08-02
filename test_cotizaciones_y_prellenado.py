@@ -491,3 +491,77 @@ def test_reenviar_usa_el_enlace_del_carrito_guardado(como, monkeypatch):
     # El precio sale del catálogo, no del documento guardado: 3 × $3,000 − 20%.
     assert enviados['cotizacion']['total'] == 7200
     assert 'gift_code' not in json.dumps(enviados['cotizacion'], ensure_ascii=False)
+
+
+# ======================================================================
+#  ENCARGO 4 (2026-08-01) — SELECCIONAR, ARCHIVAR Y BORRAR
+# ======================================================================
+LOTE = '/api/distributor/quotes/lote'
+
+
+def test_archivar_la_saca_de_la_lista_y_vive_en_el_cajon(como):
+    cli = como(DIST)
+    token = cli.post(COMPARTIR, json=CARRITO).json()['token']
+    r = cli.post(LOTE, json={'tokens': [token], 'accion': 'archivar'})
+    assert r.status_code == 200 and r.json()['archivadas'] == 1
+    assert cli.get(LISTA).json()['quotes'] == []
+    cajon = cli.get(f'{LISTA}?archivadas=1').json()['quotes']
+    assert len(cajon) == 1 and cajon[0]['archivada'] is True
+    # Archivada NO es borrada: el enlace del cliente sigue vivo.
+    assert _sin_sesion().get(f'/api/carrito/{token}').status_code == 200
+
+
+def test_desarchivar_la_regresa(como):
+    cli = como(DIST)
+    token = cli.post(COMPARTIR, json=CARRITO).json()['token']
+    cli.post(LOTE, json={'tokens': [token], 'accion': 'archivar'})
+    r = cli.post(LOTE, json={'tokens': [token], 'accion': 'desarchivar'})
+    assert r.json()['desarchivadas'] == 1
+    assert len(cli.get(LISTA).json()['quotes']) == 1
+
+
+def test_borrar_la_desaparece_y_mata_el_enlace(como):
+    cli = como(DIST)
+    token = cli.post(COMPARTIR, json=CARRITO).json()['token']
+    r = cli.post(LOTE, json={'tokens': [token], 'accion': 'borrar'})
+    assert r.status_code == 200 and r.json()['borradas'] == 1
+    assert cli.get(LISTA).json()['quotes'] == []
+    assert cli.get(f'{LISTA}?archivadas=1').json()['quotes'] == []
+    # ⛔ Para el cliente el enlace MUERE: 404, como si nunca hubiera existido.
+    assert _sin_sesion().get(f'/api/carrito/{token}').status_code == 404
+    # Pero el documento QUEDA para auditar el obsequio (borrado suave).
+    assert any(d.get('token') == token and d.get('deleted_at')
+               for d in cli.bd[server.COLECCION_CARRITOS]._docs)
+
+
+def test_borrar_una_venta_NO_la_borra_la_archiva(como):
+    """⛔ Lo pagado no se toca desde un panel: «borrar» una cotización que ya es
+    venta la ARCHIVA y lo dice (`protegidas`)."""
+    cli = como(DIST)
+    token = cli.post(COMPARTIR, json=CARRITO).json()['token']
+    _guardar_pedido(cli.bd, token, status='confirmado', paid=True)
+    r = cli.post(LOTE, json={'tokens': [token], 'accion': 'borrar'})
+    assert r.json() == {'archivadas': 0, 'borradas': 0, 'protegidas': 1, 'desarchivadas': 0}
+    doc = next(d for d in cli.bd[server.COLECCION_CARRITOS]._docs if d.get('token') == token)
+    assert doc.get('archived_at') and not doc.get('deleted_at')
+
+
+def test_el_lote_acepta_varias_de_un_jalon(como):
+    cli = como(DIST)
+    t1 = cli.post(COMPARTIR, json=CARRITO).json()['token']
+    t2 = cli.post(COMPARTIR, json={**CARRITO, 'folio': 'COT-2'}).json()['token']
+    r = cli.post(LOTE, json={'tokens': [t1, t2], 'accion': 'archivar'})
+    assert r.json()['archivadas'] == 2
+
+
+def test_las_de_otra_persona_no_se_tocan(como):
+    token_ajeno = como(OTRA).post(COMPARTIR, json=CARRITO).json()['token']
+    r = como(DIST).post(LOTE, json={'tokens': [token_ajeno], 'accion': 'borrar'})
+    assert r.json()['borradas'] == 0
+    assert como(OTRA).get(LISTA).json()['quotes']          # sigue ahí, intacta
+
+
+def test_una_accion_inventada_rebota(como):
+    cli = como(DIST)
+    token = cli.post(COMPARTIR, json=CARRITO).json()['token']
+    assert cli.post(LOTE, json={'tokens': [token], 'accion': 'quemar'}).status_code == 400

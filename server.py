@@ -33,6 +33,7 @@ from models import (
     TokenInput, ActivateInput, ResendVerificationInput, AceptarAcuerdoInput,
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
     QuoteEmailRequest, ShareCartRequest, PrellenadoRequest,
+    SolicitudPagoComision, RegistroPagoComision, RechazoPagoComision,
 )
 from auth import (
     hash_password, verify_password, create_token, create_view_as_token, deny_view_as,
@@ -69,6 +70,7 @@ import pyramid
 # LA REGLA DE 5 (consumo propio de distribuidores) y el cierre de la puerta
 # anónima. Módulo puro para poder probarlo de verdad; ver descuentos.py.
 import descuentos
+import comisiones
 # ⛔ OBSEQUIOS DEL DISTRIBUIDOR Y CARRITO COMPARTIBLE (Christián, 2026-08-01). El
 # regalo se APILA con el código de descuento, su código interno NUNCA se le enseña
 # al cliente, y no puede romper el ROI. Módulo puro; ver regalos.py.
@@ -1376,6 +1378,23 @@ CAMPOS_PRIVADOS_DE_PRODUCTO = {'commission_cap', 'distributor_eligible'}
 # volumen). Lo que el catálogo público publica se recorta aquí: si un producto
 # aguanta 25% o 40%, afuera se ve "15%" y nadie se entera de la diferencia.
 TECHO_DESCUENTO_CLIENTE = 0.15
+
+# LA PROMO AUTOMÁTICA DE LA CASA: lo que recibe cualquier cliente que llega solo,
+# sin código y sin distribuidor. 10% parejo, 15% desde $35,000 de mercancía
+# descuentable (Christian, 2026-07-21: el escalón del 20% se quitó y el 15% subió
+# a $35,000 para no competir con los descuentos de los distribuidores).
+UMBRAL_PROMO_15 = 35000
+
+
+def promo_automatica(mercancia_descuentable: float) -> float:
+    """El descuento que la casa da SOLA, sin que nadie lo pida.
+
+    ⛔ ES EL PISO DE CUALQUIER VENTA (Christián, 2026-08-01): un cliente que llega
+    por un distribuidor que NO puso descuento propio recibe esta promo igual — no
+    puede quedar PEOR por haber llegado recomendado. La pantalla del carrito ya
+    prometía «el mayor gana» desde antes; esta función es la misma regla puesta
+    donde cobra."""
+    return 0.15 if (mercancia_descuentable or 0) >= UMBRAL_PROMO_15 else 0.10
 
 
 def vista_publica_de_producto(doc):
@@ -3464,8 +3483,8 @@ async def _obsequios_del_pedido(payload):
     if not token:
         return None, [], False
     doc = await db[COLECCION_CARRITOS].find_one({'token': token}, {'_id': 0})
-    if not doc:
-        logger.info('Carrito compartido no encontrado (%s): el pedido sigue sin cortesías.', token[:8])
+    if not doc or doc.get('deleted_at'):
+        logger.info('Carrito compartido no encontrado o borrado (%s): el pedido sigue sin cortesías.', token[:8])
         return None, [], False
     if doc.get('expires_at') and doc['expires_at'] < now_iso():
         logger.info('Carrito compartido vencido (%s): el pedido sigue sin cortesías.', token[:8])
@@ -3653,9 +3672,32 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         # con 50% valen 40% (Christián, 2026-07-31). Ver `tasa_de_cupon`.
         discount_rate = tasa_de_cupon(coupon)
     elif referrer:
-        discount_rate = code_discount
+        # EL CARRITO COMPARTIDO COBRA LO QUE SE COTIZÓ (Christián, 2026-08-01). El
+        # descuento que la distribuidora pidió al armar el enlace vive en el
+        # documento del carrito, no en el código: hasta hoy la caja cobraba el
+        # descuento del código `ref` y un carrito cotizado al 20% podía cobrarse
+        # al 10% sin que nadie lo viera. Acotado a su comisión, como todo código.
+        # Sólo aplica si la atribución sigue siendo la del enlace: un código que
+        # el cliente tecleó a propósito manda él, no el carrito.
+        _es_del_carrito = bool(
+            _carrito_doc and (payload.distributor_code or '').strip() == (_carrito_doc.get('ref') or ''))
+        if _es_del_carrito:
+            _pedida = max(0.0, float(_carrito_doc.get('discount_asked') or 0))
+            # ⛔ SIN DESCUENTO PROPIO, MANDA LA PROMO DE LA CASA (Christián,
+            # 2026-08-01): un carrito compartido al 0% le enseña al cliente la
+            # promo automática (ver `_armar_cotizacion`), y la caja cobra ESO —
+            # ni el 0% que dejaría al cliente peor que un anónimo, ni el
+            # descuento del código, que aquí nadie ofreció.
+            discount_rate = (min(pyramid.effective_rate(referrer), _pedida)
+                             if _pedida > 0 else promo_automatica(discountable))
+        else:
+            # Código suelto (tecleado o de un enlace `?ref=`): su descuento, y la
+            # promo automática como PISO — el mayor gana, que es lo que el
+            # carrito de la página promete desde siempre. Un código sin
+            # descuento ya no puede dejar al cliente sin los automáticos.
+            discount_rate = max(code_discount, promo_automatica(discountable))
     else:
-        discount_rate = 0.15 if discountable >= 35000 else 0.10
+        discount_rate = promo_automatica(discountable)
     # COMPRA PROPIA de un distribuidor (regla de Christian, 2026-07-25): compra para
     # sí mismo con SU comisión máxima como descuento. Ese descuento ES su comisión,
     # cobrada por adelantado: NO gana comisión encima, y la orden no se atribuye a
@@ -5605,7 +5647,22 @@ def _armar_cotizacion(items, pedido_pct, tope_dist, catalogo):
     El descuento de cada renglón es el menor de tres: el que pidió el distribuidor,
     lo que aguanta ese producto (`tope_de_descuento`, la misma función del checkout)
     y su propio máximo. Es la misma aritmética que la pantalla, para que el correo y
-    la hoja impresa digan el mismo número."""
+    la hoja impresa digan el mismo número.
+
+    ⛔ SIN DESCUENTO PROPIO, MANDA LA PROMO DE LA CASA (Christián, 2026-08-01):
+    si el distribuidor cotizó al 0%, el cliente recibe los automáticos — 10%, o
+    15% desde $35,000 de mercancía descuentable — igual que si llegara solo al
+    sitio. La caja cobra esta misma cuenta (ver `create_order`)."""
+    if (pedido_pct or 0) <= 0:
+        base = sum(round(float(d.get('price') or 0)) * int(it.quantity)
+                   for it in items
+                   for d in [catalogo.get(it.product_id) or {}]
+                   if d and not d.get('hidden') and float(d.get('price') or 0) > 0
+                   and tope_de_descuento(d) > 0)
+        pedido_pct = promo_automatica(base)
+        # La promo es de la casa, no del nivel del distribuidor: no se recorta
+        # con su máximo (el tope POR PRODUCTO sí sigue mandando, abajo).
+        tope_dist = max(tope_dist, pedido_pct)
     lineas, lista_total, total = [], 0.0, 0.0
     for it in items:
         doc = catalogo.get(it.product_id)
@@ -5834,9 +5891,19 @@ async def _resolver_carrito(doc):
                            'quantity': int(g.get('cantidad') or 1)})
 
     # ---- el envío, con la política de la casa y no una inventada aquí ----
+    # ⛔ SIN DIRECCIÓN NO SE COTIZA ENVÍO (Christián, 2026-08-01, con estas
+    # palabras: «que en las cotizaciones no se muestre el costo de envío si no se
+    # proporcionó una dirección»). El carrito enseña «se calcula al pagar»
+    # (`shipping_pending`) y el checkout lo cobra como siempre, ya con el
+    # domicilio enfrente. El envío de CORTESÍA es gratis con o sin dirección.
+    sin_direccion = not str(doc.get('client_address') or '').strip()
     envio = 0
-    if COBRAR_ENVIO and lineas:
-        envio = 0 if envio_de_cortesia else shipping_for(total_mercancia)
+    envio_pendiente = False
+    if COBRAR_ENVIO and lineas and not envio_de_cortesia:
+        if sin_direccion:
+            envio_pendiente = True
+        else:
+            envio = shipping_for(total_mercancia)
 
     publico = regalos.vista_publica({
         'token': doc.get('token'),
@@ -5850,7 +5917,8 @@ async def _resolver_carrito(doc):
         # El PORCENTAJE, que es lo que Christián pidió que se lea en vez de "ahorro".
         'discount_rate': round((lista_total - total_mercancia) / lista_total, 4) if lista_total else 0,
         'shipping': round(envio),
-        'shipping_free': bool(COBRAR_ENVIO and lineas and envio <= 0),
+        'shipping_free': bool(COBRAR_ENVIO and lineas and envio <= 0 and not envio_pendiente),
+        'shipping_pending': envio_pendiente,
         'total': round(total_mercancia + envio),
         # El código del DISTRIBUIDOR sí viaja: es lo que atribuye la venta, y el
         # cliente ya lo veía en los enlaces `?ref=` de siempre. El del OBSEQUIO no.
@@ -6039,7 +6107,7 @@ async def datos_del_carrito_compartido(token: str, payload: PrellenadoRequest,
         logger.warning('PRELLENADO frenado por ritmo en el carrito %s', tok[:8])
         raise HTTPException(status_code=429, detail='Demasiados intentos. Espera un momento.')
     doc = await db[COLECCION_CARRITOS].find_one({'token': tok}, {'_id': 0})
-    if not doc:
+    if not doc or doc.get('deleted_at'):
         raise HTTPException(status_code=404, detail='No hay datos para ese carrito')
     if doc.get('expires_at') and doc['expires_at'] < now_iso():
         raise HTTPException(status_code=410, detail='Ese carrito ya venció.')
@@ -6061,7 +6129,9 @@ async def abrir_carrito_compartido(token: str):
     obsequio.
     """
     doc = await db[COLECCION_CARRITOS].find_one({'token': (token or '').strip()}, {'_id': 0})
-    if not doc:
+    # El borrado por la distribuidora mata el enlace: para el cliente es como si
+    # nunca hubiera existido (2026-08-01).
+    if not doc or doc.get('deleted_at'):
         raise HTTPException(status_code=404, detail='Ese carrito ya no existe')
     if doc.get('expires_at') and doc['expires_at'] < now_iso():
         raise HTTPException(status_code=410, detail='Ese carrito ya venció. Pídele uno nuevo a quien te lo mandó.')
@@ -6147,22 +6217,30 @@ def _renglon_de_cotizacion(doc, pedido, site):
         'order_total': pedido.get('total') or 0,
         'order_status': pedido.get('status') or '',
         'paid_at': pedido.get('paid_at') or '',
+        'archivada': bool(doc.get('archived_at')),
         'url': f'{site}/carrito/{token}{fragmento}',
     }
 
 
 @api_router.get('/distributor/quotes')
-async def distributor_quotes(dist=Depends(get_current_distributor)):
+async def distributor_quotes(archivadas: int = 0, dist=Depends(get_current_distributor)):
     """MIS COTIZACIONES. Sólo las suyas — nunca las de otro.
 
     El filtro es `distributor_id` contra el id del token, no un parámetro de la
     dirección: no hay forma de pedir las de otra persona porque no hay dónde
     escribirlo. El "ver como" del admin entra (es de lectura) y ve las del
     distribuidor que está mirando, que es justo lo que se espera de esa herramienta.
+
+    Las BORRADAS no salen jamás; las ARCHIVADAS sólo con `?archivadas=1` — el
+    archivo no es un bote de basura, es un cajón (Christián, 2026-08-01).
     """
     docs = await db[COLECCION_CARRITOS].find(
         {'distributor_id': dist['id']}, {'_id': 0}).sort(
         'created_at', -1).to_list(MAX_COTIZACIONES_EN_LISTA)
+    # El recorte va aquí y no en la consulta a propósito: son 200 documentos a lo
+    # más, y así la regla es una sola línea que se lee (y se prueba) completa.
+    docs = [d for d in docs if not d.get('deleted_at')
+            and bool(d.get('archived_at')) == bool(archivadas)]
     # LOS CARRITOS DE ANTES DE HOY no traen foto: se les saca una ahora y se guarda,
     # para que esto pase una sola vez por carrito y no en cada carga del panel.
     for doc in docs:
@@ -6197,6 +6275,58 @@ async def distributor_quotes(dist=Depends(get_current_distributor)):
         'ventas': sum(1 for f in filas if f['estado'] == ESTADO_VENTA),
         'vendido': sum(f['order_total'] for f in filas if f['estado'] == ESTADO_VENTA),
     }
+
+
+class LoteDeCotizaciones(BaseModel):
+    """Archivar o borrar UNA O VARIAS cotizaciones de un jalón (Christián,
+    2026-08-01: «un checkbox para seleccionar, un archivar y un borrar»)."""
+    tokens: List[str]
+    accion: str          # 'archivar' | 'borrar' | 'desarchivar'
+
+
+@api_router.post('/distributor/quotes/lote')
+async def lote_de_cotizaciones(payload: LoteDeCotizaciones,
+                               dist=Depends(get_current_distributor)):
+    """Archiva o borra cotizaciones PROPIAS, seleccionadas en el panel.
+
+    Tres reglas, las tres del lado del servidor:
+      · SÓLO LAS SUYAS: cada token se resuelve contra su `distributor_id`; un
+        token ajeno simplemente no se encuentra.
+      · ⛔ UNA VENTA NO SE BORRA (regla de la casa: lo pagado no se toca). Si el
+        token ya tiene un pedido, «borrar» lo ARCHIVA y se le dice cuántas se
+        protegieron así — el registro del dinero no se destruye desde un panel.
+      · El borrado es SUAVE (`deleted_at`): el enlace muere para el cliente
+        (404 al abrirlo) pero el documento queda para auditar el obsequio.
+    """
+    deny_view_as(dist)
+    if payload.accion not in ('archivar', 'borrar', 'desarchivar'):
+        raise HTTPException(status_code=400, detail='Acción desconocida')
+    tokens = [t.strip() for t in (payload.tokens or []) if t and t.strip()][:MAX_COTIZACIONES_EN_LISTA]
+    if not tokens:
+        raise HTTPException(status_code=400, detail='No se seleccionó ninguna cotización')
+    ahora = now_iso()
+    archivadas = borradas = protegidas = desarchivadas = 0
+    for tk in tokens:
+        doc = await db[COLECCION_CARRITOS].find_one(
+            {'token': tk, 'distributor_id': dist['id']}, {'_id': 0, 'token': 1, 'deleted_at': 1})
+        if not doc or doc.get('deleted_at'):
+            continue
+        if payload.accion == 'desarchivar':
+            await db[COLECCION_CARRITOS].update_one({'token': tk}, {'$set': {'archived_at': None}})
+            desarchivadas += 1
+            continue
+        con_pedido = bool(await db.orders.find_one({'shared_cart_token': tk}, {'_id': 0, 'id': 1}))
+        if payload.accion == 'borrar' and not con_pedido:
+            await db[COLECCION_CARRITOS].update_one({'token': tk}, {'$set': {'deleted_at': ahora}})
+            borradas += 1
+        else:
+            await db[COLECCION_CARRITOS].update_one({'token': tk}, {'$set': {'archived_at': ahora}})
+            if payload.accion == 'borrar':
+                protegidas += 1     # quiso borrar una venta: se archivó en su lugar
+            else:
+                archivadas += 1
+    return {'archivadas': archivadas, 'borradas': borradas,
+            'protegidas': protegidas, 'desarchivadas': desarchivadas}
 
 
 class ReenvioDeCotizacion(BaseModel):
@@ -7043,8 +7173,36 @@ def _compradores_invitados(orders, correos_con_cuenta):
     return list(por_correo.values())
 
 
+def _corte_de_periodo(periodo: str) -> str:
+    """Desde cuándo cuenta un pedido para el filtro de fechas del panel.
+
+    Devuelve un ISO-8601 UTC, o '' cuando se pide TODO. `semana` y `30dias` son
+    ventanas móviles (los últimos 7 y 30 días); `mes` y `ano` son de calendario
+    (lo que va de ESTE mes y de ESTE año) — si los cuatro fueran móviles, «mes»
+    y «30 días» serían el mismo botón dos veces."""
+    ahora = datetime.now(timezone.utc)
+    p = (periodo or '').strip().lower()
+    if p == 'semana':
+        return (ahora - timedelta(days=7)).isoformat()
+    if p in ('30dias', '30'):
+        return (ahora - timedelta(days=30)).isoformat()
+    if p == 'mes':
+        return ahora.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    if p in ('ano', 'anio', 'año'):
+        return ahora.replace(month=1, day=1, hour=0, minute=0,
+                             second=0, microsecond=0).isoformat()
+    return ''
+
+
 @api_router.get('/distributor/clients')
-async def distributor_clients(dist=Depends(get_current_distributor)):
+async def distributor_clients(periodo: str = 'todo', dist=Depends(get_current_distributor)):
+    """Sus clientes con totales POR PERIODO (Christián, 2026-08-01: «totales de
+    comisión por cliente, con filtro de fecha: semana, 30 días, mes, año, todo»).
+
+    El filtro recorta los PEDIDOS que se suman, no la lista: un cliente sin
+    compras esta semana sigue saliendo, con ceros — desaparecerlo parecería que
+    se borró."""
+    corte = _corte_de_periodo(periodo)
     users = await db.users.find({'referred_by': dist['id']}, {'_id': 0, 'password_hash': 0}).to_list(5000)
     # Solo pedidos hechos con SU código cuentan (no todo lo que compró el cliente).
     orders = await db.orders.find({'referred_by': dist['id']}, {'_id': 0}).to_list(10000)
@@ -7054,7 +7212,8 @@ async def distributor_clients(dist=Depends(get_current_distributor)):
             by_user.setdefault(o['user_id'], []).append(o)
     out = []
     for u in users:
-        uo = [o for o in by_user.get(u['id'], []) if esta_vivo(o)]
+        uo = [o for o in by_user.get(u['id'], []) if esta_vivo(o)
+              and (not corte or (o.get('created_at') or '') >= corte)]
         # Privacidad (Christian 2026-07-23): el distribuidor ve un RESUMEN, no la
         # ficha del cliente. Nada de correo, teléfono ni domicilio.
         out.append({
@@ -7068,13 +7227,19 @@ async def distributor_clients(dist=Depends(get_current_distributor)):
             'my_earnings': sum(_my_amount(o, dist['id']) for o in uo),
             'last_order_at': max([o.get('created_at', '') for o in uo], default=None),
         })
-    # Y los que compraron con su código SIN cuenta: también son suyos.
+    # Y los que compraron con su código SIN cuenta: también son suyos. El corte
+    # del periodo se aplica a sus pedidos IGUAL que a los de los clientes con
+    # cuenta — el invitado se detecta con todos sus pedidos (para no perder su
+    # nombre más reciente), pero se le suma sólo lo del periodo.
     con_cuenta = {(u.get('email') or '').strip().lower() for u in users}
     for g in _compradores_invitados(orders, con_cuenta):
-        uo = g['orders']
+        uo = [o for o in g['orders']
+              if not corte or (o.get('created_at') or '') >= corte]
         out.append({
+            # «Cliente desde» sale de TODOS sus pedidos, no de los del periodo:
+            # la fecha en que alguien se volvió cliente no cambia con el filtro.
             'id': g['id'], 'name': g['name'], 'created_at': min(
-                (o.get('created_at', '') for o in uo), default=None),
+                (o.get('created_at', '') for o in g['orders']), default=None),
             'guest': True,
             'orders_count': len(uo),
             'total_spent': sum(cobrado_de(o) for o in uo),
@@ -7084,6 +7249,181 @@ async def distributor_clients(dist=Depends(get_current_distributor)):
         })
     out.sort(key=lambda u: -u['total_spent'])
     return out
+
+
+# ==========================================================================
+#  EL PAGO DE LAS COMISIONES  —  solicitar, deber y pagar (Christián, 2026-08-01)
+# ==========================================================================
+# «Hoy no hay dónde ver qué se le debe a cada quien ni qué ya se pagó.» Ahora sí:
+# el distribuidor ve ganado / pagado / por pagar y SOLICITA su pago; el admin ve
+# la deuda de toda la casa y REGISTRA cada pago con su referencia. La aritmética
+# y los candados viven en `comisiones.py`, probados sin red.
+COLECCION_PAGOS_COMISION = 'commission_payouts'
+
+
+async def _ganado_de(dist_id: str) -> float:
+    """Lo GANADO por un distribuidor, con la MISMA suma que ven sus paneles
+    (`pyramid.earnings_for`: vendedor + sobrecomisiones, sólo ventas cobradas)."""
+    orders = await db.orders.find(
+        {'$or': [{'referred_by': dist_id}, {'commissions.distributor_id': dist_id}]},
+        {'_id': 0, 'status': 1, 'paid': 1, 'referred_by': 1,
+         'commissions': 1, 'commission': 1}).to_list(10000)
+    return pyramid.earnings_for(dist_id, orders)
+
+
+async def _pagos_de(dist_id: str) -> list:
+    docs = await db[COLECCION_PAGOS_COMISION].find(
+        {'distributor_id': dist_id}, {'_id': 0}).to_list(500)
+    return sorted(docs, key=lambda p: p.get('requested_at') or '', reverse=True)
+
+
+@api_router.get('/distributor/comisiones')
+async def distributor_comisiones(dist=Depends(get_current_distributor)):
+    """Su bolsa: ganado, pagado, por pagar, lo solicitado y su historial."""
+    ganado = await _ganado_de(dist['id'])
+    pagos = await _pagos_de(dist['id'])
+    r = comisiones.resumen(ganado, pagos)
+    r['historial'] = pagos
+    return r
+
+
+@api_router.post('/distributor/comisiones/solicitar')
+async def solicitar_pago_de_comision(payload: SolicitudPagoComision,
+                                     dist=Depends(get_current_distributor)):
+    """El distribuidor pide su pago. Sin monto = todo su saldo.
+
+    El candado (`comisiones.puede_solicitar`) rebota lo que rebase el saldo y la
+    segunda solicitud mientras hay una en camino. Al admin le llega la campanita."""
+    deny_view_as(dist)
+    ganado = await _ganado_de(dist['id'])
+    pagos = await _pagos_de(dist['id'])
+    monto = float(payload.amount) if payload.amount else comisiones.por_pagar(ganado, pagos)
+    ok, motivo = comisiones.puede_solicitar(monto, ganado, pagos)
+    if not ok:
+        raise HTTPException(status_code=400, detail=motivo)
+    doc = {
+        'id': str(uuid.uuid4()),
+        'distributor_id': dist['id'],
+        'distributor_name': dist.get('name') or '',
+        'amount': round(monto),
+        'status': comisiones.ESTADO_SOLICITADO,
+        'requested_at': now_iso(),
+        'requested_by': 'distribuidor',
+    }
+    await db[COLECCION_PAGOS_COMISION].insert_one(dict(doc))
+    try:
+        admins = await db.users.find({'role': 'admin'}, {'_id': 0, 'id': 1}).to_list(20)
+        for a in admins:
+            await notify(a['id'], 'comision_solicitada', 'Solicitud De Pago De Comisión',
+                         f'{dist.get("name") or "Un distribuidor"} solicita el pago de '
+                         f'${monto:,.0f} de comisiones.', link='/admin?tab=distributors')
+    except Exception:
+        logger.exception('No se pudo avisar la solicitud de comisión de %s', dist['id'])
+    return {'solicitado': True, **doc}
+
+
+@api_router.get('/admin/comisiones')
+async def admin_comisiones(admin=Depends(get_current_admin)):
+    """La deuda de toda la casa, distribuidor por distribuidor.
+
+    Una sola pasada por pedidos y pagos — no una consulta por persona — porque
+    esta pantalla se abre a diario y a la base no se le pega dos mil veces."""
+    dists = await db.users.find({'role': 'distributor'},
+                                {'_id': 0, 'id': 1, 'name': 1, 'email': 1,
+                                 'distributor_code': 1}).to_list(1000)
+    orders = await db.orders.find({}, {'_id': 0, 'status': 1, 'paid': 1,
+                                       'referred_by': 1, 'commissions': 1,
+                                       'commission': 1}).to_list(20000)
+    pagos = await db[COLECCION_PAGOS_COMISION].find({}, {'_id': 0}).to_list(5000)
+    pagos_por_dist = {}
+    for p in pagos:
+        pagos_por_dist.setdefault(p.get('distributor_id'), []).append(p)
+    out = []
+    for d in dists:
+        suyos = pagos_por_dist.get(d['id'], [])
+        r = comisiones.resumen(pyramid.earnings_for(d['id'], orders), suyos)
+        out.append({'id': d['id'], 'name': d.get('name') or '',
+                    'email': d.get('email') or '',
+                    'distributor_code': d.get('distributor_code') or '', **r})
+    # Primero los que tienen solicitud esperando; luego por deuda, de mayor a menor.
+    out.sort(key=lambda x: (0 if x['solicitud_pendiente'] else 1, -x['por_pagar']))
+    return {'distribuidores': out,
+            'por_pagar_total': round(sum(x['por_pagar'] for x in out)),
+            'solicitudes': sum(1 for x in out if x['solicitud_pendiente'])}
+
+
+@api_router.post('/admin/comisiones/pagar')
+async def admin_pagar_comision(payload: RegistroPagoComision,
+                               admin=Depends(get_current_admin)):
+    """Registra un pago YA HECHO. No mueve dinero: deja el recibo.
+
+    Si hay una solicitud en camino, ese documento se convierte en el recibo (el
+    monto pagado manda; el solicitado queda guardado aparte). Sin solicitud, el
+    recibo nace directo — Christián puede pagar sin que nadie se lo pida."""
+    deny_view_as(admin)
+    dist = await db.users.find_one({'id': payload.distributor_id, 'role': 'distributor'},
+                                   {'_id': 0, 'id': 1, 'name': 1})
+    if not dist:
+        raise HTTPException(status_code=404, detail='Ese distribuidor no existe')
+    ganado = await _ganado_de(dist['id'])
+    pagos = await _pagos_de(dist['id'])
+    ok, motivo = comisiones.puede_pagar(payload.amount, ganado, pagos)
+    if not ok:
+        raise HTTPException(status_code=400, detail=motivo)
+    ahora = now_iso()
+    pendiente = comisiones.solicitud_pendiente(pagos)
+    if pendiente:
+        await db[COLECCION_PAGOS_COMISION].update_one(
+            {'id': pendiente['id']},
+            {'$set': {'status': comisiones.ESTADO_PAGADO,
+                      'amount': round(float(payload.amount)),
+                      'requested_amount': pendiente.get('amount'),
+                      'reference': (payload.reference or '').strip()[:200],
+                      'resolved_at': ahora, 'paid_by': admin['id']}})
+        recibo_id = pendiente['id']
+    else:
+        recibo_id = str(uuid.uuid4())
+        await db[COLECCION_PAGOS_COMISION].insert_one({
+            'id': recibo_id,
+            'distributor_id': dist['id'],
+            'distributor_name': dist.get('name') or '',
+            'amount': round(float(payload.amount)),
+            'status': comisiones.ESTADO_PAGADO,
+            'requested_at': ahora, 'requested_by': 'admin',
+            'reference': (payload.reference or '').strip()[:200],
+            'resolved_at': ahora, 'paid_by': admin['id']})
+    try:
+        await notify(dist['id'], 'comision_pagada', 'Comisión Pagada',
+                     f'Se registró el pago de ${float(payload.amount):,.0f} de tus '
+                     'comisiones. Revísalo en tu panel.', link='/distribuidor')
+    except Exception:
+        logger.exception('No se pudo avisar el pago de comisión a %s', dist['id'])
+    return {'pagado': True, 'id': recibo_id}
+
+
+@api_router.post('/admin/comisiones/rechazar')
+async def admin_rechazar_solicitud(payload: RechazoPagoComision,
+                                   admin=Depends(get_current_admin)):
+    """Niega una solicitud, con motivo. El saldo no se toca y el distribuidor
+    puede volver a solicitar cuando quiera."""
+    deny_view_as(admin)
+    doc = await db[COLECCION_PAGOS_COMISION].find_one(
+        {'id': payload.payout_id, 'status': comisiones.ESTADO_SOLICITADO}, {'_id': 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail='Esa solicitud no existe o ya se resolvió')
+    await db[COLECCION_PAGOS_COMISION].update_one(
+        {'id': doc['id']},
+        {'$set': {'status': comisiones.ESTADO_RECHAZADO,
+                  'motivo': (payload.motivo or '').strip()[:300],
+                  'resolved_at': now_iso(), 'paid_by': admin['id']}})
+    try:
+        await notify(doc['distributor_id'], 'comision_rechazada', 'Solicitud De Pago Rechazada',
+                     (f'Tu solicitud de ${float(doc.get("amount") or 0):,.0f} no procedió.'
+                      + (f' Motivo: {payload.motivo.strip()}' if (payload.motivo or '').strip() else '')),
+                     link='/distribuidor')
+    except Exception:
+        logger.exception('No se pudo avisar el rechazo a %s', doc['distributor_id'])
+    return {'rechazado': True}
 
 
 @api_router.get('/cotizador/clientes')

@@ -269,7 +269,7 @@ def limpiar_obsequios(crudos, existe_producto) -> list:
 LLAVES_PUBLICAS = (
     'token', 'folio', 'client_name', 'currency',
     'lines', 'gifts', 'list_total', 'discount', 'discount_rate',
-    'shipping', 'shipping_free', 'total', 'ref', 'expires_at',
+    'shipping', 'shipping_free', 'shipping_pending', 'total', 'ref', 'expires_at',
 )
 
 # Los CUATRO datos que el distribuidor capturó por su cliente, y nada más. Misma

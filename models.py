@@ -657,6 +657,29 @@ class DistributorCreate(BaseModel):
     upline_id: Optional[str] = None        # distribuidor que lo trajo (para las sobrecomisiones)
 
 
+class SolicitudPagoComision(BaseModel):
+    """El distribuidor pide su pago. Sin monto = todo su saldo por pagar.
+
+    El monto es una PETICIÓN: el servidor la valida contra el saldo real
+    (`comisiones.puede_solicitar`) antes de escribir nada."""
+    amount: Optional[float] = Field(None, ge=0)
+
+
+class RegistroPagoComision(BaseModel):
+    """El admin registra que YA pagó una comisión. `reference` es el rastro del
+    dinero (folio SPEI, «efectivo», lo que sea) — opcional pero muy recomendable,
+    porque el documento que esto crea es el recibo."""
+    distributor_id: str
+    amount: float = Field(..., gt=0)
+    reference: Optional[str] = Field('', max_length=200)
+
+
+class RechazoPagoComision(BaseModel):
+    """El admin niega una solicitud, con motivo. No mueve un peso de saldo."""
+    payout_id: str
+    motivo: Optional[str] = Field('', max_length=300)
+
+
 class DiscountCodeCreate(BaseModel):
     # El distribuidor crea VARIOS códigos y elige cuál da a cada cliente. El
     # descuento va de 0 hasta su comisión de nivel (el servidor lo acota).

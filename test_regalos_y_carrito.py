@@ -386,16 +386,22 @@ def test_el_precio_lo_pone_el_servidor_no_el_enlace(como):
 def test_el_renglon_de_envio_sale_de_la_politica_de_la_casa(como):
     """El envío se PIDE al servidor, no se escribe en la pantalla: dos Retatrutidas
     con 20% pagan $4,800 — arriba de la compra mínima — y ahí la casa absorbe hasta
-    su tope. Un pedido chiquito paga la tarifa plana."""
+    su tope. Un pedido chiquito paga la tarifa plana. CON DIRECCIÓN: sin ella el
+    envío ni se enseña (ver test_sin_direccion_el_envio_se_cotiza_por_separado)."""
     cli = como(DIST)
     grande = cli.post(COMPARTIR, json={
-        'discount': 0.20, 'items': [{'product_id': 'p-reta', 'quantity': 2}], 'gifts': []}).json()
+        'discount': 0.20, 'items': [{'product_id': 'p-reta', 'quantity': 2}], 'gifts': [],
+        'client_address': 'Calle 1, CDMX'}).json()
     chico = cli.post(COMPARTIR, json={
-        'discount': 0.0, 'items': [{'product_id': 'p-chico', 'quantity': 1}], 'gifts': []}).json()
+        'discount': 0.0, 'items': [{'product_id': 'p-chico', 'quantity': 1}], 'gifts': [],
+        'client_address': 'Calle 1, CDMX'}).json()
     assert grande['total'] == grande['list_total'] - grande['discount'] + grande['shipping']
     assert chico['shipping'] == server.SHIPPING_FLAT and chico['shipping_free'] is False
-    # ⛔ El envío SUMA, nunca resta.
-    assert chico['total'] == chico['list_total'] + chico['shipping']
+    # ⛔ El envío SUMA, nunca resta. Y al 0% pedido el carrito ya no sale a precio
+    # de lista: entra la promo de la casa (regla del 2026-08-01, ver
+    # test_promo_automatica.py), así que el total es lista − promo + envío.
+    assert chico['discount'] > 0
+    assert chico['total'] == chico['list_total'] - chico['discount'] + chico['shipping']
 
 
 def test_regalar_el_envio_lo_deja_en_cero_y_lo_dice(como):
@@ -558,3 +564,26 @@ def test_la_ruta_publica_del_carrito_no_pide_sesion():
     ruta = next(r for r in server.app.routes if getattr(r, 'path', '') == '/api/carrito/{token}')
     assert not [d for d in ruta.dependant.dependencies if 'user' in (d.call.__name__ or '')], \
         'la ruta del carrito compartido dejó de ser pública'
+
+
+def test_sin_direccion_el_envio_se_cotiza_por_separado(como):
+    """⛔ SIN DIRECCIÓN NO SE ENSEÑA COSTO DE ENVÍO (Christián, 2026-08-01, con
+    estas palabras: «necesitamos poner una leyenda que diga que el envío se
+    cotiza por separado»). El carrito sale con `shipping_pending`, sin cobrar ni
+    prometer «gratis», y el total es SOLO la mercancía."""
+    cuerpo = como(DIST).post(COMPARTIR, json={
+        'discount': 0.20, 'items': [{'product_id': 'p-chico', 'quantity': 1}],
+        'gifts': []}).json()
+    assert cuerpo['shipping_pending'] is True
+    assert cuerpo['shipping'] == 0
+    assert cuerpo['shipping_free'] is False
+    assert cuerpo['total'] == cuerpo['list_total'] - cuerpo['discount']
+
+
+def test_el_envio_de_cortesia_es_gratis_con_o_sin_direccion(como):
+    """El regalo del envío no depende del domicilio: regalado es regalado."""
+    cuerpo = como(DIST).post(COMPARTIR, json={
+        'discount': 0.0, 'items': [{'product_id': 'p-reta', 'quantity': 1}],
+        'gifts': [{'tipo': 'envio'}]}).json()
+    assert cuerpo['shipping'] == 0 and cuerpo['shipping_free'] is True
+    assert cuerpo.get('shipping_pending') is False
