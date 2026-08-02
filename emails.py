@@ -36,19 +36,43 @@ def normalize_language(language):
     return lang if lang in SUPPORTED_LANGUAGES else DEFAULT_LANGUAGE
 
 
+def _config(nombre: str, por_omision: str = '') -> str:
+    """El valor efectivo de una opción de correo: PRIMERO el entorno, luego el Panel.
+
+    ⚠️ Por qué existe (2026-08-01). Todo esto se leía sólo de `os.environ`, así que
+    para cambiar de proveedor de correo había que entrar al servidor por SSH. El día
+    que el correo de las cotizaciones no salía, el diagnóstico fue lento justamente
+    por eso: `EMAIL_PROVIDER` viene en `ses` por omisión, la cuenta de SES está en
+    modo de pruebas, y Christián tenía Resend contratado sin forma de conectarlo
+    desde el Panel — «tenemos Resend para eso, deja de insistir con AWS».
+
+    Ahora estas tres (`EMAIL_PROVIDER`, `RESEND_API_KEY`, `EMAIL_ENABLED`) pasan por
+    el mismo camino que las llaves de cobro: el `.env` del servidor SIGUE MANDANDO, y
+    si no está ahí se busca lo que se guardó cifrado desde Admin → Cobros.
+    """
+    del_entorno = os.environ.get(nombre)
+    if del_entorno:
+        return del_entorno
+    try:
+        import secretos
+        return secretos.valor(nombre) or por_omision
+    except Exception:      # secretos no disponible: se sigue con el entorno
+        return por_omision
+
+
 def email_enabled() -> bool:
     """Si el envio esta apagado no podemos exigir confirmacion de correo:
     dejaria fuera a todo el que se registre. El servidor lo consulta antes
     de bloquear un login."""
-    return os.environ.get('EMAIL_ENABLED', 'false').lower() == 'true'
+    return _config('EMAIL_ENABLED', 'false').lower() == 'true'
 
 
 def _sender():
-    return os.environ.get('EMAIL_FROM', 'Exygen Labs <hola@exygenlabs.com>')
+    return _config('EMAIL_FROM', 'Exygen Labs <hola@exygenlabs.com>')
 
 
 def _send_via_ses(to_address, subject, html_body, reply_to=None):
-    region = os.environ.get('SES_REGION', 'us-east-1')
+    region = _config('SES_REGION', 'us-east-1')
     ses = boto3.client('sesv2', region_name=region)
     extra = {'ReplyToAddresses': [reply_to]} if reply_to else {}
     ses.send_email(
@@ -64,7 +88,7 @@ def _send_via_ses(to_address, subject, html_body, reply_to=None):
 
 def _send_via_resend(to_address, subject, html_body, reply_to=None):
     """Resend por HTTP. No necesita SDK y no tiene sandbox que pedir."""
-    api_key = os.environ.get('RESEND_API_KEY')
+    api_key = _config('RESEND_API_KEY')
     if not api_key:
         raise RuntimeError('RESEND_API_KEY is not configured.')
     cuerpo = {'from': _sender(), 'to': [to_address], 'subject': subject, 'html': html_body}
@@ -91,7 +115,7 @@ def _send_email_sync(to_address, subject, html_body, reply_to=None):
     RESPUESTA — así el cliente que contesta una cotización le contesta a su
     distribuidor, sin que el correo salga suplantando su dominio y caiga en spam.
     """
-    name = os.environ.get('EMAIL_PROVIDER', 'ses').strip().lower()
+    name = _config('EMAIL_PROVIDER', 'ses').strip().lower()
     send = PROVIDERS.get(name)
     if not send:
         raise RuntimeError(f'EMAIL_PROVIDER desconocido: {name}')

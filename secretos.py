@@ -57,6 +57,16 @@ PERMITIDAS = {
     # al arrancar, así que pegarla desde el panel no la encendería y el Admin
     # mostraría "configurada" sobre una llave que no se usa. Ésa sigue en el
     # `.env` del servidor.
+    # El correo. Vivían SÓLO en el `.env` del servidor, así que cambiar de
+    # proveedor exigía entrar por SSH — y el 2026-08-01 eso dejó las cotizaciones
+    # sin salir: `EMAIL_PROVIDER` viene en `ses` por omisión, esa cuenta está en
+    # modo de pruebas, y Resend estaba contratado sin forma de conectarlo desde el
+    # Panel. `EMAIL_PROVIDER` no es un secreto sino un interruptor (ses | resend),
+    # pero viaja por aquí para que se pueda cambiar sin desplegar.
+    'EMAIL_PROVIDER',
+    'RESEND_API_KEY',
+    'EMAIL_ENABLED',
+    'EMAIL_FROM',
     'OPENAI_API_KEY',
     'MOONSHOT_API_KEY',
     'ANTHROPIC_API_KEY',
