@@ -14,6 +14,7 @@ mientras el de comprar la guía sí estaba prendido, así que la casa pagó el e
 de cada pedido sin cobrarlo. Este encabezado decía «hoy esto no cobra nada» y
 llevaba días siendo falso; se corrigió el 2026-08-01.
 """
+import re
 
 # --------------------------------------------------------------------- switches
 # `COTIZAR_EN_CHECKOUT`: el checkout pide precios reales de Estafeta por CP y peso,
@@ -70,26 +71,101 @@ def tope_guia_automatica(es_express: bool) -> float:
 
 
 # ------------------------------------------------------------------- el peso
-# ⚠️ PENDIENTE DE CHRISTIAN: capturar el peso REAL de cada producto.
+# ⛔ AQUÍ SE DISTINGUE **DECLARADO** DE **ESTIMADO**, Y NO SE MEZCLAN NUNCA.
 #
-# El catálogo todavía no trae peso (`weight_kg` existe en el modelo pero viene
-# vacío). Mientras tanto se usan estos valores por omisión, que salen de lo que
-# de verdad hay en la caja, no de una adivinanza redonda:
+#   · DECLARADO = `weight_kg` del catálogo. Es lo que dio la BÁSCULA. Manda
+#     siempre, sobre cualquier cuenta de este archivo.
+#   · ESTIMADO  = lo que calculan las tablas de abajo a partir de la
+#     presentación. Sirve para cotizar y para no dejar de vender; **no sustenta
+#     una decisión de dinero**. `origen_del_peso()` dice cuál de los dos es, y
+#     `/api/admin/envios/pesos` los enseña por separado en el Panel.
 #
-#   · un vial liofilizado es vidrio chico con tapón de hule: ~10 g el vial, más
-#     su cajita y su espuma;
-#   · el agua bacteriostática viene en frasco de 30 ml: el líquido solo ya pesa
-#     30 g, más el vidrio;
-#   · jeringas y agujas casi no pesan, pero abultan;
-#   · un kit/stack trae varias piezas juntas.
+# ⛔ EL ESTIMADO NO ES UNA ADIVINANZA REDONDA: ES FÍSICA, Y SE PUEDE AUDITAR.
 #
-# Estos números NO son el precio: si se quedan cortos, la paquetería cobra la
-# diferencia al recibir el paquete y la casa la absorbe. Por eso conviene que el
-# dueño capture los reales en cuanto tenga la báscula enfrente.
-PESO_VIAL_KG = 0.05
-PESO_AGUA_KG = 0.10
+# Un vial de péptido liofilizado es, por peso, CASI PURO VIDRIO. El polvo son
+# miligramos —10 mg de péptido pesan 0.01 g— y el frasco pesa entre 4 y 22 g
+# según su tamaño. Por eso el peso se calcula del FORMATO DEL VIAL, no del
+# compuesto: dos productos distintos en el mismo frasco pesan lo mismo.
+#
+# FUENTE DE LA MASA DEL VIDRIO (dato de fabricante, no cálculo de la casa):
+# tabla «Dimensions, brimful capacity and mass» de la norma ISO 8362-1, tal como
+# la publica SCHOTT Pharma en su ficha de Core Vials (StandardLine), columna
+# «Mass ≈ g». Son los formatos R, los mismos que usa toda la industria.
+VIAL_G = {
+    '2R': 4.4, '3R': 5.5, '4R': 5.7, '6R': 7.9, '8R': 8.7, '10R': 9.5,
+    '15R': 12.0, '20R': 16.2, '25R': 18.9, '30R': 21.9, '50R': 34.5,
+    '100R': 60.0,
+}
+
+# El cuello del frasco, que decide qué tapón y qué sello le tocan. Sale de la
+# misma tabla ISO (d2: 13 mm hasta el 10R, 20 mm del 15R en adelante).
+VIAL_CUELLO_MM = {
+    '2R': 13, '3R': 13, '4R': 13, '6R': 13, '8R': 13, '10R': 13,
+    '15R': 20, '20R': 20, '25R': 20, '30R': 20, '50R': 20, '100R': 20,
+}
+
+# La capacidad al ras (ml) de cada formato, de la misma tabla. Es lo que decide
+# en qué frasco cabe un líquido.
+VIAL_ML = {
+    '2R': 4.0, '3R': 5.0, '4R': 6.0, '6R': 10.0, '8R': 11.5, '10R': 13.5,
+    '15R': 19.0, '20R': 26.0, '25R': 32.5, '30R': 37.5, '50R': 62.0,
+    '100R': 123.0,
+}
+
+# ⚠️ ESTIMADO (no hay ficha de fabricante con gramos publicada). Tapón de hule
+# butilo + sello de aluminio con botón de polipropileno, calculados por
+# geometría y densidad: butilo ≈1.2 g/cm³, aluminio 2.7 g/cm³.
+#   · cuello de 13 mm: tapón ≈0.9 g + sello ≈0.35 g
+#   · cuello de 20 mm: tapón ≈2.6 g + sello ≈0.65 g
+# Se redondea HACIA ARRIBA a propósito: quedarse corto se paga con recobro.
+CIERRE_G = {13: 1.3, 20: 3.2}
+
+# Etiqueta y burbuja. La etiqueta es papel/BOPP sobre el frasco; la burbuja es lo
+# que se le enrolla a CADA pieza para que no se golpeen entre ellas.
+ETIQUETA_G = {13: 0.2, 20: 0.3}
+BURBUJA_POR_PIEZA_G = 2.0
+
+# ⚠️ ESTIMADOS SIN MEDIR, y a propósito por lo alto: jeringas, agujas y toallitas
+# se venden por paquete y no por pieza, y un kit trae dentro varias cosas. Aquí
+# quedarse largo no cuesta nada (el mínimo facturable de 1 kg se los come) y
+# quedarse corto sí. El día que haya báscula, se capturan y estos números dejan
+# de usarse.
 PESO_INSUMO_KG = 0.02          # jeringas, agujas, toallitas
 PESO_KIT_KG = 0.30             # kits, stacks, combos
+
+# El formato en el que va un producto cuando NO se le pudo leer la presentación.
+# 3R (5 ml) es el frasco típico del péptido liofilizado de esta casa.
+FORMATO_POR_OMISION = '3R'
+
+# La cita, para que el estimado se pueda defender sin buscarla otra vez.
+FUENTE_DEL_PESO = (
+    'Masa del vidrio: ISO 8362-1, tabla «Dimensions, brimful capacity and mass», '
+    'publicada por SCHOTT Pharma (Core Vials StandardLine). Tapón, sello, etiqueta '
+    'y burbuja: calculados por geometría y densidad, redondeados hacia arriba. '
+    'NADA de esto es una báscula: es un ESTIMADO.'
+)
+
+
+def peso_de_vial(formato: str) -> float:
+    """Lo que pesa UN vial vacío de ese formato, ya vestido. En kg.
+
+    Vidrio (ISO) + cierre + etiqueta + la burbuja con que se envuelve. Sin el
+    polvo, que se suma aparte porque depende del producto.
+    """
+    formato = formato if formato in VIAL_G else FORMATO_POR_OMISION
+    cuello = VIAL_CUELLO_MM[formato]
+    gramos = (VIAL_G[formato] + CIERRE_G[cuello] + ETIQUETA_G[cuello]
+              + BURBUJA_POR_PIEZA_G)
+    return round(gramos / 1000.0, 4)
+
+
+# Lo que pesa un vial de 3R vestido y vacío: el número por omisión de la casa.
+# Se conserva el nombre viejo porque lo usan las pruebas y el resto del código.
+PESO_VIAL_KG = peso_de_vial(FORMATO_POR_OMISION)
+
+# El agua bacteriostática de 10 ml: frasco de 15R (19 ml al ras, cuello de 20 mm)
+# más 10 g de líquido, que es lo que más pesa del renglón.
+PESO_AGUA_KG = round(peso_de_vial('15R') + 10 / 1000.0, 4)
 
 # La caja, el relleno, la bolsa y el sobre de la guía. Va UNA vez por pedido, no
 # por producto: mandar diez viales no lleva diez cajas.
@@ -209,17 +285,132 @@ def peso_volumetrico(caja: dict) -> float:
     return round(vol / DIVISOR_VOLUMETRICO, 2)
 
 
+def peso_facturable(paquete: dict) -> float:
+    """El peso por el que la paquetería va a COBRAR: el mayor entre real y volumétrico.
+
+    ⛔ NO ES EL PESO QUE SE MANDA A COTIZAR. A Skydropx se le manda el peso real Y
+    las medidas, y ella hace este mismo máximo por su cuenta — hacerlo aquí antes
+    de mandarlo lo contaría dos veces. Esto es para MIRAR: en el panel y en la
+    bitácora, «pesa 1 kg» y «te van a cobrar 1.8 kg» son dos frases distintas, y
+    hasta hoy sólo se veía la primera.
+    """
+    paquete = paquete or {}
+    def _n(k):
+        try:
+            return max(0.0, float(paquete.get(k) or 0))
+        except (TypeError, ValueError):
+            return 0.0
+    return round(max(_n('peso_kg'), _n('peso_volumetrico_kg')), 2)
+
+
 def _es(texto: str, *palabras: str) -> bool:
     t = (texto or '').lower()
     return any(p in t for p in palabras)
 
 
+# «10 mg», «1,000 IU», «10ml», «0.1 mg». Se acepta la coma de los miles porque la
+# maestra escribe «5,000IU» y sin esto se leería como 5.
+_MEDIDA = re.compile(r'(\d[\d,]*(?:\.\d+)?)\s*(mg|mcg|µg|ug|g|ml|iu|ui)\b', re.I)
+
+
+def contenido_declarado(texto: str) -> tuple:
+    """Lee la presentación y devuelve (miligramos, mililitros). (0, 0) si no dice.
+
+    Es la única lectura de texto que hay en el peso, y se hace UNA vez y aquí
+    para que no se copie mal en tres lados.
+    """
+    mg = ml = 0.0
+    for crudo, unidad in _MEDIDA.findall(texto or ''):
+        try:
+            n = float(crudo.replace(',', ''))
+        except ValueError:
+            continue
+        u = unidad.lower()
+        if u == 'mg':
+            mg = max(mg, n)
+        elif u in ('mcg', 'µg', 'ug'):
+            mg = max(mg, n / 1000.0)
+        elif u == 'g':
+            mg = max(mg, n * 1000.0)
+        elif u == 'ml':
+            ml = max(ml, n)
+        # IU/UI no dicen masa ni volumen: son unidades de actividad. Se ignoran a
+        # propósito y el producto cae en el formato por omisión.
+    return mg, ml
+
+
+def formato_de_vial(mg: float = 0.0, ml: float = 0.0) -> str:
+    """En qué frasco ISO va este contenido.
+
+    Un líquido manda sobre el polvo: si son 10 ml, el frasco tiene que caberlos.
+    Para el polvo se va por el volumen que ocupa el pastel liofilizado, que es lo
+    que obliga a subir de frasco arriba de cierta cantidad. Se escoge el frasco
+    que aguanta CON HOLGURA (≈70% de la capacidad al ras); errar hacia el frasco
+    grande pesa de más, y pesar de más nunca produce un recobro.
+    """
+    try:
+        ml = max(0.0, float(ml or 0))
+    except (TypeError, ValueError):
+        ml = 0.0
+    try:
+        mg = max(0.0, float(mg or 0))
+    except (TypeError, ValueError):
+        mg = 0.0
+
+    if ml > 0:
+        for formato in ('2R', '3R', '4R', '6R', '8R', '10R', '15R', '20R',
+                        '25R', '30R', '50R', '100R'):
+            if ml <= VIAL_ML[formato] * 0.7:
+                return formato
+        return '100R'
+
+    if mg <= 0:
+        return FORMATO_POR_OMISION
+    # Los cortes salen de cuánto llena el liofilizado: hasta 30 mg cabe de sobra
+    # en el 3R de 5 ml (el frasco estándar del péptido); de ahí para arriba el
+    # polvo y su excipiente piden más volumen.
+    if mg <= 30:
+        return FORMATO_POR_OMISION
+    if mg <= 120:
+        return '6R'
+    if mg <= 600:
+        return '10R'
+    return '20R'
+
+
+def peso_estimado_de_pieza(doc: dict | None, nombre: str = '') -> float:
+    """El peso CALCULADO de una pieza, en kg. Ignora `weight_kg` a propósito.
+
+    Vive aparte de `peso_de_pieza` para que el Panel pueda enseñar el declarado y
+    el estimado lado a lado y se vea de cuánto se equivocaba la cuenta.
+    """
+    doc = doc or {}
+    texto = ' '.join(str(doc.get(k) or '')
+                     for k in ('name', 'slug', 'category', 'presentation'))
+    texto = f'{texto} {nombre or ""}'
+    if _es(texto, 'jering', 'aguja', 'syringe', 'needle', 'toallit', 'alcohol'):
+        return PESO_INSUMO_KG
+    if _es(texto, 'kit', 'stack', 'combo', 'paquete'):
+        return PESO_KIT_KG
+
+    mg, ml = contenido_declarado(str(doc.get('presentation') or '') or texto)
+    es_liquido = _es(texto, 'bacteriost', 'agua', 'water', 'solvente', 'diluyente')
+    if es_liquido and ml <= 0:
+        ml = 10.0                      # el frasco que se vende, si no lo dijo
+    formato = formato_de_vial(mg=mg, ml=ml)
+    peso = peso_de_vial(formato)
+    # El contenido: el líquido pesa 1 g por ml; el polvo, sus miligramos.
+    peso += (ml * 1.0 + mg / 1000.0) / 1000.0
+    return round(peso, 4)
+
+
 def peso_de_pieza(doc: dict | None, nombre: str = '') -> float:
     """Cuánto pesa UNA pieza de este producto, en kg.
 
-    Si el catálogo trae `weight_kg` capturado, manda ese — siempre. Si no, se
-    deduce del tipo de presentación. Nunca devuelve cero: un renglón que pesa
-    cero es un renglón que la paquetería no va a cobrar en cero.
+    Si el catálogo trae `weight_kg` capturado, manda ese — siempre, porque ese es
+    el de la báscula. Si no, se ESTIMA del formato del frasco que le toca a su
+    presentación. Nunca devuelve cero: un renglón que pesa cero es un renglón que
+    la paquetería no va a cobrar en cero.
     """
     doc = doc or {}
     try:
@@ -228,16 +419,37 @@ def peso_de_pieza(doc: dict | None, nombre: str = '') -> float:
         capturado = 0
     if capturado > 0:
         return capturado
+    return peso_estimado_de_pieza(doc, nombre)
 
-    texto = ' '.join(str(doc.get(k) or '') for k in ('name', 'slug', 'category', 'presentation'))
-    texto = f'{texto} {nombre or ""}'
-    if _es(texto, 'bacteriost', 'agua', 'water', 'solvente', 'diluyente'):
-        return PESO_AGUA_KG
-    if _es(texto, 'jering', 'aguja', 'syringe', 'needle', 'toallit', 'alcohol'):
-        return PESO_INSUMO_KG
-    if _es(texto, 'kit', 'stack', 'combo', 'paquete'):
-        return PESO_KIT_KG
-    return PESO_VIAL_KG
+
+def origen_del_peso(doc: dict | None) -> str:
+    """'declarado' si lo pesó una báscula, 'estimado' si lo calculó esta casa.
+
+    ⛔ ES EL DATO QUE SEPARA UN NÚMERO DE UNA OPINIÓN. Un estimado cotiza y
+    despacha, pero no sustenta una decisión de dinero.
+    """
+    try:
+        return 'declarado' if float((doc or {}).get('weight_kg') or 0) > 0 else 'estimado'
+    except (TypeError, ValueError):
+        return 'estimado'
+
+
+def piezas_sin_peso_declarado(items, pflags: dict | None = None) -> list:
+    """Qué renglones de este pedido van con peso ESTIMADO. Lista de nombres.
+
+    El checkout no se detiene por esto —vender siempre—, pero el pedido tiene que
+    poder decir cuáles de sus pesos son cuenta y cuáles son báscula.
+    """
+    pflags = pflags or {}
+    faltan = []
+    for it in items or []:
+        get = (lambda k: getattr(it, k, None)) if not isinstance(it, dict) else it.get
+        doc = pflags.get(get('product_id') or '')
+        if origen_del_peso(doc) == 'estimado':
+            nombre = str(get('name') or (doc or {}).get('name') or '').strip()
+            if nombre and nombre not in faltan:
+                faltan.append(nombre)
+    return faltan
 
 
 def peso_del_contenido(items, pflags: dict | None = None) -> float:
@@ -284,15 +496,25 @@ def paquete_del_pedido(items, pflags: dict | None = None) -> dict:
     """
     contenido = peso_del_contenido(items, pflags)
     caja = caja_para(contenido)
-    return {
+    bulto = {
         'peso_kg': peso_del_pedido(items, pflags),
+        'peso_volumetrico_kg': peso_volumetrico(caja),
+    }
+    return {
+        'peso_kg': bulto['peso_kg'],
         'largo_cm': caja['largo_cm'],
         'ancho_cm': caja['ancho_cm'],
         'alto_cm': caja['alto_cm'],
         # Para que se vea en el panel y en la bitácora POR QUÉ costó lo que costó.
         'caja': caja.get('nombre', ''),
         'peso_contenido_kg': contenido,
-        'peso_volumetrico_kg': peso_volumetrico(caja),
+        'peso_volumetrico_kg': bulto['peso_volumetrico_kg'],
+        # Lo que la paquetería va a cobrar de verdad: el mayor de los dos de arriba.
+        'peso_facturable_kg': peso_facturable(bulto),
+        # ⛔ Qué renglones fueron con peso CALCULADO y no con báscula. Viaja con la
+        # cotización y se guarda en el pedido para que un recobro por sobrepeso se
+        # pueda ir a buscar al producto que lo causó, en vez de discutirlo de memoria.
+        'pesos_estimados': piezas_sin_peso_declarado(items, pflags),
     }
 
 
@@ -324,23 +546,27 @@ def paquete_manual(peso_kg, largo_cm=0, ancho_cm=0, alto_cm=0) -> dict:
         'ancho_cm': _num(ancho_cm) or caja['ancho_cm'],
         'alto_cm': _num(alto_cm) or caja['alto_cm'],
     }
-    return {
+    paquete = {
         'peso_kg': round(peso, 2),
         **bulto,
         'caja': 'capturado a mano',
         'peso_contenido_kg': round(peso, 2),
         'peso_volumetrico_kg': peso_volumetrico(bulto),
     }
+    paquete['peso_facturable_kg'] = peso_facturable(paquete)
+    return paquete
 
 
 # =========================================================================
 #  EL EMPAQUE DE VERDAD: cuántas piezas caben en lo que Christián TIENE
 # =========================================================================
-# ⛔ ESTO NACE DE UN RECOBRO. Hasta hoy TODO pedido se cotizaba con la caja que le
-# tocaba por peso calculado, y como el catálogo no trae pesos reales, todo caía en
-# la misma caja de 1 kg. Cuando el paquete de verdad no cabe ahí, la paquetería lo
+# ⛔ ESTO NACE DE UN RECOBRO. Todo pedido se cotiza con la caja que le toca por
+# peso, y como el peso de un vial es chiquito de verdad (9 g de vidrio, no los
+# 0.05 kg redondos que se suponían antes del 2026-08-03), casi todo cae en la
+# misma caja de 1 kg. Cuando el paquete de verdad no cabe ahí, la paquetería lo
 # vuelve a pesar y le cobra la diferencia a la casa (recobro por sobrepeso), que es
-# el cargo que aparece semanas después y que nadie cotizó.
+# el cargo que aparece semanas después y que nadie cotizó. Por eso el bulto que se
+# despacha sale de ESTA tabla —lo que Christián tiene en la bodega— y no del peso.
 #
 # ⛔ LO QUE HAY HOY, DICHO POR CHRISTIÁN (2026-07-31), SIN ADORNOS:
 #
@@ -457,7 +683,7 @@ def paquete_de_empaque(empaque: dict) -> dict:
     el que despacha el admin a mano— hablen el mismo idioma río abajo.
     """
     empaque = empaque or {}
-    return {
+    paquete = {
         'peso_kg': max(PESO_MINIMO_KG, float(empaque.get('peso_facturable_kg') or 0)),
         'largo_cm': empaque.get('largo_cm'),
         'ancho_cm': empaque.get('ancho_cm'),
@@ -465,6 +691,8 @@ def paquete_de_empaque(empaque: dict) -> dict:
         'caja': empaque.get('nombre', ''),
         'peso_volumetrico_kg': peso_volumetrico(empaque),
     }
+    paquete['peso_facturable_kg'] = peso_facturable(paquete)
+    return paquete
 
 
 # ------------------------------------------------- quién paga el envío

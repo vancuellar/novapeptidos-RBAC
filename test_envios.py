@@ -334,18 +334,83 @@ def test_peso_usa_el_capturado_cuando_existe():
 
 def test_peso_por_omision_distingue_la_presentacion():
     """⚠️ Hasta que Christian capture los reales, el tipo de producto manda."""
-    assert envios.peso_de_pieza({'name': 'Agua bacteriostática 30 ml'}) == envios.PESO_AGUA_KG
     assert envios.peso_de_pieza({'name': 'Jeringas de insulina'}) == envios.PESO_INSUMO_KG
     assert envios.peso_de_pieza({'name': 'Stack de recomposición'}) == envios.PESO_KIT_KG
     assert envios.peso_de_pieza({'name': 'BPC-157 10 mg'}) == envios.PESO_VIAL_KG
+    # El agua es el frasco MÁS el líquido, que es lo que de verdad pesa el renglón.
+    agua = envios.peso_de_pieza({'name': 'Agua bacteriostática', 'presentation': '10ml'})
+    assert agua == envios.PESO_AGUA_KG
+    assert agua > envios.PESO_VIAL_KG
+
+
+def test_el_peso_de_un_vial_sale_del_FORMATO_del_frasco_no_del_compuesto():
+    """⛔ Un vial liofilizado es casi puro vidrio: 10 mg de polvo pesan 0.01 g.
+
+    Por eso dos compuestos distintos en el mismo frasco pesan lo mismo, y lo que
+    sube el peso es CAMBIAR DE FRASCO, no cambiar de péptido.
+    """
+    bpc = envios.peso_de_pieza({'name': 'BPC-157', 'presentation': '10mg'})
+    tirze = envios.peso_de_pieza({'name': 'Tirzepatida', 'presentation': '10mg'})
+    assert bpc == tirze == envios.peso_de_vial('3R')
+    # El NAD+ de 1 g ya no cabe en el 3R: sube a un frasco de 20R y pesa el doble.
+    nad = envios.peso_de_pieza({'name': 'NAD+', 'presentation': '1000mg'})
+    assert envios.formato_de_vial(mg=1000) == '20R'
+    assert nad > 2 * bpc
+
+
+def test_la_masa_del_vidrio_es_la_de_la_norma_ISO_8362_1():
+    """El vidrio NO se estima: es tabla de fabricante (ISO 8362-1 / SCHOTT)."""
+    assert envios.VIAL_G['2R'] == 4.4
+    assert envios.VIAL_G['3R'] == 5.5
+    assert envios.VIAL_G['10R'] == 9.5
+    assert envios.VIAL_G['20R'] == 16.2
+    # Y el cuello decide el cierre: 13 mm hasta el 10R, 20 mm de ahí en adelante.
+    assert envios.VIAL_CUELLO_MM['10R'] == 13
+    assert envios.VIAL_CUELLO_MM['15R'] == 20
+
+
+def test_un_peso_de_bascula_le_gana_SIEMPRE_al_calculado():
+    doc = {'name': 'BPC-157', 'presentation': '10mg', 'weight_kg': 0.42}
+    assert envios.peso_de_pieza(doc) == 0.42
+    assert envios.peso_estimado_de_pieza(doc) == envios.peso_de_vial('3R')
+    assert envios.origen_del_peso(doc) == 'declarado'
+    assert envios.origen_del_peso({'name': 'BPC-157'}) == 'estimado'
+    assert envios.origen_del_peso({'weight_kg': 0}) == 'estimado'
+    assert envios.origen_del_peso(None) == 'estimado'
+
+
+def test_el_pedido_dice_QUE_renglones_van_con_peso_calculado():
+    """⛔ Un estimado no puede viajar disfrazado de dato."""
+    items = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=1),
+             OrderItem(product_id='b', name='Tirzepatida', price=100, quantity=1)]
+    pflags = {'a': {'name': 'BPC-157'}, 'b': {'name': 'Tirzepatida', 'weight_kg': 0.02}}
+    assert envios.piezas_sin_peso_declarado(items, pflags) == ['BPC-157']
+    assert envios.paquete_del_pedido(items, pflags)['pesos_estimados'] == ['BPC-157']
+
+
+def test_el_paquete_dice_por_cuanto_van_a_COBRAR_no_solo_cuanto_pesa():
+    """Las paqueterías cobran por el mayor entre el peso real y el volumétrico."""
+    kits = [OrderItem(product_id='k', name='Stack', price=100, quantity=5)]
+    p = envios.paquete_del_pedido(kits, {'k': {'name': 'Stack'}})
+    assert p['caja'] == 'mediana'
+    assert p['peso_volumetrico_kg'] == 1.8            # 30×20×15 ÷ 5000
+    assert p['peso_kg'] == 1.8                        # 1.5 de contenido + 0.30
+    assert p['peso_facturable_kg'] == 1.8
+    # Una caja chica con poco adentro: manda el mínimo facturable de 1 kg.
+    uno = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=1)]
+    chico = envios.paquete_del_pedido(uno, {'a': {'name': 'BPC-157'}})
+    assert chico['peso_volumetrico_kg'] == 0.6
+    assert chico['peso_facturable_kg'] == envios.PESO_MINIMO_KG
 
 
 def test_peso_del_pedido_suma_piezas_empaque_y_respeta_el_minimo():
     items = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=2)]
-    # 2 viales (0.10) + empaque (0.30) = 0.40 → la paquetería cobra 1 kg mínimo.
+    # 2 viales (0.018) + caja chica (0.15) = 0.168 → la paquetería cobra 1 kg mínimo.
     assert envios.peso_del_pedido(items, {'a': {'name': 'BPC-157'}}) == envios.PESO_MINIMO_KG
-    muchos = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=40)]
-    assert envios.peso_del_pedido(muchos, {'a': {'name': 'BPC-157'}}) == 2.3   # 2.0 + 0.30
+    # Con peso REAL de vidrio hacen falta muchísimos viales para pasar del mínimo;
+    # lo que sí pesa es un kit. 8 kits son 2.4 kg + los 0.30 de la caja mediana.
+    kits = [OrderItem(product_id='k', name='Stack', price=100, quantity=8)]
+    assert envios.peso_del_pedido(kits, {'k': {'name': 'Stack'}}) == 2.7
 
 
 def test_peso_de_un_carrito_vacio_es_cero_y_no_revienta():
@@ -1246,12 +1311,17 @@ def test_la_caja_vieja_cobraba_casi_el_DOBLE_de_peso_volumetrico():
 
 
 def test_un_pedido_grande_sube_de_caja_solo():
-    muchos = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=40)]
-    p = envios.paquete_del_pedido(muchos, {'a': {'name': 'BPC-157'}})
-    assert p['caja'] == 'mediana'           # 2.0 kg de contenido
-    assert p['peso_kg'] == 2.3              # 2.0 + los 0.30 de la caja
-    gigante = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=100)]
-    assert envios.paquete_del_pedido(gigante, {'a': {'name': 'BPC-157'}})['caja'] == 'grande'
+    # Se prueba con kits porque con el peso REAL del vidrio 40 viales no llenan ni
+    # la caja chica: 40 × 9 g son 0.36 kg. Antes «subían de caja» por un peso por
+    # omisión de 0.05 kg/vial que nadie había medido — y esa caja de más se pagaba.
+    muchos = [OrderItem(product_id='k', name='Stack', price=100, quantity=5)]
+    p = envios.paquete_del_pedido(muchos, {'k': {'name': 'Stack'}})
+    assert p['caja'] == 'mediana'           # 1.5 kg de contenido
+    assert p['peso_kg'] == 1.8              # 1.5 + los 0.30 de la caja
+    gigante = [OrderItem(product_id='k', name='Stack', price=100, quantity=12)]
+    assert envios.paquete_del_pedido(gigante, {'k': {'name': 'Stack'}})['caja'] == 'grande'
+    viales = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=40)]
+    assert envios.paquete_del_pedido(viales, {'a': {'name': 'BPC-157'}})['caja'] == 'chica'
 
 
 def test_las_cajas_se_cambian_desde_el_panel_sin_desplegar(monkeypatch):
@@ -1274,7 +1344,7 @@ def test_una_caja_con_medidas_en_cero_NO_se_guarda(monkeypatch):
 
 def test_el_peso_del_contenido_no_incluye_la_caja():
     items = [OrderItem(product_id='a', name='BPC-157', price=100, quantity=2)]
-    assert envios.peso_del_contenido(items, {'a': {'name': 'BPC-157'}}) == 0.1
+    assert envios.peso_del_contenido(items, {'a': {'name': 'BPC-157'}}) == 0.018
 
 
 # ==========================================================================
@@ -1741,3 +1811,53 @@ def test_un_cp_que_no_es_cp_rebota(db, monkeypatch):
     cli = TestClient(server.app)
     assert cli.get('/api/cp/abc').status_code == 400
     assert cli.get('/api/cp/1234').status_code == 400
+
+
+# ==========================================================================
+#  El candado del peso: un producto sin báscula GRITA, no se rellena solo
+# ==========================================================================
+def _alta(**extra):
+    from models import ProductCreate
+    base = {'name': 'BPC-157', 'slug': 'bpc-157', 'category': 'reparacion',
+            'presentation': '10mg', 'price': 999.0}
+    return ProductCreate(**dict(base, **extra))
+
+
+def test_dar_de_alta_un_producto_SIN_peso_avisa(db, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING):
+        creado = asyncio.run(server.create_product(_alta(), admin=_admin()))
+    aviso = creado.get('aviso_peso')
+    assert aviso, 'un alta sin peso tiene que contestar diciendo que va con un estimado'
+    assert aviso['origen'] == 'estimado'
+    assert aviso['peso_estimado_kg'] == envios.peso_de_vial('3R')
+    assert 'PESO SIN CAPTURAR' in caplog.text
+    # ⛔ Y NO se rellena el campo: el catálogo sigue diciendo la verdad (0 = sin pesar).
+    assert db.products.docs[0]['weight_kg'] == 0
+
+
+def test_dar_de_alta_un_producto_CON_peso_no_molesta(db):
+    creado = asyncio.run(server.create_product(_alta(weight_kg=0.011), admin=_admin()))
+    assert 'aviso_peso' not in creado
+    assert creado['weight_kg'] == 0.011
+
+
+def test_quitarle_el_peso_a_un_producto_vuelve_a_avisar(db):
+    from models import ProductUpdate
+    creado = asyncio.run(server.create_product(_alta(weight_kg=0.011), admin=_admin()))
+    actualizado = asyncio.run(server.update_product(
+        creado['id'], ProductUpdate(weight_kg=0.0), admin=_admin()))
+    assert actualizado['aviso_peso']['origen'] == 'estimado'
+
+
+def test_el_panel_separa_los_pesados_de_los_calculados(db):
+    asyncio.run(server.create_product(_alta(weight_kg=0.011), admin=_admin()))
+    asyncio.run(server.create_product(
+        _alta(name='NAD+', slug='nad', presentation='1000mg'), admin=_admin()))
+    r = asyncio.run(server.admin_pesos_de_productos(admin=_admin()))
+    assert r['total'] == 2 and r['declarados'] == 1 and r['estimados'] == 1
+    # Los que faltan van ARRIBA: un hueco que hay que ir a buscar no es un hueco.
+    assert r['productos'][0]['origen'] == 'estimado'
+    assert r['productos'][0]['formato_vial'] == '20R'
+    # Y se dice de dónde sale el estimado, para poder defenderlo sin buscar la cita.
+    assert 'ISO 8362-1' in r['fuente_del_estimado']

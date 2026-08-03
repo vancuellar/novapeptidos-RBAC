@@ -1215,6 +1215,34 @@ async def admin_list_products(admin=Depends(get_current_admin)):
     return await db.products.find({}, {'_id': 0}).to_list(1000)
 
 
+def _aviso_de_peso(doc: dict) -> dict | None:
+    """El GRITO de un alta sin peso. `None` cuando el producto sí trae báscula.
+
+    ⛔ UN DATO AUSENTE GRITA, NO SE RELLENA CON UN CERO. `weight_kg` nació vacío en
+    todo el catálogo y el envío se cotizaba con un número redondo que nadie midió;
+    el hueco no se veía porque el sistema lo tapaba solo. Dar de alta un producto
+    sin peso SIGUE ESTANDO PERMITIDO —no se bloquea una venta por un dato de
+    logística— pero el alta contesta diciendo que va con un estimado, y el producto
+    queda listado en /admin/envios/pesos hasta que alguien lo ponga en la báscula.
+    """
+    if envios.origen_del_peso(doc) == 'declarado':
+        return None
+    estimado = envios.peso_estimado_de_pieza(doc)
+    logger.warning(
+        'PESO SIN CAPTURAR: "%s" (%s) se dio de alta sin weight_kg. El envío lo va a '
+        'cotizar con un ESTIMADO de %s kg. Capturar el real en Admin → Envíos → Pesos.',
+        doc.get('name') or doc.get('slug') or doc.get('id') or '?',
+        doc.get('sku') or 's/SKU', estimado)
+    return {
+        'campo': 'weight_kg',
+        'origen': 'estimado',
+        'peso_estimado_kg': estimado,
+        'detalle': ('Este producto NO tiene peso capturado. El envío se va a cotizar '
+                    f'con un estimado de {estimado} kg calculado de su presentación, '
+                    'no con una báscula. Captúralo en Admin → Envíos → Pesos.'),
+    }
+
+
 @api_router.post('/admin/products')
 async def create_product(payload: ProductCreate, admin=Depends(get_current_admin)):
     existing = await db.products.find_one({'slug': payload.slug})
@@ -1222,7 +1250,11 @@ async def create_product(payload: ProductCreate, admin=Depends(get_current_admin
         raise HTTPException(status_code=400, detail='Ya existe un producto con ese slug')
     product = Product(**payload.model_dump())
     await db.products.insert_one(product.model_dump())
-    return clean(product.model_dump())
+    creado = clean(product.model_dump())
+    aviso = _aviso_de_peso(product.model_dump())
+    if aviso:
+        creado = dict(creado, aviso_peso=aviso)
+    return creado
 
 
 @api_router.put('/admin/products/{product_id}')
@@ -1234,6 +1266,9 @@ async def update_product(product_id: str, payload: ProductUpdate, admin=Depends(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail='Producto no encontrado')
     product = await db.products.find_one({'id': product_id}, {'_id': 0})
+    aviso = _aviso_de_peso(product or {})
+    if aviso:
+        product = dict(product or {}, aviso_peso=aviso)
     return product
 
 
@@ -2025,6 +2060,58 @@ async def admin_costo_real_envio(csv: int = 0, admin=Depends(get_current_admin))
     w.writeheader()
     w.writerows(filas)
     return PlainTextResponse(buf.getvalue(), media_type='text/csv')
+
+
+@api_router.get('/admin/envios/pesos')
+async def admin_pesos_de_productos(admin=Depends(get_current_admin)):
+    """Qué productos tienen peso DE BÁSCULA y cuáles van con una cuenta.
+
+    ⛔ EL CANDADO DEL PENDIENTE 14. `weight_kg` nació vacío en todo el catálogo y el
+    envío se cotizaba con un peso por omisión —0.05 kg por vial— que nadie había
+    medido ni calculado: era un número redondo. Un dato ausente que se rellena solo
+    y en silencio deja de verse, y a los meses ya nadie sabe cuál es cuál.
+
+    Aquí se ven separados a propósito:
+      · `declarado` = alguien lo puso en la báscula y lo capturó. Sustenta dinero.
+      · `estimado`  = lo calculó `envios.peso_estimado_de_pieza` del formato de
+        frasco que le toca a su presentación (vidrio ISO 8362-1 + cierre + etiqueta
+        + burbuja). Sirve para cotizar y para despachar; NO para decidir.
+
+    `diferencia_kg` sólo aparece en los declarados: es de cuánto se equivocaba la
+    cuenta contra la báscula, que es la forma de saber si el estimado sirve.
+    """
+    docs = await db.products.find(
+        {}, {'_id': 0, 'id': 1, 'sku': 1, 'name': 1, 'slug': 1, 'category': 1,
+             'presentation': 1, 'hidden': 1, 'weight_kg': 1}).to_list(1000)
+    filas = []
+    for d in docs:
+        estimado = envios.peso_estimado_de_pieza(d)
+        origen = envios.origen_del_peso(d)
+        try:
+            declarado = round(float(d.get('weight_kg') or 0), 4)
+        except (TypeError, ValueError):
+            declarado = 0.0
+        mg, ml = envios.contenido_declarado(str(d.get('presentation') or ''))
+        filas.append({
+            'id': d.get('id') or '', 'sku': d.get('sku') or '',
+            'nombre': d.get('name') or '', 'presentacion': d.get('presentation') or '',
+            'oculto': bool(d.get('hidden')),
+            'origen': origen,
+            'peso_declarado_kg': declarado or None,
+            'peso_estimado_kg': estimado,
+            'formato_vial': envios.formato_de_vial(mg=mg, ml=ml),
+            'diferencia_kg': (round(declarado - estimado, 4)
+                              if origen == 'declarado' else None),
+        })
+    faltan = [f for f in filas if f['origen'] == 'estimado']
+    filas.sort(key=lambda f: (f['origen'] != 'estimado', f['nombre'].lower()))
+    return {
+        'total': len(filas),
+        'declarados': len(filas) - len(faltan),
+        'estimados': len(faltan),
+        'fuente_del_estimado': envios.FUENTE_DEL_PESO,
+        'productos': filas,
+    }
 
 
 @api_router.put('/admin/envios/remitente')
@@ -2834,9 +2921,11 @@ async def comprar_guia_del_pedido(order: dict, avisar: bool = True) -> dict | No
         'reference': c.get('notes', ''), 'contents': 'Insumos de laboratorio',
     }
     quote = order.get('shipping_quote') or {}
-    # ⛔ EL BULTO SALE DEL EMPAQUE DE VERDAD, no de un peso calculado contra un catálogo
-    # que no trae pesos. Es la diferencia entre cotizar lo que se manda y cotizar una
-    # suposición — y la suposición es la que produce el recobro.
+    # ⛔ EL BULTO SALE DEL EMPAQUE DE VERDAD (lo que Christián tiene en la bodega), no
+    # del peso del catálogo. Y sigue así aunque el peso por pieza ya sea defendible:
+    # el peso dice cuánto pesa la mercancía, no en qué la va a meter. Es la diferencia
+    # entre cotizar lo que se manda y cotizar una suposición — y la suposición es la
+    # que produce el recobro.
     paquete = envios.paquete_de_empaque(empaque)
     try:
         # Doble cotizador: pregunta en Skydropx y en enviosinternacionales.com y compra

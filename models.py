@@ -129,9 +129,13 @@ class ProductBase(BaseModel):
     sku: str = ''
     commission_cap: float = 0.50
     distributor_eligible: bool = True
-    # Peso de UNA pieza, en kilos, para cotizar el envío por peso real.
-    # ⚠️ PENDIENTE DE CHRISTIAN: capturar los reales. Mientras venga en 0, el
-    # envío usa el peso por omisión del tipo de presentación (ver envios.py).
+    # Peso de UNA pieza, en kilos. ⛔ ESTE CAMPO ES **LA BÁSCULA**, y sólo eso: un
+    # número aquí quiere decir que alguien pesó el producto. En 0 significa «no se
+    # ha pesado», y entonces el envío usa un ESTIMADO calculado del formato de
+    # frasco que le toca a su presentación (vidrio ISO 8362-1 + cierre + etiqueta
+    # + burbuja; ver `envios.peso_estimado_de_pieza`). Los dos NO se mezclan:
+    # `envios.origen_del_peso` dice cuál es cuál y /api/admin/envios/pesos los
+    # enseña por separado. Nunca se rellena este campo con el estimado.
     weight_kg: float = 0
     # Un producto vive en su `category` principal y, opcionalmente, aparece
     # también en estas otras (p. ej. un combo en su categoría funcional Y en
