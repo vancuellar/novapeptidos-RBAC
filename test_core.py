@@ -677,20 +677,25 @@ def test_la_escalera_sigue_subiendo_desde_la_base():
 
 
 def test_pyramid_differential_total_equals_top_tier():
-    # Vende junior0 (30, la base). Master arriba (35) y Elite (40): diferenciales 5 y 5.
+    """El total del reparto = la tasa efectiva del más alto de la línea.
+
+    NO cambió con el techo del 2026-08-03: el Elite quedó como nivel SECRETO y sigue
+    cobrando su 40%, así que su diferencial sobre el Master se mantiene."""
     j = {'id': 'j', 'tier': 'junior0'}
     s = {'id': 's', 'tier': 'master'}
     e = {'id': 'e', 'tier': 'elite'}
     b = pyramid.compute_commission_breakdown(10000, j, [s, e])
     amounts = {r['distributor_id']: r['amount'] for r in b}
     assert amounts == {'j': 3000, 's': 500, 'e': 500}    # 30 + 5 + 5
-    assert pyramid.total_amount(b) == 4000                 # 40% total = tasa del más alto
+    assert pyramid.total_amount(b) == 4000                 # 40% = tasa del más alto
 
 
 def test_pyramid_adjacent_levels_split_by_the_gap():
+    """Cada quien cobra SU DIFERENCIAL sobre el de abajo. El Elite es secreto desde
+    el 2026-08-03 pero sigue cobrando 40%, así que el reparto no se movió."""
     se = {'id': 'se', 'tier': 'senior'}        # 30 (la base)
     ma = {'id': 'ma', 'tier': 'master'}        # 35
-    el = {'id': 'el', 'tier': 'elite'}         # 40
+    el = {'id': 'el', 'tier': 'elite'}         # 40 (secreto)
     b = pyramid.compute_commission_breakdown(10000, se, [ma, el])
     amounts = {r['distributor_id']: r['amount'] for r in b}
     assert amounts == {'se': 3000, 'ma': 500, 'el': 500}   # 30 + 5 + 5 = 40
@@ -916,11 +921,15 @@ def test_discount_tiers_diamond_ends_at_38():
 
 # ---------- Comisión puesta A MANO por el admin (manda sobre el nivel) ----------
 def test_effective_rate_prefers_manual_commission_over_tier():
-    # Christián todavía puede subirle la comisión a alguien sin moverlo de nivel.
+    """La tasa manual sigue mandando sobre el nivel, pero ⚠️ DESDE EL 2026-08-03 la
+    topa el techo visible (35%): un junior con 40% puesto a mano cobra 35, porque el
+    40 vive detrás de un nivel secreto que no se desbloquea desde el panel."""
     subido = {'tier': 'junior', 'commission_rate': 0.40}
-    assert pyramid.effective_rate(subido) == 0.40
-    # Y por eso puede dar hasta 35% de descuento.
-    assert pyramid.discount_tiers_for(pyramid.effective_rate(subido)) == [0.15, 0.20, 0.25, 0.30, 0.35]
+    assert pyramid.effective_rate(subido) == 0.35
+    # La manual SÍ gana cuando cabe bajo el techo: 33 > 30 del nivel.
+    cabe = {'tier': 'junior', 'commission_rate': 0.33}
+    assert pyramid.effective_rate(cabe) == 0.33
+    assert pyramid.discount_tiers_for(pyramid.effective_rate(subido)) == [0.15, 0.20, 0.25, 0.30]
 
 
 def test_effective_rate_keeps_tier_when_manual_is_lower():
@@ -947,13 +956,18 @@ def test_normalize_tier_maps_old_junior_label():
 
 
 def test_commission_uses_manual_rate_not_tier():
-    # Alanís vende $10,000 dando 35% de descuento: se queda 40-35 = 5%.
+    """La comisión sale de la tasa manual, no del nivel.
+
+    ⚠️ CAMBIÓ EL 2026-08-03: la manual del 40% de Alanís queda topada en 35% por el
+    techo de la escalera visible. Dando 35% de descuento ya no le queda nada
+    (35 − 35 = 0); sin descuento se lleva 35%, no 40%. Es la consecuencia buscada
+    del techo — el 40 vive detrás del Elite, que es secreto y se otorga, no se pide."""
     seller = {'id': 'alanis', 'tier': 'junior', 'commission_rate': 0.40}
     rows = pyramid.compute_commission_breakdown(10000, seller, [], discount_rate=0.35)
-    assert rows[0]['amount'] == 500
-    # Sin descuento se lleva su 40% completo, no el 20% de su nivel.
+    assert rows == [] or rows[0]['amount'] == 0        # 35 − 35 = 0
+    # Sin descuento se lleva el techo, no su manual.
     rows = pyramid.compute_commission_breakdown(10000, seller, [], discount_rate=0)
-    assert rows[0]['amount'] == 4000
+    assert rows[0]['amount'] == 3500
 
 
 # ---------- Centro de noticias: audiencia por rol ----------
@@ -2306,3 +2320,81 @@ def test_todas_las_pruebas_del_repo_estan_en_pytest_ini():
     assert not faltan, (
         f'estos archivos de prueba NO los corre nadie: {faltan}. '
         'Agrégalos a `testpaths` en pytest.ini.')
+
+
+# ---------------------------------------------- EL TECHO DEL CANAL (35%), 2026-08-03
+# Christián: «vamos a topar las comisiones a 35% máximo por ahora», con UNA excepción:
+# María Neunfeld. Se midió antes de decidir: bajar el cashback de 3% a 1% rescataba 2
+# productos del piso de 5×, topar en 35% rescataba 5, las dos juntas 11. Eligió el
+# techo y dejó el cashback intacto — el cashback lo ve todo cliente.
+def test_el_techo_visible_es_35():
+    import pyramid
+    assert pyramid.TECHO_VISIBLE == 0.35
+
+
+def test_elite_y_diamond_son_secretos_y_SI_cobran_su_nivel():
+    """Christián, 2026-08-03: la escalera que el distribuidor VE tope en Master 35%,
+    y arriba quedan dos escalones que no se anuncian y que él otorga. Un techo que
+    todos ven es un límite; con dos puertas escondidas detrás es una meta."""
+    import pyramid
+    assert pyramid.NIVELES_SECRETOS == frozenset({'elite', 'diamond'})
+    assert pyramid.effective_rate({'tier': 'elite', 'email': 'x@y.com'}) == 0.40
+    assert pyramid.effective_rate({'tier': 'diamond', 'email': 'x@y.com'}) == 0.43
+
+
+def test_la_escalera_VISIBLE_tope_en_master():
+    """Lo que ve quien entra al canal: de junior0 a master, y nada pasa de 35%."""
+    import pyramid
+    for nivel in ('junior0', 'junior1', 'senior', 'master'):
+        r = pyramid.effective_rate({'tier': nivel, 'email': 'x@y.com'})
+        assert r <= pyramid.TECHO_VISIBLE, f'{nivel} dio {r}'
+    assert pyramid.effective_rate({'tier': 'master', 'email': 'x@y.com'}) == 0.35
+
+
+def test_una_tasa_manual_no_se_salta_el_techo():
+    """El techo se aplica DESPUÉS de todo, si no una tasa puesta a mano en el panel
+    sería la puerta por la que se cuela el 50%."""
+    import pyramid
+    alto = {'tier': 'senior', 'commission_rate': 0.50, 'email': 'x@y.com'}
+    assert pyramid.effective_rate(alto) == 0.35
+
+
+def test_maria_neunfeld_va_exenta():
+    """La excepción POR PERSONA (Christián, 2026-08-03): cobra por encima del techo
+    visible aunque esté en un nivel visible. Se prueba con `senior`, que sin la
+    excepción daría 30%, para que la prueba mida la excepción y no el nivel."""
+    import pyramid
+    maria = {'tier': 'senior', 'commission_rate': 0.40,
+             'email': 'marianeunfeld0@gmail.com'}
+    assert pyramid.effective_rate(maria) == 0.40
+    otro = {'tier': 'senior', 'commission_rate': 0.40, 'email': 'otro@ejemplo.com'}
+    assert pyramid.effective_rate(otro) == 0.35        # a él sí lo topa
+
+
+def test_la_excepcion_se_reconoce_aunque_el_correo_venga_raro():
+    """Se empareja por CORREO y no por nombre —«María  Neunfeld» y «maria neunfeld»
+    se teclean distinto— y sin distinguir mayúsculas ni espacios de más: un tope de
+    comisión no puede depender de cómo alguien escribió un acento."""
+    import pyramid
+    for escrito in ('MariaNeunfeld0@Gmail.com ', ' MARIANEUNFELD0@GMAIL.COM'):
+        d = {'tier': 'senior', 'commission_rate': 0.40, 'email': escrito}
+        assert pyramid.effective_rate(d) == 0.40
+
+
+def test_el_piso_de_30_sigue_en_pie():
+    """El techo no puede haber roto la base del canal: todos arrancan en 30%."""
+    import pyramid
+    assert pyramid.effective_rate({'tier': 'junior0', 'email': 'x@y.com'}) == 0.30
+    assert pyramid.effective_rate({'tier': 'senior', 'email': 'x@y.com'}) == 0.30
+
+
+def test_una_tasa_manual_no_abre_la_puerta_de_los_secretos():
+    """Barrido: en un nivel VISIBLE, ninguna tasa manual —por alta que sea— se pasa
+    del techo. Si esto se rompe, el panel de admin se vuelve la puerta por la que
+    alguien cobra 50% sin haber desbloqueado nada."""
+    import pyramid
+    for nivel in ('junior0', 'junior1', 'senior', 'master'):
+        for manual in (0, 0.30, 0.43, 0.50, 0.99):
+            r = pyramid.effective_rate({'tier': nivel, 'commission_rate': manual,
+                                        'email': 'cualquiera@ejemplo.com'})
+            assert r <= pyramid.TECHO_VISIBLE, f'{nivel} con manual {manual} dio {r}'

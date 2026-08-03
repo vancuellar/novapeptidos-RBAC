@@ -56,6 +56,46 @@ MANUAL_CAP = 0.50  # tope de la tasa que el admin puede poner A MANO (= COMMISSI
 # consecuencia directa de «todos empiezan en 30» sin tocar los niveles altos.
 BASE_RATE = 0.30
 
+# ⛔ TECHO DE LA ESCALERA VISIBLE — 35%. Decisión de Christián, 2026-08-03.
+#
+# POR QUÉ. Con la vara del ROI CON TODO adentro (comisión, cashback, flete de China,
+# guía y empaque, gastos fijos y la comisión de la pasarela) 63 de 188 productos no
+# llegaban al piso de 5×. Se midieron tres salidas: bajar el cashback de 3% a 1%
+# rescataba 2 productos, topar la comisión en 35% rescataba 5, y las dos juntas 11.
+# Eligió el techo y dejó el cashback en 3%: el cashback lo ve TODO cliente y
+# recortarlo se sentía en toda la tienda para rescatar dos renglones.
+#
+# ⛔ Y LO QUE HACE QUE ESTO NO SEA UN RECORTE A SECAS (misma fecha): Elite y Diamond
+# NO desaparecen — se vuelven **niveles secretos desbloqueables**, como ya lo era el
+# Diamond. Lo que el distribuidor VE al entrar tope en Master 35%; arriba de eso hay
+# dos escalones que no se anuncian y que Christián otorga. Un techo que todos ven es
+# un límite; un techo con dos puertas escondidas detrás es una meta.
+TECHO_VISIBLE = 0.35
+
+# Los niveles que NO se anuncian en la escalera y que sí cobran su tasa completa.
+# El Diamond ya era secreto desde el 2026-07-23; el Elite se suma hoy.
+NIVELES_SECRETOS = frozenset({'elite', 'diamond'})
+
+# Y una excepción por persona, por orden expresa de Christián: María Neunfeld.
+# Se identifica por CORREO y no por nombre, porque el nombre se teclea distinto
+# («María  Neunfeld», «maria neunfeld») y un tope de comisión no puede depender de
+# cómo alguien escribió un acento. Si mañana hay más, se añaden AQUÍ y no se
+# dispersan por el código: una lista corta y a la vista es lo que permite auditar
+# quién cobra por encima del techo.
+SIN_TECHO = frozenset({'marianeunfeld0@gmail.com'})
+
+
+def exenta_del_techo(dist):
+    """¿Este distribuidor cobra por encima del techo visible?
+
+    Dos caminos: haber desbloqueado un nivel secreto (Elite o Diamond), o estar en
+    la lista de excepciones por persona.
+    """
+    d = dist or {}
+    if normalize_tier(d.get('tier')) in NIVELES_SECRETOS:
+        return True
+    return str(d.get('email') or '').strip().lower() in SIN_TECHO
+
 # Alias de niveles viejos guardados en la base antes de la pirámide de 6 niveles.
 TIER_ALIASES = {'junior': 'junior0'}
 
@@ -80,7 +120,11 @@ def effective_rate(dist):
     server.py, que guarda los valores anteriores para poder revertir)."""
     tier_r = tier_rate(normalize_tier((dist or {}).get('tier')))
     manual = float((dist or {}).get('commission_rate') or 0)
-    return min(MANUAL_CAP, max(tier_r, manual))
+    bruta = min(MANUAL_CAP, max(tier_r, manual))
+    # El techo de la escalera VISIBLE (35%) se aplica al final, para que sea el
+    # último filtro. Se lo saltan quien desbloqueó un nivel secreto (Elite,
+    # Diamond) y las excepciones por persona.
+    return bruta if exenta_del_techo(dist) else min(TECHO_VISIBLE, bruta)
 
 # Diamond es un nivel SECRETO: no está en la escalera visible (el tope que ven los
 # distribuidores es Elite 40%). Se desbloquea al llegar a estas metas; el sistema

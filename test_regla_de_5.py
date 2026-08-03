@@ -315,10 +315,15 @@ def test_el_precio_de_distribuidor_sale_de_la_base_nueva():
 
 def test_una_manual_vieja_de_40_se_reancla_en_la_base():
     """Comprobación de la migración: bajarle la manual a 30 deja la efectiva en 30
-    (y no la deja caer al 20 viejo del nivel)."""
+    (y no la deja caer al 20 viejo del nivel).
+
+    ⚠️ EL «ANTES» CAMBIÓ EL 2026-08-03: una manual de 40 en un nivel VISIBLE ahora
+    la topa el techo de 35% (`pyramid.TECHO_VISIBLE`). Lo que esta prueba cuida
+    sigue igual —que el «después» no se desplome al 20 del nivel viejo— y de paso
+    deja fijo que ni una manual heredada se salta el techo."""
     antes = {'tier': 'junior0', 'commission_rate': 0.40}
     despues = {'tier': 'junior0', 'commission_rate': pyramid.BASE_RATE}
-    assert pyramid.effective_rate(antes) == 0.40
+    assert pyramid.effective_rate(antes) == 0.35        # topada, ya no 0.40
     assert pyramid.effective_rate(despues) == 0.30
 
 
