@@ -36,6 +36,46 @@ verdad —y no leyendo el texto de `create_order`, que es lo que había.
 # Piezas del MISMO producto que hacen falta para pagar precio de distribuidor.
 MINIMO_PARA_PRECIO_DISTRIBUIDOR = 5
 
+# ---------------------------------------------------------------------------
+# EL ESCALÓN DE VOLUMEN (Christián, 2026-08-02)
+#
+# Desde TRES piezas del mismo producto, 12% — lo tenga quien lo tenga, cliente
+# suelto o distribuidor comprando para sí.
+#
+# ⛔ POR QUÉ. Certified-PepMex cobra por escalones desde la TERCERA pieza (su
+# Semaglutida 10 mg: 1-2 $2,300 · 3-5 $2,100 · 6-8 $1,960 · 9+ $1,800) y lo
+# anuncia en Meta como «¡20% por apertura en el país!», sin decir que ese 20%
+# exige comprar NUEVE. Nosotros teníamos un hueco justo ahí: nada hasta la
+# cuarta pieza y de golpe 40% en la quinta (la REGLA DE 5). El cliente que
+# quería tres o cuatro veía mejor precio con ellos.
+#
+# 12% y no 15% ni 20%: medido con la vara del ROI CON TODO (comisión, cashback,
+# flete de China, guía y empaque, gastos fijos y pasarela), 12% deja 11 de 187
+# productos bajo el piso de 5x contra los 9 que ya hay hoy sin ningún escalón.
+# Al 20% son 18 — el doble. Y con 12% quedamos abajo de Certified en TODOS sus
+# tramos: su Semaglutida de 10 mg a tres piezas sale en $2,100 y la nuestra en
+# $2,014.
+#
+# NO toca la REGLA DE 5: el salto de la quinta pieza al precio de distribuidor
+# sigue igual. Esto sólo llena el hueco de tres y cuatro, y de paso empuja a la
+# quinta, que es donde la casa quiere al cliente.
+PIEZAS_PARA_ESCALON_VOLUMEN = 3
+ESCALON_VOLUMEN = 0.12
+
+
+def tasa_por_volumen(cantidad):
+    """El descuento que gana un renglón por SU PROPIA cantidad, sin pedir nada.
+
+    Se cuenta por PRODUCTO ya resuelto contra el catálogo, igual que la regla de
+    5 — y por la misma razón: contado por el texto del carrito, dos renglones de
+    dos piezas del mismo vial son dos montones que nunca llegan a tres.
+    """
+    try:
+        cantidad = int(cantidad or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return ESCALON_VOLUMEN if cantidad >= PIEZAS_PARA_ESCALON_VOLUMEN else 0.0
+
 
 def mismo_correo(a, b):
     """¿Son el mismo correo? Exacto, sin distinguir mayúsculas ni espacios de más.
@@ -77,8 +117,13 @@ def tasa_del_renglon(cantidad, tasa_base, tasa_distribuidor, es_compra_propia):
     - Compra propia de un distribuidor: la tasa de distribuidor SÓLO si el
       renglón junta 5 o más piezas del mismo producto. Si no, precio de cliente.
 
-    Nunca devuelve menos que `tasa_base`: la regla de 5 quita el precio de
-    MAYOREO, no el descuento que cualquier cliente tendría por esa misma compra.
+    Y en LOS DOS casos, el piso incluye el ESCALÓN DE VOLUMEN: desde tres piezas
+    del mismo producto, 12%. Es un descuento que el renglón gana por su propia
+    cantidad, así que no depende de quién compre.
+
+    Nunca devuelve menos que `tasa_base` ni menos que ese escalón: la regla de 5
+    quita el precio de MAYOREO, no el descuento que cualquier cliente tendría por
+    esa misma compra.
     """
     tasa_base = max(0.0, float(tasa_base or 0))
     tasa_distribuidor = max(0.0, float(tasa_distribuidor or 0))
@@ -86,11 +131,12 @@ def tasa_del_renglon(cantidad, tasa_base, tasa_distribuidor, es_compra_propia):
         cantidad = int(cantidad or 0)
     except (TypeError, ValueError):
         cantidad = 0
+    piso = max(tasa_base, tasa_por_volumen(cantidad))
     if not es_compra_propia:
-        return max(tasa_base, tasa_distribuidor)
+        return max(piso, tasa_distribuidor)
     if cantidad >= MINIMO_PARA_PRECIO_DISTRIBUIDOR:
-        return max(tasa_base, tasa_distribuidor)
-    return tasa_base
+        return max(piso, tasa_distribuidor)
+    return piso
 
 
 def tasas_por_producto(cantidades, tasa_base, tasa_distribuidor, es_compra_propia):

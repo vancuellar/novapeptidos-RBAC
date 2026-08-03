@@ -25,6 +25,7 @@ import server        # noqa: E402
 
 
 CLIENTE = 0.10          # precio de cliente: la promo automática de siempre
+VOLUMEN = 0.12          # el escalón por 3+ piezas del mismo producto (2026-08-02)
 DIST = 0.30             # precio de distribuidor con la base nueva del canal
 
 
@@ -46,23 +47,32 @@ def test_cinco_piezas_del_mismo_producto_pagan_precio_de_distribuidor():
 
 
 def test_menos_de_cinco_paga_precio_de_cliente():
-    for piezas in (1, 2, 3, 4):
+    """Una y dos piezas pagan precio de cliente. Tres y cuatro ya no: desde el
+    2026-08-02 ganan el ESCALÓN DE VOLUMEN del 12%, que sigue siendo precio de
+    cliente y no de mayoreo (ver test_el_escalon_de_volumen_*)."""
+    for piezas in (1, 2):
         assert descuentos.tasa_del_renglon(piezas, CLIENTE, DIST, True) == CLIENTE
+    for piezas in (3, 4):
+        assert descuentos.tasa_del_renglon(piezas, CLIENTE, DIST, True) == VOLUMEN
+        assert descuentos.tasa_del_renglon(piezas, CLIENTE, DIST, True) < DIST
 
 
 def test_la_frontera_esta_en_cinco_exactamente():
     """Cuatro no, cinco sí. El mínimo se lee del módulo, no de un número suelto."""
     assert descuentos.MINIMO_PARA_PRECIO_DISTRIBUIDOR == 5
     n = descuentos.MINIMO_PARA_PRECIO_DISTRIBUIDOR
-    assert descuentos.tasa_del_renglon(n - 1, CLIENTE, DIST, True) == CLIENTE
+    assert descuentos.tasa_del_renglon(n - 1, CLIENTE, DIST, True) == VOLUMEN
     assert descuentos.tasa_del_renglon(n, CLIENTE, DIST, True) == DIST
     assert descuentos.tasa_del_renglon(n + 40, CLIENTE, DIST, True) == DIST
 
 
 def test_una_venta_normal_no_conoce_la_regla_de_5():
-    """A un CLIENTE no se le pide mínimo: su descuento es parejo, como siempre."""
-    for piezas in (1, 4, 5, 50):
+    """A un CLIENTE no se le pide mínimo para su descuento de siempre. Lo que sí
+    gana, desde el 2026-08-02, es el escalón de volumen por sus propias piezas."""
+    for piezas in (1, 2):
         assert descuentos.tasa_del_renglon(piezas, CLIENTE, 0.0, False) == CLIENTE
+    for piezas in (3, 4, 5, 50):
+        assert descuentos.tasa_del_renglon(piezas, CLIENTE, 0.0, False) == VOLUMEN
 
 
 def test_la_regla_nunca_deja_por_debajo_del_precio_de_cliente():
@@ -90,7 +100,7 @@ def test_es_por_producto_no_por_carrito():
 def test_un_carrito_mixto_lleva_dos_tasas_a_la_vez():
     tasas = descuentos.tasas_por_producto(
         {'reta-20': 5, 'bpc-10': 3}, CLIENTE, DIST, True)
-    assert tasas == {'reta-20': DIST, 'bpc-10': CLIENTE}
+    assert tasas == {'reta-20': DIST, 'bpc-10': VOLUMEN}
 
 
 def test_el_mismo_producto_en_dos_renglones_suma():
@@ -134,14 +144,73 @@ def test_los_insumos_siguen_sin_descuento_aunque_lleve_cincuenta():
 
 
 def test_un_carrito_parejo_se_comporta_igual_que_antes_de_la_regla():
-    """Regresión: sin compra propia, todo el carrito lleva la misma tasa y
-    `discount_rate` vale lo mismo que valía antes. Nada de lo viejo se movió."""
-    items = [renglon('a', 1000, 1), renglon('b', 2000, 7)]
-    tasas = descuentos.tasas_por_producto({'a': 1, 'b': 7}, CLIENTE, 0.0, False)
+    """Regresión: sin compra propia y con renglones de 1 y 2 piezas, todo el
+    carrito lleva la misma tasa y `discount_rate` vale lo que valía antes.
+
+    Se bajó el renglón 'b' de 7 piezas a 2: con 7 ya gana el escalón de volumen
+    del 2026-08-02 y el carrito deja de ser parejo — que es lo correcto, pero no
+    lo que esta regresión vigila. Las dos tasas a la vez se prueban en
+    `test_el_escalon_de_volumen_convive_con_la_regla_de_5`."""
+    items = [renglon('a', 1000, 1), renglon('b', 2000, 2)]
+    tasas = descuentos.tasas_por_producto({'a': 1, 'b': 2}, CLIENTE, 0.0, False)
     dinero, tasa, capados, _ = _reparte(items, tasas, CLIENTE)
     assert tasa == CLIENTE
-    assert dinero == round(1000 * CLIENTE) + round(2000 * 7 * CLIENTE)
+    assert dinero == round(1000 * CLIENTE) + round(2000 * 2 * CLIENTE)
     assert capados == []
+
+
+# ------------------------------------------------- el escalón de volumen (12%)
+def test_el_escalon_de_volumen_empieza_en_tres_piezas():
+    """Christián, 2026-08-02: desde TRES piezas del mismo producto, 12%.
+
+    Existe porque Certified cobra por escalones desde su tercera pieza y nosotros
+    no dábamos nada hasta la quinta. El número se lee del módulo, no a mano."""
+    assert descuentos.PIEZAS_PARA_ESCALON_VOLUMEN == 3
+    assert descuentos.ESCALON_VOLUMEN == 0.12
+    n = descuentos.PIEZAS_PARA_ESCALON_VOLUMEN
+    assert descuentos.tasa_por_volumen(n - 1) == 0.0
+    assert descuentos.tasa_por_volumen(n) == descuentos.ESCALON_VOLUMEN
+    assert descuentos.tasa_por_volumen(n + 100) == descuentos.ESCALON_VOLUMEN
+
+
+def test_el_escalon_de_volumen_no_pisa_un_descuento_mejor():
+    """Es un PISO, no un techo. Con un cupón del 20% en la mano, tres piezas
+    pagan 20%, no 12%. La casa nunca cobra más por haber comprado más."""
+    assert descuentos.tasa_del_renglon(3, 0.20, 0.0, False) == 0.20
+    assert descuentos.tasa_del_renglon(3, 0.15, 0.0, False) == 0.15
+    assert descuentos.tasa_del_renglon(3, 0.0, 0.0, False) == VOLUMEN
+
+
+def test_el_escalon_de_volumen_convive_con_la_regla_de_5():
+    """El salto de la quinta pieza NO se tocó: 3-4 piezas dan 12% y 5+ siguen
+    dando precio de distribuidor. El escalón llena el hueco, no lo sustituye."""
+    tasas = descuentos.tasas_por_producto(
+        {'dos': 2, 'tres': 3, 'cuatro': 4, 'cinco': 5}, CLIENTE, DIST, True)
+    assert tasas == {'dos': CLIENTE, 'tres': VOLUMEN, 'cuatro': VOLUMEN, 'cinco': DIST}
+
+
+def test_el_escalon_de_volumen_es_por_producto_no_por_carrito():
+    """Dos piezas de un vial y dos de otro son cuatro piezas, pero ninguno llega
+    a tres del MISMO producto: nadie gana el escalón. Es la misma mitad de la
+    regla de 5, y por la misma razón."""
+    tasas = descuentos.tasas_por_producto(
+        {'reta-20': 2, 'bpc-10': 2}, CLIENTE, 0.0, False)
+    assert set(tasas.values()) == {CLIENTE}
+
+
+def test_el_tope_del_producto_manda_sobre_el_escalon_de_volumen():
+    """Un producto que sólo aguanta 10% no da 12% por llevar tres. El ROI de la
+    casa manda sobre cualquier descuento, éste incluido."""
+    items = [renglon('flaco', 1000, 3)]
+    dinero, tasa, capados, _ = _reparte(
+        items, {'flaco': VOLUMEN}, CLIENTE, topes={'flaco': 0.10})
+    assert dinero == 1000 * 3 * 0.10
+    assert capados[0]['applied_rate'] == 0.10 and capados[0]['asked_rate'] == VOLUMEN
+
+
+def test_cantidades_raras_no_tumban_el_escalon():
+    for basura in (None, '', 'tres', -4, 0):
+        assert descuentos.tasa_por_volumen(basura) == 0.0
 
 
 def test_un_carrito_vacio_no_revienta():
