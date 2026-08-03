@@ -8974,10 +8974,10 @@ async def chat_history(session_id: str):
 #      no puede gastar la cuota ni escribir en la conversación de otro.
 #   3. La conversación se guarda y se lee por `user_id`: nadie ve la de nadie.
 
-# La conversación previa que se le recuerda al modelo. Corta a propósito: cada
-# vuelta re-manda el catálogo entero, y una vuelta larga se paga por token en
-# cualquier proveedor.
-NEGOCIO_HISTORIAL = 8
+# La conversación previa que se le recuerda al modelo ya no es un número fijo de
+# mensajes (eran 8, y en chats largos se sentía como si el asesor «olvidara»):
+# viaja lo que quepa en `chat_negocio.PRESUPUESTO_CHARS`, y el mismo presupuesto
+# alimenta el aviso del 85% en pantalla. Ver chat_negocio.historia_que_cabe.
 
 
 @api_router.post('/business/chat')
@@ -8997,7 +8997,12 @@ async def business_chat(payload: ChatInput, user=Depends(get_current_distributor
 
     prior = await db.business_chat_messages.find(
         {'session_id': payload.session_id, 'user_id': user['id']}, {'_id': 0},
-    ).sort('created_at', 1).to_list(50)
+    ).sort('created_at', 1).to_list(400)
+
+    # Cuánta memoria del chat ya se usó, ANTES de contestar: viaja en un header
+    # para que la pantalla pueda avisar «abre un chat nuevo» al 85% (Christián,
+    # 2026-08-03). Se calcula con la MISMA vara que decide qué historia viaja.
+    pct = chat_negocio.contexto_pct(prior, payload.message)
 
     await db.business_chat_messages.insert_one({
         'id': str(uuid.uuid4()), 'session_id': payload.session_id, 'user_id': user['id'],
@@ -9006,8 +9011,11 @@ async def business_chat(payload: ChatInput, user=Depends(get_current_distributor
 
     historia = ''
     if prior:
+        # Antes viajaban SÓLO los últimos 8 mensajes: el «olvido» de los chats
+        # largos era ese recorte, no el modelo. Ahora viaja lo que quepa en el
+        # presupuesto de chat_negocio.PRESUPUESTO_CHARS, los más nuevos primero.
         lineas = [f"{'Usuario' if m['role'] == 'user' else 'Asesor'}: {m['content']}"
-                  for m in prior[-NEGOCIO_HISTORIAL:]]
+                  for m in chat_negocio.historia_que_cabe(prior)]
         historia = ('Conversacion previa:\n' + '\n'.join(lineas)
                     + '\n\nNuevo mensaje del usuario:\n')
 
@@ -9044,8 +9052,37 @@ async def business_chat(payload: ChatInput, user=Depends(get_current_distributor
     return StreamingResponse(
         event_generator(),
         media_type='text/plain; charset=utf-8',
-        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no',
+                 'X-Contexto-Pct': str(pct),
+                 'Access-Control-Expose-Headers': 'X-Contexto-Pct'},
     )
+
+
+@api_router.get('/business/chats')
+async def business_chats(user=Depends(get_current_distributor)):
+    """SUS chats, el más reciente primero, con lo que la lista necesita: título
+    (el primer mensaje), fecha del último, cuántos mensajes y qué tanta memoria
+    lleva usada cada uno (para pintar el aviso del 85% también en la lista)."""
+    docs = await db.business_chat_messages.find(
+        {'user_id': user['id']}, {'_id': 0, 'session_id': 1, 'role': 1,
+                                  'content': 1, 'created_at': 1},
+    ).sort('created_at', 1).to_list(5000)
+    por_sesion = {}
+    for m in docs:
+        por_sesion.setdefault(m.get('session_id'), []).append(m)
+    out = []
+    for sid, msgs in por_sesion.items():
+        if not sid:
+            continue
+        out.append({
+            'session_id': sid,
+            'titulo': chat_negocio.titulo_de_chat(msgs),
+            'mensajes': len(msgs),
+            'last_at': msgs[-1].get('created_at') or '',
+            'contexto_pct': chat_negocio.contexto_pct(msgs),
+        })
+    out.sort(key=lambda c: c['last_at'], reverse=True)
+    return {'chats': out[:50], 'aviso_pct': chat_negocio.AVISO_PCT}
 
 
 @api_router.get('/business/history/{session_id}')

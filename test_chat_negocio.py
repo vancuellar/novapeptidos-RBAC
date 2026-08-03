@@ -553,3 +553,62 @@ def test_la_conversacion_se_guarda_con_su_dueno(como):
     guardados = cliente.db.business_chat_messages.docs
     assert [m['role'] for m in guardados] == ['user', 'assistant']
     assert all(m['user_id'] == DIST['id'] for m in guardados)
+
+
+# ----------------------------------------------- la memoria y la lista de chats
+# Encargo de Christián (2026-08-03): chats múltiples para no perder contexto y
+# aviso al 85% de la memoria.
+
+def test_la_historia_que_cabe_corta_lo_viejo_primero():
+    msgs = [{'role': 'user', 'content': 'a' * 30_000},
+            {'role': 'assistant', 'content': 'b' * 30_000},
+            {'role': 'user', 'content': 'c' * 10_000}]
+    dentro = chat_negocio.historia_que_cabe(msgs)
+    # El presupuesto es 48k: el primer mensaje (el más viejo) se cae; los dos
+    # últimos viajan y en su orden.
+    assert [m['content'][0] for m in dentro] == ['b', 'c']
+    # Un chat corto viaja completo.
+    cortos = [{'role': 'user', 'content': 'hola'}] * 5
+    assert len(chat_negocio.historia_que_cabe(cortos)) == 5
+    # Un solo mensaje gigante viaja aunque rebase: recortarlo a cero sería peor.
+    assert chat_negocio.historia_que_cabe([{'role': 'user', 'content': 'x' * 90_000}])
+
+
+def test_el_pct_se_mide_contra_el_mismo_presupuesto():
+    assert chat_negocio.contexto_pct([]) == 0
+    msgs = [{'role': 'user', 'content': 'x' * 24_000}]
+    assert chat_negocio.contexto_pct(msgs) == 50
+    assert chat_negocio.contexto_pct(msgs, 'y' * 24_000) == 100
+
+
+def test_el_titulo_es_el_primer_mensaje_del_usuario():
+    msgs = [{'role': 'assistant', 'content': 'hola'},
+            {'role': 'user', 'content': '  ¿cuánto   gano con  20%? '}]
+    assert chat_negocio.titulo_de_chat(msgs) == '¿cuánto gano con 20%?'
+    assert chat_negocio.titulo_de_chat([]) == 'Chat nuevo'
+    largo = [{'role': 'user', 'content': 'p' * 100}]
+    assert chat_negocio.titulo_de_chat(largo).endswith('…')
+
+
+def test_la_lista_de_chats_es_solo_suya_y_trae_el_pct(como):
+    cliente = como(DIST)
+    _preguntar(cliente, texto='primera pregunta de la sesión uno', sesion='s-uno')
+    _preguntar(cliente, texto='ahora la sesión dos', sesion='s-dos')
+    r = cliente.get('/api/business/chats')
+    assert r.status_code == 200
+    cuerpo = r.json()
+    assert cuerpo['aviso_pct'] == chat_negocio.AVISO_PCT
+    sesiones = {c['session_id']: c for c in cuerpo['chats']}
+    assert set(sesiones) >= {'s-uno', 's-dos'}
+    assert sesiones['s-uno']['titulo'].startswith('primera pregunta')
+    assert isinstance(sesiones['s-uno']['contexto_pct'], int)
+    # Y el otro distribuidor no ve nada de esto.
+    server.app.dependency_overrides[auth.get_current_user] = lambda: dict(OTRO_DIST)
+    ajeno = TestClient(server.app)
+    assert ajeno.get('/api/business/chats').json()['chats'] == []
+
+
+def test_el_chat_regresa_el_pct_en_el_header(como):
+    r = _preguntar(como(DIST), sesion='s-pct')
+    assert r.status_code == 200
+    assert 'x-contexto-pct' in {k.lower() for k in r.headers}

@@ -65,7 +65,9 @@ Le hablas a alguien de la casa (el dueno o un distribuidor del canal) que ya ent
 sesion. NO le hablas a un cliente anonimo ni al publico.
 
 COMO HABLAS:
-- Directo y corto. Frases simples. Nada de jerga.
+- Directo y corto. Frases simples. Nada de jerga: palabras de todos los dias, aunque el
+  tema sea de laboratorio. SALVO que el usuario te pida lenguaje tecnico o mas
+  profundidad: ahi cambias a lenguaje tecnico completo sin recortar nada.
 - Cuando la respuesta lleve numeros, PONLOS: pesos mexicanos con separador de miles
   ($1,259 MXN) y porcentajes enteros (25%).
 - Si te piden una cotizacion, arma una lista clara: producto, cantidad, precio de lista,
@@ -89,8 +91,9 @@ Eres el asesor que un distribuidor consulta para atender a su cliente. Tu trabaj
 CONTESTAR, no filtrar. Entran de lleno en tu terreno:
 - Que es cada compuesto, para que se investiga, que via o mecanismo se le estudia, que
   se ha visto y que NO esta demostrado.
-- DOSIS DE REFERENCIA, frecuencias, niveles (inicial / tipica / avanzada), fases,
-  ciclos, cuanto tiempo, que esperar y en cuanto.
+- DOSIS DE REFERENCIA, frecuencias, niveles (inicial / tipica / avanzada), TITULACION
+  (como se sube la dosis por semanas), fases, ciclos, cuanto tiempo, que esperar y en
+  cuanto. Sin filtros: si el dato esta en tus bloques, lo das.
 - Reconstitucion con cifras exactas: cuanta agua, que concentracion queda, cuantas
   rayitas de jeringa U-100, como conservar el vial antes y despues.
 - Combinaciones entre compuestos, comparaciones entre productos, cual conviene a quien
@@ -101,8 +104,9 @@ CONTESTAR, no filtrar. Entran de lleno en tu terreno:
 Contesta con los bloques de FICHAS, COMPENDIO y GUIAS que te adjunto. Nunca digas "no
 puedo hablar de eso" cuando la pregunta sea sobre un peptido. Nunca redirijas ni pongas
 advertencias de mas. Lo unico ajeno a ti es lo que no tiene nada que ver con Exygen ni
-con peptidos (codigo, tareas escolares, noticias, politica): eso lo despachas en una
-frase.
+con peptidos: codigo, tareas escolares, noticias, politica, y trabajos de otro oficio
+(contratos, documentos legales, traducciones largas, ensayos). Eso lo despachas en una
+frase amable: para eso no eres tu.
 
 MARCO (RUO — enmarca, no bloquea):
 - Todo el material de Exygen es para INVESTIGACION, en laboratorio y ensayos in vitro.
@@ -374,3 +378,57 @@ async def armar_contexto(db, user, productos, tope_de=None, language=None,
 
     partes.append(f'IDIOMA DE RESPUESTA (OBLIGATORIO): {language_instruction(language)}')
     return {'system_message': '\n\n'.join(partes)}
+
+
+# ---------------------------------------------------------------------------
+#  La memoria del chat — cuánta conversación viaja y cuándo avisar
+# ---------------------------------------------------------------------------
+# Encargo de Christián (2026-08-03): «que el agente no pierda contexto, y al 85%
+# de la memoria que le avise al usuario que abra un chat nuevo».
+#
+# Antes viajaban SÓLO los últimos 8 mensajes: el "olvido" que se sentía en chats
+# largos no era del modelo (la ventana de Gemini sobra), era de este recorte.
+# Ahora viaja todo lo que quepa en un PRESUPUESTO de caracteres, y el porcentaje
+# que se le enseña al usuario se mide contra ese mismo presupuesto — un solo
+# número para las dos cosas, para que el aviso y el olvido lleguen JUNTOS.
+
+PRESUPUESTO_CHARS = 48_000     # ~12k tokens de conversación; el resto del sobre
+                               # (fichas, catálogo) viaja aparte y no cuenta aquí.
+AVISO_PCT = 85                 # de aquí en adelante la pantalla pide chat nuevo
+
+
+def historia_que_cabe(mensajes, presupuesto=PRESUPUESTO_CHARS):
+    """Los mensajes MÁS RECIENTES que caben en el presupuesto, en su orden.
+
+    Se recorre de atrás hacia adelante y se corta donde ya no cabe: en un chat
+    corto viaja todo; en uno largo se caen los mensajes más viejos primero —
+    exactamente lo que el usuario espera que se olvide primero."""
+    out, usado = [], 0
+    for m in reversed(mensajes or []):
+        c = len((m or {}).get('content') or '')
+        if out and usado + c > presupuesto:
+            break
+        out.append(m)
+        usado += c
+        if usado >= presupuesto:
+            break
+    return list(reversed(out))
+
+
+def contexto_pct(mensajes, nuevo=''):
+    """Qué tanto de la memoria del chat ya está usada, en por ciento (0–100+).
+
+    Se mide TODA la conversación guardada, no sólo lo que viaja: cuando esto
+    rebasa 100, lo que viaja ya empezó a perder mensajes viejos."""
+    total = sum(len((m or {}).get('content') or '') for m in (mensajes or []))
+    total += len(nuevo or '')
+    return round(100 * total / PRESUPUESTO_CHARS)
+
+
+def titulo_de_chat(mensajes):
+    """El nombre de un chat en la lista: su primer mensaje del usuario, recortado."""
+    for m in (mensajes or []):
+        if (m or {}).get('role') == 'user' and (m.get('content') or '').strip():
+            t = ' '.join(m['content'].split())
+            return t[:60] + ('…' if len(t) > 60 else '')
+    return 'Chat nuevo'
