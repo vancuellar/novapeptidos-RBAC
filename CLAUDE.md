@@ -69,3 +69,29 @@ avisarle, no limpiar la base a sus espaldas.
 nuevo**, o no se corre nunca. No es capricho: sin esa lista pytest sale a recorrer el
 `.venv` (que cuelga de iCloud) y se queda colgado — el 2026-07-28 una recolección tardó
 3 min 32 s y hubo que matar varias corridas a mano.
+
+## Aquí hay varias sesiones trabajando a la vez
+
+En este árbol suele haber más de una sesión de Claude abierta. El índice de git es
+**compartido**: lo que una sesión deja a medias, otra se lo puede llevar en su commit.
+
+**PROHIBIDO `git add -A`, `git add .`, `git commit -a` y `git stash` sin ruta.**
+
+⛔ **Y EL `git commit` TAMBIÉN LLEVA RUTAS.** `git add` explícito NO basta:
+`git commit -m "…"` a secas publica **todo lo que esté en el índice**, incluido lo
+que otra sesión dejó ahí con su propio `git add`. Siempre:
+
+```bash
+git status                          # si aparece algo que no reconoces, no es tuyo
+git commit -m "…" -- modelo_ia.py test_modelo_ia.py
+```
+
+Con `-- <rutas>` git commitea ESOS archivos e **ignora el resto del índice**. Es lo
+único que aísla de verdad con dos sesiones abiertas.
+
+**Qué pasó el 2026-08-03.** Dos agentes en paralelo, uno en `modelo_ia.py` y otro en
+`server.py`/`chat_negocio.py`/`models.py`/`test_chat_negocio.py`. El primero hizo su
+`git add` explícito y correcto —sólo sus dos archivos— pero commiteó sin rutas y se
+llevó los cuatro archivos a medio terminar del otro dentro del commit `7a42032`. Esa
+vez no hubo daño (el trabajo estaba completo y la suite en verde), pero el mismo
+descuido pudo haber desplegado backend a medias.
