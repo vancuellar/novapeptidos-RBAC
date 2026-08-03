@@ -1758,12 +1758,21 @@ def test_el_correo_del_cliente_es_EL_MISMO_venga_del_admin_o_del_distribuidor():
 
 def test_COTIZAR_Y_COMPRAR_guias_sigue_siendo_SOLO_del_admin():
     """⛔ Comprar guía es DINERO DE LA CASA. El distribuidor captura la guía que ya
-    tiene; no le abre la chequera a nadie."""
+    tiene; no le abre la chequera a nadie.
+
+    Desde el 2026-08-03 hay UNA excepción con nombre y apellido: `solicitar-guia`,
+    que NO compra nada — deja una solicitud y la campanita; la única compuerta
+    hacia el gasto sigue siendo la aprobación del admin (`/admin/guia-solicitudes/
+    aprobar`). Cualquier OTRA ruta de guías o cotización en el panel del
+    distribuidor sigue prohibida, y ésta se prohíbe sola si un día compra:
+    lo fija test_guia_solicitudes.py (un freno deja la solicitud pendiente)."""
     import inspect
-    for fn in (server.admin_cotizar_envio, server.admin_comprar_guia):
+    for fn in (server.admin_cotizar_envio, server.admin_comprar_guia,
+               server.admin_aprobar_solicitud_guia):
         assert 'get_current_admin' in str(inspect.signature(fn))
     rutas = [r.path for r in server.app.routes
              if getattr(r, 'path', '').startswith('/api/distributor')]
+    rutas = [p for p in rutas if not p.endswith('/solicitar-guia')]
     assert not any('guia' in p or 'cotizar' in p for p in rutas), \
         f'se coló una ruta de compra de guías en el panel del distribuidor: {rutas}'
 

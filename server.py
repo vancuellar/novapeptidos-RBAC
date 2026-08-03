@@ -34,6 +34,7 @@ from models import (
     ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
     QuoteEmailRequest, ShareCartRequest, PrellenadoRequest,
     SolicitudPagoComision, RegistroPagoComision, RechazoPagoComision,
+    AprobarSolicitudGuia, RechazoSolicitudGuia,
 )
 from auth import (
     hash_password, verify_password, create_token, create_view_as_token, deny_view_as,
@@ -73,6 +74,7 @@ import descuentos
 # El 5% por pagar en cripto. Lo financia la comisión de pasarela que NO se paga.
 import descuento_cripto
 import comisiones
+import guia_solicitudes
 # ⛔ OBSEQUIOS DEL DISTRIBUIDOR Y CARRITO COMPARTIBLE (Christián, 2026-08-01). El
 # regalo se APILA con el código de descuento, su código interno NUNCA se le enseña
 # al cliente, y no puede romper el ROI. Módulo puro; ver regalos.py.
@@ -7737,6 +7739,184 @@ async def admin_rechazar_solicitud(payload: RechazoPagoComision,
     return {'rechazado': True}
 
 
+# ==========================================================================
+#  LA SOLICITUD DE GUÍA  —  el distribuidor pide, Christián aprueba (2026-08-03)
+# ==========================================================================
+# «Un botón "solicitar guía" junto al cliente al que le falte número de guía,
+# siempre y cuando ya haya pagado.» El distribuidor NUNCA dispara la compra —
+# una guía cuesta dinero de verdad —; la aprobación de Christián es la compuerta,
+# y la compra es `comprar_guia_del_pedido`, el MISMO camino del pago automático,
+# para que el correo al cliente y los frenos de gasto sean los mismos.
+# Los candados viven en `guia_solicitudes.py`, probados sin red.
+COLECCION_SOLICITUDES_GUIA = 'label_requests'
+
+
+@api_router.post('/distributor/orders/{order_number}/solicitar-guia')
+async def distribuidor_solicitar_guia(order_number: str,
+                                      dist=Depends(get_current_distributor)):
+    """El distribuidor pide la guía de un pedido SUYO, pagado y sin guía.
+
+    No se compra nada aquí: se deja la solicitud y la campanita al admin. El
+    candado de «es SU pedido» es el mismo del detalle: `referred_by` o 403."""
+    deny_view_as(dist)
+    o = await db.orders.find_one({'order_number': order_number}, {'_id': 0})
+    if not o:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    if o.get('referred_by') != dist['id']:
+        raise HTTPException(status_code=403, detail='Ese pedido no es tuyo')
+    previas = await db[COLECCION_SOLICITUDES_GUIA].find(
+        {'order_id': o['id']}, {'_id': 0}).to_list(50)
+    ok, motivo = guia_solicitudes.puede_solicitar(o, previas)
+    if not ok:
+        raise HTTPException(status_code=400, detail=motivo)
+    doc = {
+        'id': str(uuid.uuid4()),
+        'order_id': o['id'],
+        'order_number': o.get('order_number', ''),
+        'distributor_id': dist['id'],
+        'distributor_name': dist.get('name') or '',
+        'status': guia_solicitudes.ESTADO_SOLICITADA,
+        'requested_at': now_iso(),
+    }
+    await db[COLECCION_SOLICITUDES_GUIA].insert_one(dict(doc))
+    try:
+        admins = await db.users.find({'role': 'admin'}, {'_id': 0, 'id': 1}).to_list(20)
+        for a in admins:
+            await notify(a['id'], 'guia_solicitada', 'Solicitud De Guía De Envío',
+                         f'{dist.get("name") or "Un distribuidor"} solicita la guía '
+                         f'del pedido {o.get("order_number")}.',
+                         link='/admin?tab=orders',
+                         dedup=f'guia-solicitud:{o.get("order_number")}')
+    except Exception:
+        logger.exception('No se pudo avisar la solicitud de guía de %s', dist['id'])
+    return {'solicitado': True, **doc}
+
+
+@api_router.get('/admin/guia-solicitudes')
+async def admin_guia_solicitudes(admin=Depends(get_current_admin)):
+    """Las solicitudes de guía, las pendientes primero. Cada una con el estado
+    ACTUAL de su pedido — pagado y con o sin guía — porque entre solicitar y
+    aprobar el pedido puede cambiar, y aprobar es gastar."""
+    docs = await db[COLECCION_SOLICITUDES_GUIA].find({}, {'_id': 0}).to_list(1000)
+    ids = list({d.get('order_id') for d in docs})
+    pedidos = {o['id']: o for o in await db.orders.find(
+        {'id': {'$in': ids}}, {'_id': 0, 'id': 1, 'status': 1, 'paid': 1,
+                               'total': 1, 'tracking_number': 1}).to_list(1000)} if ids else {}
+    out = []
+    for d in docs:
+        o = pedidos.get(d.get('order_id')) or {}
+        out.append({**d, 'order_status': o.get('status', ''),
+                    'order_paid': esta_pagado(o) if o else False,
+                    'order_total': o.get('total', 0),
+                    'order_tracking': o.get('tracking_number', '')})
+    # Las más nuevas arriba y, encima de todo, las que esperan respuesta.
+    out.sort(key=lambda x: x.get('requested_at') or '', reverse=True)
+    out.sort(key=lambda x: 0 if x['status'] == guia_solicitudes.ESTADO_SOLICITADA else 1)
+    return {'solicitudes': out,
+            'pendientes': sum(1 for x in out
+                              if x['status'] == guia_solicitudes.ESTADO_SOLICITADA)}
+
+
+@api_router.post('/admin/guia-solicitudes/aprobar')
+async def admin_aprobar_solicitud_guia(payload: AprobarSolicitudGuia,
+                                       admin=Depends(get_current_admin)):
+    """Aprueba una solicitud: COMPRA la guía por el mismo camino del pago
+    automático (`comprar_guia_del_pedido`, con su correo al cliente, su candado
+    de doble compra y sus frenos de gasto) y asigna el número al pedido.
+
+    ⚠️ CUESTA DINERO DE VERDAD. Si un freno detiene la compra (tope de gasto,
+    sin empaque, paquetería caída), la solicitud SE QUEDA PENDIENTE y el error
+    se devuelve tal cual: aprobar sin comprar sería mentirle al distribuidor."""
+    deny_view_as(admin)
+    s = await db[COLECCION_SOLICITUDES_GUIA].find_one(
+        {'id': payload.solicitud_id, 'status': guia_solicitudes.ESTADO_SOLICITADA},
+        {'_id': 0})
+    if not s:
+        raise HTTPException(status_code=404,
+                            detail='Esa solicitud no existe o ya se resolvió')
+    o = await db.orders.find_one({'id': s['order_id']}, {'_id': 0})
+    if not o:
+        raise HTTPException(status_code=404, detail='El pedido de la solicitud ya no existe')
+    ahora = now_iso()
+    if (o.get('tracking_number') or '').strip():
+        # Alguien la compró por otro camino entre solicitar y aprobar: no se
+        # compra dos veces; la solicitud se resuelve con la guía que ya hay.
+        await db[COLECCION_SOLICITUDES_GUIA].update_one(
+            {'id': s['id']},
+            {'$set': {'status': guia_solicitudes.ESTADO_APROBADA,
+                      'tracking_number': o['tracking_number'],
+                      'nota': 'El pedido ya tenía guía al aprobar',
+                      'resolved_at': ahora, 'resolved_by': admin['id']}})
+        await _avisar_guia_al_distribuidor(s, o['tracking_number'])
+        return {'aprobada': True, 'tracking_number': o['tracking_number'],
+                'ya_tenia_guia': True}
+    if not esta_pagado(o):
+        raise HTTPException(status_code=409, detail='Ese pedido ya no figura como pagado')
+    if not envios.COMPRAR_GUIA_AL_PAGAR:
+        raise HTTPException(status_code=400,
+                            detail='La compra automática de guías está apagada; '
+                                   'cómprala a mano desde el pedido')
+    update = await comprar_guia_del_pedido(o, avisar=True)
+    if not update or not update.get('tracking_number'):
+        # El porqué quedó escrito en el pedido por `comprar_guia_del_pedido`
+        # (label_hold/label_error) y Christián ya tiene su aviso detallado.
+        fresco = await db.orders.find_one({'id': o['id']},
+                                          {'_id': 0, 'label_hold': 1, 'label_error': 1})
+        motivo = ((fresco or {}).get('label_error')
+                  or (fresco or {}).get('label_hold') or 'la compra no procedió')
+        raise HTTPException(status_code=502,
+                            detail=f'La guía no se pudo comprar: {motivo}. '
+                                   'La solicitud sigue pendiente.'[:300])
+    await db[COLECCION_SOLICITUDES_GUIA].update_one(
+        {'id': s['id']},
+        {'$set': {'status': guia_solicitudes.ESTADO_APROBADA,
+                  'tracking_number': update['tracking_number'],
+                  'resolved_at': ahora, 'resolved_by': admin['id']}})
+    await _avisar_guia_al_distribuidor(s, update['tracking_number'])
+    return {'aprobada': True, 'tracking_number': update['tracking_number']}
+
+
+async def _avisar_guia_al_distribuidor(solicitud: dict, numero: str):
+    """La campanita de vuelta: al que solicitó le llega el número. El CLIENTE ya
+    recibió su correo por `comprar_guia_del_pedido`; esto es el otro sentido."""
+    try:
+        await notify(solicitud['distributor_id'], 'guia_aprobada', 'Guía Generada',
+                     f'La guía del pedido {solicitud.get("order_number")} ya está: '
+                     f'{numero}. Tu cliente recibió el aviso con el rastreo.',
+                     link='/distribuidor')
+    except Exception:
+        logger.exception('No se pudo avisar la guía al distribuidor %s',
+                         solicitud.get('distributor_id'))
+
+
+@api_router.post('/admin/guia-solicitudes/rechazar')
+async def admin_rechazar_solicitud_guia(payload: RechazoSolicitudGuia,
+                                        admin=Depends(get_current_admin)):
+    """Niega una solicitud, con motivo. No se compra nada y el distribuidor
+    puede volver a solicitar cuando quiera."""
+    deny_view_as(admin)
+    s = await db[COLECCION_SOLICITUDES_GUIA].find_one(
+        {'id': payload.solicitud_id, 'status': guia_solicitudes.ESTADO_SOLICITADA},
+        {'_id': 0})
+    if not s:
+        raise HTTPException(status_code=404,
+                            detail='Esa solicitud no existe o ya se resolvió')
+    await db[COLECCION_SOLICITUDES_GUIA].update_one(
+        {'id': s['id']},
+        {'$set': {'status': guia_solicitudes.ESTADO_RECHAZADA,
+                  'motivo': (payload.motivo or '').strip()[:300],
+                  'resolved_at': now_iso(), 'resolved_by': admin['id']}})
+    try:
+        await notify(s['distributor_id'], 'guia_rechazada', 'Solicitud De Guía Rechazada',
+                     (f'La solicitud de guía del pedido {s.get("order_number")} no procedió.'
+                      + (f' Motivo: {payload.motivo.strip()}'
+                         if (payload.motivo or '').strip() else '')),
+                     link='/distribuidor')
+    except Exception:
+        logger.exception('No se pudo avisar el rechazo de guía a %s', s.get('distributor_id'))
+    return {'rechazado': True}
+
+
 @api_router.get('/cotizador/clientes')
 async def cotizador_clientes(quien=Depends(get_current_distributor)):
     """Los clientes que puede autollenar quien está cotizando. Admin o distribuidor.
@@ -7906,6 +8086,12 @@ async def distributor_orders(dist=Depends(get_current_distributor)):
     """
     orders = await _distributor_orders(dist)
     abierto = ve_datos_del_cliente(dist)
+    # Sus solicitudes de guía pendientes, de un jalón: el botón «Solicitar guía»
+    # necesita saber si ya hay una en camino para no ofrecerse dos veces.
+    solicitadas = {s.get('order_id') for s in await db[COLECCION_SOLICITUDES_GUIA].find(
+        {'distributor_id': dist['id'],
+         'status': guia_solicitudes.ESTADO_SOLICITADA},
+        {'_id': 0, 'order_id': 1}).to_list(500)}
     out = []
     for o in orders:
         c = o.get('customer') or {}
@@ -7938,6 +8124,10 @@ async def distributor_orders(dist=Depends(get_current_distributor)):
             'shipped_at': o.get('shipped_at'),
             'delivered_at': o.get('delivered_at'),
             'eta': o.get('eta', ''),
+            # Para el botón «Solicitar guía»: sólo pagado y sin guía se puede
+            # pedir, y si ya se pidió el botón dice «Solicitada» y se apaga.
+            'paid': esta_pagado(o),
+            'guia_solicitada': o.get('id') in solicitadas,
             **(_contacto_del_cliente(o, dist) if abierto else {}),
         })
     return out

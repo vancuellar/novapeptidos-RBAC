@@ -705,6 +705,19 @@ class RechazoPagoComision(BaseModel):
     motivo: Optional[str] = Field('', max_length=300)
 
 
+class AprobarSolicitudGuia(BaseModel):
+    """El admin aprueba una solicitud de guía. Aprobar ES comprar: el servidor
+    llama al MISMO camino de la compra automática del pago, con sus frenos."""
+    solicitud_id: str
+
+
+class RechazoSolicitudGuia(BaseModel):
+    """El admin niega una solicitud de guía, con motivo. No se compra nada y el
+    distribuidor puede volver a solicitar cuando quiera."""
+    solicitud_id: str
+    motivo: Optional[str] = Field('', max_length=300)
+
+
 class DiscountCodeCreate(BaseModel):
     # El distribuidor crea VARIOS códigos y elige cuál da a cada cliente. El
     # descuento va de 0 hasta su comisión de nivel (el servidor lo acota).
