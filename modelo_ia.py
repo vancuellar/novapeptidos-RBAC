@@ -55,8 +55,10 @@ import httpx
 
 import secretos
 
-# El motor. Vacío o desconocido = Gemini, que es el que está pagado y probado.
-PROVEEDOR = (os.environ.get('AI_PROVIDER') or 'gemini').strip().lower()
+# El motor, si alguien lo eligió a mano. VACÍO = lo elige `proveedor()` solo, con
+# las llaves que haya (ver ORDEN_PROVEEDOR_AUTO). Antes decía 'gemini' aquí, y eso
+# amarraba el chat al plan gratis aunque hubiera llaves de pago pegadas en el panel.
+PROVEEDOR = (os.environ.get('AI_PROVIDER') or '').strip().lower()
 
 # A dónde se cae si el motor de arriba falla EN CALIENTE (no si le falta la llave).
 # `ninguno` lo apaga. Por omisión Gemini, que es el que ya está pagado y probado.
@@ -122,8 +124,36 @@ class FaltaConfiguracion(RuntimeError):
     """
 
 
+# El orden para elegir motor cuando NADIE puso `AI_PROVIDER`. Gemini va AL FINAL
+# (Christián, 2026-08-03: «quita lo de Gemini»): su plan gratis son 20 consultas
+# al día, así que el chat amanecía bien y para la tarde decía «se acabó la cuota».
+# Un motor de pago por uso cuesta centavos y no se apaga a media jornada.
+ORDEN_PROVEEDOR_AUTO = ('kimi', 'openai', 'claude', 'gemini')
+
+
 def proveedor() -> str:
-    return PROVEEDOR if PROVEEDOR in MODELO_POR_OMISION else 'gemini'
+    """El motor de casa. `AI_PROVIDER` manda; si nadie lo puso, se elige solo.
+
+    ⛔ POR QUÉ SE ELIGE SOLO. Antes esto devolvía `gemini` a secas, y `AI_PROVIDER`
+    únicamente se puede poner en el `.env` del servidor — o sea que pegar una llave
+    en el panel NO cambiaba de motor y el chat seguía amarrado al plan gratis que
+    se agota. Ahora basta con pegar la llave: se toma el primer motor de la lista
+    que tenga llave Y nombre de modelo.
+    """
+    if PROVEEDOR in MODELO_POR_OMISION:
+        return PROVEEDOR
+    for cual in ORDEN_PROVEEDOR_AUTO:
+        if _tiene_modelo(cual) and encendido(cual):
+            return cual
+    return 'gemini'
+
+
+def _tiene_modelo(cual: str) -> bool:
+    """¿Este motor sabe a qué modelo pegarle? Mira su variable propia y su
+    nombre por omisión — nunca `modelo()`, que preguntaría por el proveedor y
+    haría recursión infinita con la función de arriba."""
+    return bool(os.environ.get(f'AI_MODEL_NAME_{cual.upper()}')
+                or MODELO_POR_OMISION.get(cual))
 
 
 def modelo(cual: str = None) -> str:
@@ -200,7 +230,7 @@ def respaldo() -> str:
     for cual in ORDEN_RESPALDO_AUTO:
         # `modelo(cual)` mira también `AI_MODEL_NAME_<MOTOR>`: un motor sin nombre
         # por omisión SÍ entra si Christián ya le puso el suyo.
-        if cual != proveedor() and modelo(cual) and encendido(cual):
+        if cual != proveedor() and _tiene_modelo(cual) and encendido(cual):
             return cual
     return ''
 
