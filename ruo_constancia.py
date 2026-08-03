@@ -81,9 +81,18 @@ def declaracion_completa(edad: bool, investigacion: bool) -> bool:
     return bool(edad) and bool(investigacion)
 
 
+def huella(textos: dict) -> str:
+    """SHA-256 de lo que se le enseñó, para poder comparar dos constancias de un
+    vistazo sin leer los párrafos enteros."""
+    import hashlib
+    crudo = '␟'.join(f'{k}={textos.get(k, "")}' for k in sorted(textos or {}))
+    return hashlib.sha256(crudo.encode('utf-8')).hexdigest()
+
+
 def constancia(request, edad: bool, investigacion: bool, recordar: bool,
-               user_id: str = None, idioma: str = '') -> dict:
+               user_id: str = None, idioma: str = '', textos: dict = None) -> dict:
     """El documento que se guarda. Sin base de datos: así se prueba de verdad."""
+    textos = {k: str(v)[:600] for k, v in (textos or {}).items()}
     return {
         'accepted_at': ahora(),
         'version': VERSION,
@@ -95,11 +104,20 @@ def constancia(request, edad: bool, investigacion: bool, recordar: bool,
         'user_agent': user_agent_de(request),
         'idioma': (idioma or '')[:16],
         'user_id': user_id or None,
+        # ⛔ EL TEXTO EXACTO QUE SE LE ENSEÑÓ, no sólo su número de versión
+        # (hallazgo de la revisión de Codex, 2026-08-03). `VERSION` la escribe el
+        # backend y el TEXTO vive en el i18n del frontend: cualquiera podía editar
+        # las frases sin subir la versión, y entonces la constancia probaba que
+        # aceptó «la v2» sin que nadie pudiera reconstruir qué decía la v2.
+        # Se guarda lo que el navegador dice haber pintado — con su huella, para
+        # comparar dos constancias sin leerlas enteras.
+        'textos': textos,
+        'huella_textos': huella(textos) if textos else '',
     }
 
 
 async def registrar(db, request, edad: bool, investigacion: bool, recordar: bool,
-                    user_id: str = None, idioma: str = '') -> dict:
+                    user_id: str = None, idioma: str = '', textos: dict = None) -> dict:
     """Guarda la constancia y devuelve lo que se guardó.
 
     ⛔ NUNCA revienta hacia arriba. Si la base no está o falla, se devuelve el
@@ -108,7 +126,7 @@ async def registrar(db, request, edad: bool, investigacion: bool, recordar: bool
     """
     if not declaracion_completa(edad, investigacion):
         return {'guardada': False, 'motivo': 'faltan casillas'}
-    doc = constancia(request, edad, investigacion, recordar, user_id, idioma)
+    doc = constancia(request, edad, investigacion, recordar, user_id, idioma, textos)
     if db is None:
         return {**doc, 'guardada': False, 'motivo': 'sin base'}
     try:

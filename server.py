@@ -474,7 +474,9 @@ async def register(payload: RegisterInput):
     if existing:
         raise HTTPException(status_code=400, detail='Este correo ya esta registrado')
     if not payload.age_confirmed:
-        raise HTTPException(status_code=400, detail='Debes confirmar que tienes 18 anos o mas y aceptar los Terminos y Condiciones')
+        # 21, no 18 (Christián, 2026-08-02). Se le pasó al barrido de ese día porque
+        # este texto vive en el backend y el barrido miró el frontend y los i18n.
+        raise HTTPException(status_code=400, detail='Debes confirmar que tienes 21 anos o mas y aceptar los Terminos y Condiciones')
     if not payload.privacy_accepted:
         raise HTTPException(status_code=400, detail='Debes aceptar la Politica de privacidad')
     referrer = await resolve_distributor(payload.distributor_code)
@@ -6651,6 +6653,11 @@ class RuoAceptarInput(BaseModel):
     investigacion: bool = False
     recordar: bool = True
     idioma: str = ''
+    # Lo que el navegador dice haber PINTADO en pantalla. Se guarda tal cual para
+    # poder reconstruir qué aceptó exactamente: la versión la escribe el backend,
+    # pero el texto vive en el i18n del frontend y podía cambiar sin que nadie
+    # subiera la versión (hallazgo de la revisión de Codex, 2026-08-03).
+    textos: dict = {}
 
 
 @api_router.post('/ruo/aceptar')
@@ -6672,7 +6679,7 @@ async def ruo_aceptar(payload: RuoAceptarInput, request: Request,
     quien = (user or {}).get('id') if isinstance(user, dict) else getattr(user, 'id', None)
     res = await ruo_constancia.registrar(
         db, request, payload.edad, payload.investigacion, payload.recordar,
-        user_id=quien, idioma=payload.idioma)
+        user_id=quien, idioma=payload.idioma, textos=payload.textos)
     # Sólo se le devuelve lo que le importa: cuándo y qué versión. La IP y el
     # user-agent son la prueba de la CASA, no información que el visitante pidió.
     return {'guardada': bool(res.get('guardada')),
