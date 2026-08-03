@@ -360,7 +360,7 @@ def test_con_gemini_de_proveedor_el_respaldo_se_elige_solo(motor):
     """El caso real del 3-ago: Gemini corriendo y las llaves de Claude y GPT
     pegadas en el panel. Sin tocar nada más, la cadena tiene a dónde caerse."""
     m = motor(None, ANTHROPIC_API_KEY='a-de-mentiras', GEMINI_API_KEY='g')
-    assert m.cadena() == ['gemini', 'claude']
+    assert m.cadena() == ['gemini', 'claude']   # la única otra llave puesta
 
 
 def test_el_automatico_respeta_el_orden_y_salta_al_que_no_tiene_modelo(motor):
@@ -371,10 +371,17 @@ def test_el_automatico_respeta_el_orden_y_salta_al_que_no_tiene_modelo(motor):
     m = motor(None, OPENAI_API_KEY='o', AI_MODEL_NAME_OPENAI='gpt-x',
               GEMINI_API_KEY='g')
     assert m.cadena() == ['gemini', 'openai']
-    # Y con las dos, manda el orden: Claude antes que GPT.
+    # Y con las tres llaves manda el PRECIO: Kimi (centavos) antes que GPT, y
+    # GPT antes que Claude. El respaldo entra el día de más tráfico: saltar al
+    # más caro haría que el pico de demanda fuera también el de la factura.
+    m = motor(None, ANTHROPIC_API_KEY='a', OPENAI_API_KEY='o',
+              AI_MODEL_NAME_OPENAI='gpt-x', MOONSHOT_API_KEY='k',
+              GEMINI_API_KEY='g')
+    assert m.cadena() == ['gemini', 'kimi']
+    # Sin Kimi, el siguiente más barato es GPT.
     m = motor(None, ANTHROPIC_API_KEY='a', OPENAI_API_KEY='o',
               AI_MODEL_NAME_OPENAI='gpt-x', GEMINI_API_KEY='g')
-    assert m.cadena() == ['gemini', 'claude']
+    assert m.cadena() == ['gemini', 'openai']
 
 
 def test_elegirlo_a_mano_sigue_mandando_sobre_el_automatico(motor):

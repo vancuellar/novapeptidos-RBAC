@@ -157,9 +157,17 @@ def encendido(cual: str = None) -> bool:
 
 
 # El orden en que se busca un respaldo AUTOMÁTICO cuando nadie lo eligió a mano.
-# Primero los que traen nombre de modelo por omisión: un motor sin nombre muere
-# con «falta AI_MODEL_NAME» en la primera línea, que es peor que no tener respaldo.
-ORDEN_RESPALDO_AUTO = ('claude', 'openai', 'kimi', 'gemini')
+#
+# ⛔ DE MÁS BARATO A MÁS CARO (Christián, 2026-08-03: «que el más barato responda
+# primero»). El respaldo entra justo cuando el motor de casa se agotó, o sea el
+# día de más tráfico: si ahí salta al más caro, el pico de demanda es también el
+# pico de la factura. Kimi cuesta centavos por consulta, GPT bastante más y
+# Claude es el más caro de los tres — así que se prueban en ese orden.
+#
+# Un motor sin nombre de modelo se salta solo (ver el `modelo(cual)` de abajo):
+# entrar sin nombre muere con «falta AI_MODEL_NAME» en la primera línea, que es
+# peor que no tener respaldo.
+ORDEN_RESPALDO_AUTO = ('kimi', 'openai', 'claude', 'gemini')
 
 
 def respaldo() -> str:
