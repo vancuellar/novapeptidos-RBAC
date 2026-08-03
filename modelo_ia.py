@@ -156,17 +156,45 @@ def encendido(cual: str = None) -> bool:
     return bool(nombre and llave(nombre))
 
 
+# El orden en que se busca un respaldo AUTOMÁTICO cuando nadie lo eligió a mano.
+# Primero los que traen nombre de modelo por omisión: un motor sin nombre muere
+# con «falta AI_MODEL_NAME» en la primera línea, que es peor que no tener respaldo.
+ORDEN_RESPALDO_AUTO = ('claude', 'openai', 'kimi', 'gemini')
+
+
 def respaldo() -> str:
     """El motor de respaldo EFECTIVO, o cadena vacía si no hay.
 
     Un respaldo sin llave no es un respaldo: se descarta aquí para que la cadena
     no cargue con un motor que va a morir en la primera línea.
+
+    ⛔ POR QUÉ HAY RESPALDO AUTOMÁTICO (Christián, 2026-08-03). El chat seguía
+    diciendo «se acabó la cuota» con las llaves de GPT y Claude YA pegadas en el
+    panel: `AI_PROVIDER_FALLBACK` venía en `gemini` por omisión y el proveedor
+    también era `gemini`, o sea «si falla Gemini, usa Gemini» — un respaldo que
+    no existe. Pegar una llave tenía que bastar; que además hubiera que editar
+    una variable en el servidor era una trampa silenciosa.
+
+    Ahora: si nadie eligió respaldo a mano, se toma el primer motor ENCENDIDO
+    (con llave, del entorno o del panel) distinto del proveedor. Apagarlo sigue
+    siendo `AI_PROVIDER_FALLBACK=ninguno`, y elegirlo a mano sigue mandando.
     """
-    if RESPALDO in ('', 'ninguno', 'none', 'off', 'no', '0'):
+    if RESPALDO in ('ninguno', 'none', 'off', 'no', '0'):
         return ''
-    if RESPALDO not in MODELO_POR_OMISION or RESPALDO == proveedor():
-        return ''
-    return RESPALDO if encendido(RESPALDO) else ''
+    # Elegido a mano: se respeta tal cual (y se descarta si no sirve).
+    if RESPALDO and RESPALDO != 'gemini':
+        if RESPALDO not in MODELO_POR_OMISION or RESPALDO == proveedor():
+            return ''
+        return RESPALDO if encendido(RESPALDO) else ''
+    # Nadie lo eligió (o quedó el `gemini` por omisión): se busca solo.
+    if RESPALDO == 'gemini' and RESPALDO != proveedor() and encendido('gemini'):
+        return 'gemini'
+    for cual in ORDEN_RESPALDO_AUTO:
+        # `modelo(cual)` mira también `AI_MODEL_NAME_<MOTOR>`: un motor sin nombre
+        # por omisión SÍ entra si Christián ya le puso el suyo.
+        if cual != proveedor() and modelo(cual) and encendido(cual):
+            return cual
+    return ''
 
 
 def cadena() -> list:

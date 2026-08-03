@@ -21,6 +21,7 @@ depende de que nadie mantenga una lista de campos permitidos.
 """
 
 import json
+import unicodedata
 
 import compendio
 import pyramid
@@ -432,3 +433,103 @@ def titulo_de_chat(mensajes):
             t = ' '.join(m['content'].split())
             return t[:60] + ('…' if len(t) > 60 else '')
     return 'Chat nuevo'
+
+
+# ---------------------------------------------------------------------------
+#  Renombrar, buscar y archivar — las funciones puras
+# ---------------------------------------------------------------------------
+# Encargo de Christián (2026-08-03): ponerle nombre a un chat, buscar sin que
+# importen mayúsculas ni acentos, y consolidar un chat viejo en UN documento
+# markdown. Todo lo que se puede probar sin red vive aquí; server.py sólo pega
+# estas piezas con la base.
+
+TITULO_MAX = 80        # un nombre custom no pasa de aquí: se recorta, no se rechaza
+SNIPPET_LARGO = 120    # caracteres del fragmento que enseña la búsqueda
+
+
+def limpiar_titulo(titulo):
+    """El nombre que puso el usuario, aseado: espacios colapsados y tope de 80.
+
+    Vacío después del aseo = «quítale el nombre»: el que llama borra el custom
+    y la lista vuelve al título derivado del primer mensaje."""
+    return ' '.join((titulo or '').split())[:TITULO_MAX].strip()
+
+
+def normalizar(texto):
+    """Minúsculas y sin acentos: «¿CUÁNTO?» → «¿cuanto?».
+
+    Así «cuanto» encuentra «¿cuánto gano…» aunque quien busca no ponga tildes.
+    El volumen de chats por usuario es chico: comparar en Python sobre texto
+    normalizado alcanza y sobra; no hay índice de texto que mantener."""
+    d = unicodedata.normalize('NFD', (texto or '').lower())
+    return ''.join(c for c in d if unicodedata.category(c) != 'Mn')
+
+
+def _normalizar_alineado(texto):
+    """Como `normalizar`, pero garantizando la MISMA longitud que el original.
+
+    `normalizar` a secas cambia la longitud («á» NFD son dos puntos de código y
+    uno se tira), y entonces la posición hallada no sirve para recortar el texto
+    original. Aquí se normaliza carácter por carácter conservando uno por uno:
+    la posición en el normalizado ES la posición en el original."""
+    out = []
+    for c in (texto or ''):
+        d = unicodedata.normalize('NFD', c)
+        base = ''.join(ch for ch in d if unicodedata.category(ch) != 'Mn') or c
+        base = base.lower() or c
+        out.append(base[0])
+    return ''.join(out)
+
+
+def coincide(texto, palabras):
+    """¿Aparecen TODAS las palabras (ya normalizadas) en el texto? AND, no OR.
+
+    Con lista vacía contesta False a propósito: «sin palabras» no puede
+    significar «coincide con todo»."""
+    if not palabras:
+        return False
+    t = normalizar(texto)
+    return all(p in t for p in palabras)
+
+
+def snippet(texto, palabras, largo=SNIPPET_LARGO):
+    """~120 caracteres del texto, centrados en la primera palabra hallada, con
+    «…» en el lado que se recortó. Es lo que la lista de resultados enseña."""
+    texto = ' '.join((texto or '').split())
+    alineado = _normalizar_alineado(texto)
+    pos = None
+    for p in (palabras or []):
+        i = alineado.find(normalizar(p))
+        if i >= 0 and (pos is None or i < pos):
+            pos = i
+    if pos is None:
+        pos = 0
+    ini = max(0, pos - largo // 2)
+    fin = min(len(texto), ini + largo)
+    ini = max(0, fin - largo)
+    frag = texto[ini:fin].strip()
+    return ('…' if ini > 0 else '') + frag + ('…' if fin < len(texto) else '')
+
+
+def en_mes(ts, anio=None, mes=None):
+    """¿La fecha ISO cae en ese año/mes? None en cualquiera = no filtrar por él."""
+    try:
+        y, m = int((ts or '')[:4]), int((ts or '')[5:7])
+    except ValueError:
+        return False
+    return (anio is None or y == anio) and (mes is None or m == mes)
+
+
+def chat_a_markdown(titulo, mensajes):
+    """El chat ENTERO como UN documento markdown: título y luego cada mensaje
+    con su etiqueta. Es lo que se guarda al archivar (N documentos → 1) y lo que
+    se exporta con /business/chats/{id}/md."""
+    partes = [f'# {titulo}']
+    for m in (mensajes or []):
+        fecha = ((m or {}).get('created_at') or '')[:10]
+        if (m or {}).get('role') == 'user':
+            enc = f'**Usuario** ({fecha}):' if fecha else '**Usuario**:'
+        else:
+            enc = '**Asesor**:'
+        partes.append(f"{enc}\n{(m or {}).get('content') or ''}")
+    return '\n\n'.join(partes) + '\n'

@@ -31,7 +31,7 @@ from models import (
     ComprarGuiaRequest, CotizadorEnvioRequest,
     ProtocolInput, ProtocolUpdate, PerfilSalud, LabReportInput,
     TokenInput, ActivateInput, ResendVerificationInput, AceptarAcuerdoInput,
-    ChatInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
+    ChatInput, ChatRenameInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
     QuoteEmailRequest, ShareCartRequest, PrellenadoRequest,
     SolicitudPagoComision, RegistroPagoComision, RechazoPagoComision,
     AprobarSolicitudGuia, RechazoSolicitudGuia,
@@ -8983,6 +8983,13 @@ async def chat_history(session_id: str):
 @api_router.post('/business/chat')
 async def business_chat(payload: ChatInput, user=Depends(get_current_distributor)):
     deny_view_as(user)
+    # Un chat archivado quedó consolidado en UN markdown y sus mensajes sueltos
+    # ya no existen: aceptar uno nuevo abriría un hueco entre el archivo y lo
+    # suelto. Se corta ANTES de armar nada, con un 409 que la pantalla entiende.
+    if await db.business_chat_archive.find_one(
+            {'session_id': payload.session_id, 'user_id': user['id']}, {'_id': 1}):
+        raise HTTPException(status_code=409,
+                            detail='Este chat está archivado. Abre uno nuevo.')
     # El mismo catálogo que ve el sitio, más los campos con los que se calcula el
     # tope. `tope_de_descuento` recorta a un número: por ahí no se asoma un costo.
     catalog = await db.products.find(
@@ -9061,8 +9068,9 @@ async def business_chat(payload: ChatInput, user=Depends(get_current_distributor
 @api_router.get('/business/chats')
 async def business_chats(user=Depends(get_current_distributor)):
     """SUS chats, el más reciente primero, con lo que la lista necesita: título
-    (el primer mensaje), fecha del último, cuántos mensajes y qué tanta memoria
-    lleva usada cada uno (para pintar el aviso del 85% también en la lista)."""
+    (el custom si lo puso, si no el primer mensaje), fecha del último, cuántos
+    mensajes y qué tanta memoria lleva usada cada uno (para pintar el aviso del
+    85% también en la lista). Los archivados también salen, marcados."""
     docs = await db.business_chat_messages.find(
         {'user_id': user['id']}, {'_id': 0, 'session_id': 1, 'role': 1,
                                   'content': 1, 'created_at': 1},
@@ -9070,19 +9078,208 @@ async def business_chats(user=Depends(get_current_distributor)):
     por_sesion = {}
     for m in docs:
         por_sesion.setdefault(m.get('session_id'), []).append(m)
+    # Los nombres custom, en UNA consulta para toda la lista (no una por chat).
+    custom = await db.business_chat_sessions.find(
+        {'user_id': user['id']}, {'_id': 0, 'session_id': 1, 'titulo': 1},
+    ).to_list(1000)
+    titulos = {c.get('session_id'): c.get('titulo') for c in custom if c.get('titulo')}
     out = []
     for sid, msgs in por_sesion.items():
         if not sid:
             continue
         out.append({
             'session_id': sid,
-            'titulo': chat_negocio.titulo_de_chat(msgs),
+            'titulo': titulos.get(sid) or chat_negocio.titulo_de_chat(msgs),
             'mensajes': len(msgs),
             'last_at': msgs[-1].get('created_at') or '',
             'contexto_pct': chat_negocio.contexto_pct(msgs),
+            'archivado': False,
+        })
+    # Los archivados: un documento por chat, con el conteo ya guardado. Su
+    # memoria no aplica (no aceptan mensajes nuevos): contexto_pct va en 0.
+    archivados = await db.business_chat_archive.find(
+        {'user_id': user['id']},
+        {'_id': 0, 'session_id': 1, 'titulo': 1, 'mensajes': 1, 'last_at': 1},
+    ).to_list(1000)
+    for a in archivados:
+        out.append({
+            'session_id': a.get('session_id'),
+            'titulo': titulos.get(a.get('session_id')) or a.get('titulo') or 'Chat archivado',
+            'mensajes': int(a.get('mensajes') or 0),
+            'last_at': a.get('last_at') or '',
+            'contexto_pct': 0,
+            'archivado': True,
         })
     out.sort(key=lambda c: c['last_at'], reverse=True)
     return {'chats': out[:50], 'aviso_pct': chat_negocio.AVISO_PCT}
+
+
+@api_router.put('/business/chats/{session_id}/nombre')
+async def business_chat_rename(session_id: str, payload: ChatRenameInput,
+                               user=Depends(get_current_distributor)):
+    """Ponerle nombre a un chat (o quitárselo mandando título vacío).
+
+    El nombre vive en `business_chat_sessions`, aparte de los mensajes, y la
+    lista lo pisa sobre el derivado. Sólo se puede nombrar un chat que tenga
+    mensajes SUYOS: nombrar el de otro (o uno inexistente) es 404, no 403 — no
+    se le confirma a nadie que ese session_id existe."""
+    deny_view_as(user)
+    mio = await db.business_chat_messages.find_one(
+        {'session_id': session_id, 'user_id': user['id']})
+    if not mio:
+        raise HTTPException(status_code=404, detail='Ese chat no existe o no es tuyo')
+    titulo = chat_negocio.limpiar_titulo(payload.titulo)
+    if not titulo:
+        # Vacío = volver al título derivado: se borra el custom y ya.
+        await db.business_chat_sessions.delete_one(
+            {'session_id': session_id, 'user_id': user['id']})
+        return {'ok': True, 'titulo': ''}
+    await db.business_chat_sessions.update_one(
+        {'session_id': session_id, 'user_id': user['id']},
+        {'$set': {'session_id': session_id, 'user_id': user['id'],
+                  'titulo': titulo, 'updated_at': now_iso()}},
+        upsert=True)
+    return {'ok': True, 'titulo': titulo}
+
+
+@api_router.get('/business/chats/buscar')
+async def business_chats_buscar(q: str = '', anio: Optional[int] = None,
+                                mes: Optional[int] = None,
+                                user=Depends(get_current_distributor)):
+    """Búsqueda en SUS chats: por texto (sin distinguir mayúsculas ni acentos,
+    multi-palabra = todas deben aparecer), por año/mes, o ambos.
+
+    Se trae lo del usuario y se filtra en Python con las funciones puras de
+    chat_negocio (normalizar/coincide/snippet): el volumen por usuario es chico
+    y así la búsqueda se prueba sin red. También rasca en los archivados, que
+    regresan con `archivado: true`."""
+    q = (q or '').strip()
+    if not q and anio is None and mes is None:
+        raise HTTPException(status_code=400,
+                            detail='Da al menos un criterio: q, anio o mes')
+    palabras = chat_negocio.normalizar(q).split()
+
+    docs = await db.business_chat_messages.find(
+        {'user_id': user['id']},
+        {'_id': 0, 'session_id': 1, 'role': 1, 'content': 1, 'created_at': 1},
+    ).sort('created_at', 1).to_list(5000)
+    por_sesion = {}
+    for m in docs:
+        if m.get('session_id'):
+            por_sesion.setdefault(m['session_id'], []).append(m)
+    custom = await db.business_chat_sessions.find(
+        {'user_id': user['id']}, {'_id': 0, 'session_id': 1, 'titulo': 1},
+    ).to_list(1000)
+    titulos = {c.get('session_id'): c.get('titulo') for c in custom if c.get('titulo')}
+
+    out = []
+    for sid, msgs in por_sesion.items():
+        if (anio is not None or mes is not None) and not any(
+                chat_negocio.en_mes(m.get('created_at'), anio, mes) for m in msgs):
+            continue
+        titulo = titulos.get(sid) or chat_negocio.titulo_de_chat(msgs)
+        con_la_palabra = []
+        if palabras:
+            # Un mensaje coincide si trae TODAS las palabras; el chat entra si
+            # coincide algún mensaje o su título (custom o derivado).
+            con_la_palabra = [m for m in msgs
+                              if chat_negocio.coincide(m.get('content'), palabras)]
+            if not con_la_palabra and not chat_negocio.coincide(titulo, palabras) \
+                    and not chat_negocio.coincide(chat_negocio.titulo_de_chat(msgs), palabras):
+                continue
+        primero = con_la_palabra[0].get('content') if con_la_palabra else ''
+        out.append({
+            'session_id': sid,
+            'titulo': titulo,
+            'last_at': msgs[-1].get('created_at') or '',
+            'mensajes': len(msgs),
+            'snippet': chat_negocio.snippet(primero, palabras) if primero else '',
+            'coincidencias': len(con_la_palabra),
+        })
+
+    # Los archivados: el chat entero vive en su markdown, se busca ahí.
+    archivados = await db.business_chat_archive.find(
+        {'user_id': user['id']},
+        {'_id': 0, 'session_id': 1, 'titulo': 1, 'md': 1, 'mensajes': 1,
+         'first_at': 1, 'last_at': 1},
+    ).to_list(1000)
+    for a in archivados:
+        if (anio is not None or mes is not None) and not (
+                chat_negocio.en_mes(a.get('first_at'), anio, mes)
+                or chat_negocio.en_mes(a.get('last_at'), anio, mes)):
+            continue
+        titulo = titulos.get(a.get('session_id')) or a.get('titulo') or 'Chat archivado'
+        en_md = bool(palabras) and chat_negocio.coincide(a.get('md'), palabras)
+        if palabras and not en_md and not chat_negocio.coincide(titulo, palabras):
+            continue
+        out.append({
+            'session_id': a.get('session_id'),
+            'titulo': titulo,
+            'last_at': a.get('last_at') or '',
+            'mensajes': int(a.get('mensajes') or 0),
+            'snippet': chat_negocio.snippet(a.get('md'), palabras) if en_md else '',
+            'coincidencias': 1 if palabras else 0,
+            'archivado': True,
+        })
+
+    out.sort(key=lambda c: c['last_at'], reverse=True)
+    return {'chats': out[:50]}
+
+
+@api_router.post('/business/chats/{session_id}/archivar')
+async def business_chat_archivar(session_id: str,
+                                 user=Depends(get_current_distributor)):
+    """Consolida un chat viejo: N mensajes sueltos → UN documento markdown en
+    `business_chat_archive`, y los sueltos se borran. No hay desarchivar (a
+    propósito): el chat queda de sólo lectura y rechaza mensajes nuevos."""
+    deny_view_as(user)
+    msgs = await db.business_chat_messages.find(
+        {'session_id': session_id, 'user_id': user['id']}, {'_id': 0},
+    ).sort('created_at', 1).to_list(5000)
+    if not msgs:
+        raise HTTPException(status_code=404,
+                            detail='Ese chat no existe, no es tuyo o ya esta archivado')
+    custom = await db.business_chat_sessions.find_one(
+        {'session_id': session_id, 'user_id': user['id']})
+    titulo = (custom or {}).get('titulo') or chat_negocio.titulo_de_chat(msgs)
+    md = chat_negocio.chat_a_markdown(titulo, msgs)
+    # PRIMERO se escribe el archivo y DESPUÉS se borran los sueltos: si algo
+    # truena a la mitad, lo peor que queda es el chat duplicado, nunca perdido.
+    await db.business_chat_archive.update_one(
+        {'session_id': session_id, 'user_id': user['id']},
+        {'$set': {'session_id': session_id, 'user_id': user['id'],
+                  'titulo': titulo, 'md': md, 'mensajes': len(msgs),
+                  'first_at': msgs[0].get('created_at') or '',
+                  'last_at': msgs[-1].get('created_at') or '',
+                  'archived_at': now_iso()}},
+        upsert=True)
+    await db.business_chat_messages.delete_many(
+        {'session_id': session_id, 'user_id': user['id']})
+    return {'ok': True, 'session_id': session_id, 'titulo': titulo,
+            'mensajes': len(msgs)}
+
+
+@api_router.get('/business/chats/{session_id}/md')
+async def business_chat_md(session_id: str,
+                           user=Depends(get_current_distributor)):
+    """El chat como markdown, para exportar: el archivado sale de su archivo tal
+    cual; el vivo se genera al vuelo con la misma función. Sólo el dueño: el
+    filtro por user_id hace que el de otro sea un 404, no un documento."""
+    arch = await db.business_chat_archive.find_one(
+        {'session_id': session_id, 'user_id': user['id']}, {'_id': 0})
+    if arch:
+        return {'titulo': arch.get('titulo') or 'Chat archivado',
+                'md': arch.get('md') or '', 'archivado': True}
+    msgs = await db.business_chat_messages.find(
+        {'session_id': session_id, 'user_id': user['id']}, {'_id': 0},
+    ).sort('created_at', 1).to_list(5000)
+    if not msgs:
+        raise HTTPException(status_code=404, detail='Ese chat no existe o no es tuyo')
+    custom = await db.business_chat_sessions.find_one(
+        {'session_id': session_id, 'user_id': user['id']})
+    titulo = (custom or {}).get('titulo') or chat_negocio.titulo_de_chat(msgs)
+    return {'titulo': titulo, 'md': chat_negocio.chat_a_markdown(titulo, msgs),
+            'archivado': False}
 
 
 @api_router.get('/business/history/{session_id}')

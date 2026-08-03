@@ -348,3 +348,48 @@ def test_las_llaves_se_pueden_pegar_desde_el_admin():
     assert 'OPENAI_API_KEY' in secretos.PERMITIDAS
     assert 'MOONSHOT_API_KEY' in secretos.PERMITIDAS
     assert 'ANTHROPIC_API_KEY' in secretos.PERMITIDAS
+
+
+# ------------------------------------- el respaldo AUTOMÁTICO (Christián, 3-ago)
+# «¿Por qué sigue diciendo que se agotó la cuota si ya subí las claves de GPT y
+# Claude como respaldo?» Porque `AI_PROVIDER_FALLBACK` venía en `gemini` y el
+# proveedor también: «si falla Gemini, usa Gemini». Pegar la llave tiene que
+# bastar.
+
+def test_con_gemini_de_proveedor_el_respaldo_se_elige_solo(motor):
+    """El caso real del 3-ago: Gemini corriendo y las llaves de Claude y GPT
+    pegadas en el panel. Sin tocar nada más, la cadena tiene a dónde caerse."""
+    m = motor(None, ANTHROPIC_API_KEY='a-de-mentiras', GEMINI_API_KEY='g')
+    assert m.cadena() == ['gemini', 'claude']
+
+
+def test_el_automatico_respeta_el_orden_y_salta_al_que_no_tiene_modelo(motor):
+    """OpenAI va sin nombre de modelo por omisión: entrar a la cadena sin él
+    sería cambiar «se acabó la cuota» por «falta AI_MODEL_NAME»."""
+    m = motor(None, OPENAI_API_KEY='o', GEMINI_API_KEY='g')
+    assert m.cadena() == ['gemini']          # openai no entra: no tiene modelo
+    m = motor(None, OPENAI_API_KEY='o', AI_MODEL_NAME_OPENAI='gpt-x',
+              GEMINI_API_KEY='g')
+    assert m.cadena() == ['gemini', 'openai']
+    # Y con las dos, manda el orden: Claude antes que GPT.
+    m = motor(None, ANTHROPIC_API_KEY='a', OPENAI_API_KEY='o',
+              AI_MODEL_NAME_OPENAI='gpt-x', GEMINI_API_KEY='g')
+    assert m.cadena() == ['gemini', 'claude']
+
+
+def test_elegirlo_a_mano_sigue_mandando_sobre_el_automatico(motor):
+    m = motor(None, AI_PROVIDER_FALLBACK='kimi', MOONSHOT_API_KEY='k',
+              ANTHROPIC_API_KEY='a', GEMINI_API_KEY='g')
+    assert m.cadena() == ['gemini', 'kimi']
+
+
+def test_apagarlo_sigue_apagandolo_aunque_haya_llaves(motor):
+    m = motor(None, AI_PROVIDER_FALLBACK='ninguno', ANTHROPIC_API_KEY='a',
+              GEMINI_API_KEY='g')
+    assert m.cadena() == ['gemini']
+
+
+def test_sin_ninguna_otra_llave_la_cadena_no_cambia(motor):
+    """Sin nada que pegar, el comportamiento es el de siempre: un solo motor."""
+    m = motor(None, GEMINI_API_KEY='g')
+    assert m.cadena() == ['gemini']

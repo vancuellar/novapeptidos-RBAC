@@ -98,15 +98,16 @@ class _Coll:
     def __init__(self, docs=None):
         self.docs = list(docs or [])
 
+    @staticmethod
+    def _pega(d, filtro):
+        return all(d.get(k2) == v for k2, v in (filtro or {}).items())
+
     def find(self, filtro=None, *a, **k):
-        filtro = filtro or {}
-        return _Cursor([d for d in self.docs
-                        if all(d.get(k2) == v for k2, v in filtro.items())])
+        return _Cursor([d for d in self.docs if self._pega(d, filtro)])
 
     async def find_one(self, filtro=None, *a, **k):
-        filtro = filtro or {}
         for d in self.docs:
-            if all(d.get(k2) == v for k2, v in filtro.items()):
+            if self._pega(d, filtro):
                 return dict(d)
         return None
 
@@ -114,7 +115,29 @@ class _Coll:
         self.docs.append(dict(doc))
         return None
 
-    async def update_one(self, *a, **k):
+    async def update_one(self, filtro=None, cambio=None, upsert=False, *a, **k):
+        # Lo justo para renombrar y archivar: $set sobre el primero que pegue,
+        # y con upsert=True se crea el documento si no había.
+        puesto = (cambio or {}).get('$set') or {}
+        for d in self.docs:
+            if self._pega(d, filtro):
+                d.update(puesto)
+                return None
+        if upsert:
+            nuevo = dict(filtro or {})
+            nuevo.update(puesto)
+            self.docs.append(nuevo)
+        return None
+
+    async def delete_one(self, filtro=None):
+        for i, d in enumerate(self.docs):
+            if self._pega(d, filtro):
+                del self.docs[i]
+                return None
+        return None
+
+    async def delete_many(self, filtro=None):
+        self.docs = [d for d in self.docs if not self._pega(d, filtro)]
         return None
 
 
@@ -612,3 +635,227 @@ def test_el_chat_regresa_el_pct_en_el_header(como):
     r = _preguntar(como(DIST), sesion='s-pct')
     assert r.status_code == 200
     assert 'x-contexto-pct' in {k.lower() for k in r.headers}
+
+
+# ------------------------------- renombrar, buscar y archivar (2026-08-03)
+# Encargo de Christián: ponerle nombre a un chat, búsqueda que no se fije en
+# mayúsculas ni acentos, y archivar chats viejos en UN documento markdown.
+#
+# ⚠️ Ojo con las palabras de búsqueda en estas pruebas: el doble de
+# `stream_reply` guarda el SYSTEM PROMPT como respuesta del asesor, así que
+# palabras comunes («cuanto», «pedido», «retatrutida») aparecen en TODOS los
+# chats. Por eso se busca con apellidos que el prompt no trae.
+
+def test_normalizar_quita_acentos_y_mayusculas():
+    assert chat_negocio.normalizar('¿CUÁNTO Ganó Gutiérrez?') == '¿cuanto gano gutierrez?'
+
+
+def test_coincide_es_AND_y_sin_acentos():
+    assert chat_negocio.coincide('¿Cuánto gana un distribuidor?', ['cuanto', 'gana'])
+    assert not chat_negocio.coincide('¿Cuánto cuesta?', ['cuanto', 'gana'])
+    # Lista vacía NO es «coincide con todo».
+    assert not chat_negocio.coincide('lo que sea', [])
+
+
+def test_el_snippet_se_centra_en_la_palabra_y_pone_puntos():
+    texto = 'x' * 300 + ' aquí está la clave gutiérrez escondida ' + 'y' * 300
+    s = chat_negocio.snippet(texto, ['gutierrez'])
+    assert 'gutiérrez' in s.lower()          # con su acento original
+    assert s.startswith('…') and s.endswith('…')
+    assert len(s) <= chat_negocio.SNIPPET_LARGO + 2
+    # Un texto corto viaja entero, sin puntos.
+    assert chat_negocio.snippet('hola Gutiérrez', ['gutierrez']) == 'hola Gutiérrez'
+
+
+def test_en_mes_filtra_por_partes():
+    assert chat_negocio.en_mes('2026-07-15T10:00:00-06:00', 2026, 7)
+    assert chat_negocio.en_mes('2026-07-15T10:00:00-06:00', anio=2026)
+    assert chat_negocio.en_mes('2026-07-15T10:00:00-06:00', mes=7)
+    assert not chat_negocio.en_mes('2026-07-15T10:00:00-06:00', 2026, 8)
+    assert not chat_negocio.en_mes('', 2026, 7)
+
+
+def test_chat_a_markdown_arma_un_solo_documento():
+    msgs = [
+        {'role': 'user', 'content': '¿cuánto gano?',
+         'created_at': '2026-08-03T10:00:00-06:00'},
+        {'role': 'assistant', 'content': 'Ganas 30%.',
+         'created_at': '2026-08-03T10:00:05-06:00'},
+    ]
+    md = chat_negocio.chat_a_markdown('Mi cotización', msgs)
+    assert md.startswith('# Mi cotización')
+    assert '**Usuario** (2026-08-03):' in md
+    assert '**Asesor**:' in md
+    assert '¿cuánto gano?' in md and 'Ganas 30%.' in md
+
+
+def test_limpiar_titulo_recorta_y_asea():
+    assert chat_negocio.limpiar_titulo('  Cotización   de   García  ') == 'Cotización de García'
+    assert len(chat_negocio.limpiar_titulo('z' * 200)) == chat_negocio.TITULO_MAX
+    assert chat_negocio.limpiar_titulo('   ') == ''
+
+
+def test_renombrar_y_la_lista_lo_pisa(como):
+    cliente = como(DIST)
+    _preguntar(cliente, texto='pregunta original del chat', sesion='s-nom')
+    r = cliente.put('/api/business/chats/s-nom/nombre',
+                    json={'titulo': '   Cotización   de   García   '})
+    assert r.status_code == 200
+    assert r.json()['titulo'] == 'Cotización de García'
+    chats = {c['session_id']: c
+             for c in cliente.get('/api/business/chats').json()['chats']}
+    assert chats['s-nom']['titulo'] == 'Cotización de García'
+    # Título vacío = borrar el custom y volver al derivado.
+    assert cliente.put('/api/business/chats/s-nom/nombre',
+                       json={'titulo': '   '}).status_code == 200
+    chats = {c['session_id']: c
+             for c in cliente.get('/api/business/chats').json()['chats']}
+    assert chats['s-nom']['titulo'].startswith('pregunta original')
+
+
+def test_renombrar_chat_ajeno_o_inexistente_404(como):
+    cliente = como(DIST)
+    _preguntar(cliente, sesion='s-mio')
+    # Uno que no existe: 404 aunque sea el suyo quien pregunta.
+    assert cliente.put('/api/business/chats/s-fantasma/nombre',
+                       json={'titulo': 'Nada'}).status_code == 404
+    # El de otro: mismo 404 — no se le confirma que el session_id existe.
+    server.app.dependency_overrides[auth.get_current_user] = lambda: dict(OTRO_DIST)
+    ajeno = TestClient(server.app)
+    assert ajeno.put('/api/business/chats/s-mio/nombre',
+                     json={'titulo': 'Robado'}).status_code == 404
+
+
+def test_renombrar_en_ver_como_no_escribe(como):
+    assert como(ESPIANDO).put('/api/business/chats/s-1/nombre',
+                              json={'titulo': 'X'}).status_code == 403
+
+
+def test_buscar_ignora_acentos_y_mayusculas(como):
+    """Buscar «GUTIERREZ» sin tilde encuentra el chat que dice «Gutiérrez»."""
+    cliente = como(DIST)
+    _preguntar(cliente, texto='cotización para el cliente Gutiérrez', sesion='s-b1')
+    _preguntar(cliente, texto='otra cosa sin relación', sesion='s-b2')
+    r = cliente.get('/api/business/chats/buscar?q=GUTIERREZ')
+    assert r.status_code == 200
+    chats = r.json()['chats']
+    assert [c['session_id'] for c in chats] == ['s-b1']
+    assert 'gutiérrez' in chats[0]['snippet'].lower()   # el snippet trae la palabra
+    assert chats[0]['coincidencias'] >= 1
+
+
+def test_buscar_multipalabra_exige_todas(como):
+    cliente = como(DIST)
+    _preguntar(cliente, texto='cotización urgente para Gutiérrez', sesion='s-a')
+    _preguntar(cliente, texto='cotización tranquila para Ramírez', sesion='s-b')
+    chats = cliente.get('/api/business/chats/buscar?q=cotizacion gutierrez').json()['chats']
+    assert [c['session_id'] for c in chats] == ['s-a']
+
+
+def test_buscar_por_anio_y_mes(como):
+    cliente = como(DIST)
+    _preguntar(cliente, texto='chat de este mes', sesion='s-mes')
+    ts = cliente.db.business_chat_messages.docs[0]['created_at']
+    anio, mes = int(ts[:4]), int(ts[5:7])
+    con = cliente.get(f'/api/business/chats/buscar?anio={anio}&mes={mes}').json()['chats']
+    assert any(c['session_id'] == 's-mes' for c in con)
+    sin = cliente.get(f'/api/business/chats/buscar?anio={anio - 1}&mes={mes}').json()['chats']
+    assert sin == []
+
+
+def test_buscar_sin_criterio_es_400(como):
+    assert como(DIST).get('/api/business/chats/buscar').status_code == 400
+
+
+def test_buscar_tambien_encuentra_el_titulo_custom(como):
+    cliente = como(DIST)
+    _preguntar(cliente, texto='una pregunta cualquiera', sesion='s-tc')
+    cliente.put('/api/business/chats/s-tc/nombre', json={'titulo': 'Negociación Zúñiga'})
+    chats = cliente.get('/api/business/chats/buscar?q=zuniga').json()['chats']
+    assert [c['session_id'] for c in chats] == ['s-tc']
+    assert chats[0]['titulo'] == 'Negociación Zúñiga'
+
+
+def test_archivar_consolida_los_mensajes_en_uno(como):
+    cliente = como(DIST)
+    _preguntar(cliente, texto='primera pregunta sobre Gutiérrez', sesion='s-arc')
+    _preguntar(cliente, texto='segunda pregunta del mismo chat', sesion='s-arc')
+    r = cliente.post('/api/business/chats/s-arc/archivar')
+    assert r.status_code == 200
+    assert r.json()['mensajes'] == 4          # 2 preguntas + 2 respuestas
+    # Los mensajes sueltos desaparecen…
+    assert not [m for m in cliente.db.business_chat_messages.docs
+                if m['session_id'] == 's-arc']
+    # …y el documento único trae TODO el chat.
+    arc = next(d for d in cliente.db.business_chat_archive.docs
+               if d['session_id'] == 's-arc')
+    assert arc['md'].startswith('# ')
+    assert 'primera pregunta sobre Gutiérrez' in arc['md']
+    assert 'segunda pregunta del mismo chat' in arc['md']
+    assert arc['mensajes'] == 4 and arc['user_id'] == DIST['id']
+    assert arc['first_at'] and arc['last_at'] and arc['archived_at']
+    # La lista lo sigue enseñando, marcado y con su conteo.
+    chats = {c['session_id']: c
+             for c in cliente.get('/api/business/chats').json()['chats']}
+    assert chats['s-arc']['archivado'] is True
+    assert chats['s-arc']['mensajes'] == 4
+    assert chats['s-arc']['contexto_pct'] == 0
+
+
+def test_el_archivado_rechaza_mensajes_nuevos_con_409(como):
+    cliente = como(DIST)
+    _preguntar(cliente, sesion='s-cerrado')
+    assert cliente.post('/api/business/chats/s-cerrado/archivar').status_code == 200
+    r = _preguntar(cliente, sesion='s-cerrado')
+    assert r.status_code == 409
+    assert 'archivado' in r.json()['detail'].lower()
+
+
+def test_archivar_chat_ajeno_o_inexistente_404(como):
+    cliente = como(DIST)
+    assert cliente.post('/api/business/chats/s-nada/archivar').status_code == 404
+    _preguntar(cliente, sesion='s-suyo')
+    server.app.dependency_overrides[auth.get_current_user] = lambda: dict(OTRO_DIST)
+    ajeno = TestClient(server.app)
+    assert ajeno.post('/api/business/chats/s-suyo/archivar').status_code == 404
+
+
+def test_archivar_en_ver_como_no_escribe(como):
+    assert como(ESPIANDO).post('/api/business/chats/s-1/archivar').status_code == 403
+
+
+def test_el_archivo_lleva_el_titulo_custom(como):
+    cliente = como(DIST)
+    _preguntar(cliente, sesion='s-tit')
+    cliente.put('/api/business/chats/s-tit/nombre', json={'titulo': 'Negociación X'})
+    cliente.post('/api/business/chats/s-tit/archivar')
+    arc = next(d for d in cliente.db.business_chat_archive.docs
+               if d['session_id'] == 's-tit')
+    assert arc['titulo'] == 'Negociación X'
+
+
+def test_el_md_se_exporta_vivo_o_archivado_y_solo_al_dueno(como):
+    cliente = como(DIST)
+    _preguntar(cliente, texto='exportame esto por favor', sesion='s-md')
+    vivo = cliente.get('/api/business/chats/s-md/md')
+    assert vivo.status_code == 200
+    assert vivo.json()['archivado'] is False
+    assert 'exportame esto por favor' in vivo.json()['md']
+    cliente.post('/api/business/chats/s-md/archivar')
+    arch = cliente.get('/api/business/chats/s-md/md').json()
+    assert arch['archivado'] is True
+    assert 'exportame esto por favor' in arch['md']
+    # El de otro no existe: 404, ni vivo ni archivado.
+    server.app.dependency_overrides[auth.get_current_user] = lambda: dict(OTRO_DIST)
+    ajeno = TestClient(server.app)
+    assert ajeno.get('/api/business/chats/s-md/md').status_code == 404
+
+
+def test_buscar_tambien_en_los_archivados(como):
+    cliente = como(DIST)
+    _preguntar(cliente, texto='dato guardado sobre Gutiérrez', sesion='s-viejo')
+    cliente.post('/api/business/chats/s-viejo/archivar')
+    chats = cliente.get('/api/business/chats/buscar?q=gutierrez').json()['chats']
+    mio = next(c for c in chats if c['session_id'] == 's-viejo')
+    assert mio['archivado'] is True
+    assert 'gutiérrez' in mio['snippet'].lower()

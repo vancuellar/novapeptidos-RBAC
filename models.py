@@ -831,6 +831,15 @@ class ChatInput(BaseModel):
     language: Optional[str] = None
 
 
+class ChatRenameInput(BaseModel):
+    """Nombre puesto a mano a un chat del Asesor de Negocio.
+
+    Vacío = borrar el nombre custom y volver al título derivado (el primer
+    mensaje). El servidor lo asea con `chat_negocio.limpiar_titulo` (espacios
+    colapsados, tope de 80): se recorta, no se rechaza."""
+    titulo: str = ''
+
+
 class GoogleAuthInput(BaseModel):
     """Credencial de Google Identity Services (el ID token del boton).
 
