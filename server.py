@@ -70,6 +70,8 @@ import pyramid
 # LA REGLA DE 5 (consumo propio de distribuidores) y el cierre de la puerta
 # anónima. Módulo puro para poder probarlo de verdad; ver descuentos.py.
 import descuentos
+# El 5% por pagar en cripto. Lo financia la comisión de pasarela que NO se paga.
+import descuento_cripto
 import comisiones
 # ⛔ OBSEQUIOS DEL DISTRIBUIDOR Y CARRITO COMPARTIBLE (Christián, 2026-08-01). El
 # regalo se APILA con el código de descuento, su código interno NUNCA se le enseña
@@ -3982,6 +3984,13 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
             shipping = 0
         elif paid_merchandise < FREE_SHIPPING_FROM:
             shipping = round(envios.EXTRA_EXPRESS_MXN)
+    # EL 5% POR PAGAR EN CRIPTO (Christián, 2026-08-03). Sobre la mercancía YA
+    # descontada y NUNCA sobre el envío: la guía se le paga completa a la paquetería.
+    # No cuenta contra el techo del 40% porque no sale del margen del producto, sino
+    # de la comisión de Mercado Pago que este pedido no va a pagar. Ver
+    # descuento_cripto.py.
+    crypto_discount = descuento_cripto.descuento(paid_merchandise, payload.payment_method)
+    paid_merchandise = max(0, paid_merchandise - crypto_discount)
     total = paid_merchandise + shipping
     # Lo que la guia cuesta DE VERDAD. Sin cotizacion de Skydropx no es cero: es la
     # tarifa plana, que es lo que la paqueteria cobra igual. Se calculaba con
@@ -4070,6 +4079,10 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         payment_method=payload.payment_method,
         subtotal=subtotal,
         discount=discount,
+        # Se guarda APARTE del descuento comercial a propósito: son dos dineros con
+        # origen distinto (aquél sale del margen, éste del ahorro de pasarela) y
+        # mezclarlos haría imposible saber cuánto costó de verdad la promoción.
+        crypto_discount=crypto_discount,
         discount_rate=discount_rate,
         discount_capped=discount_capped,
         discount_lines=discount_lines,

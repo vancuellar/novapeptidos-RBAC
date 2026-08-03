@@ -300,6 +300,12 @@ class Order(BaseModel):
     payment_method: str
     subtotal: float
     discount: float = 0         # descuento automatico por volumen (10/15/20%)
+    # El 5% por pagar en cripto, APARTE del descuento comercial (Christián,
+    # 2026-08-03). Son dos dineros con origen distinto: aquél sale del margen del
+    # producto y por eso está topado al 40%; éste sale de la comisión de Mercado Pago
+    # que el pedido no paga. Juntarlos en un solo campo haría imposible saber cuánto
+    # costó de verdad la promoción. Ver descuento_cripto.py.
+    crypto_discount: float = 0
     # La MAYOR tasa concedida a algún renglón de este pedido. Con un carrito parejo
     # —todo lo que existía antes de la REGLA DE 5— es la tasa de siempre. Lo leen los
     # puntos (el 40% no genera), las comisiones viejas y los reportes.
