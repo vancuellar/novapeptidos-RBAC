@@ -81,6 +81,8 @@ import avisos_de_venta
 # ACUERDO_DISTRIBUIDOR_ACTIVO no valga 'true', ninguna de estas llamadas cambia
 # nada para nadie. Ver acuerdo.py.
 import acuerdo
+# La constancia del aviso de entrada (RUO): quién aceptó, cuándo y desde dónde.
+import ruo_constancia
 # ⛔ QUÉ CUENTA COMO INGRESO. Una sola regla para todo el backend: ver cobrado.py.
 # Los nombres se re-exportan aquí porque medio server.py (y los tests) ya los usaban
 # cuando la regla vivía dentro de este archivo.
@@ -6638,6 +6640,45 @@ async def admin_rotate_distributor_codes(dist_id: str, admin=Depends(get_current
 # hoy— estas rutas siguen existiendo pero contestan `requiere_aceptacion: false`
 # y el panel del distribuidor no enseña ni una pantalla nueva. Ver acuerdo.py
 # para el porqué legal (Código de Comercio arts. 93, 93 Bis y 1298-A).
+
+
+# ---------------------------------------------------------------------------
+# LA CONSTANCIA DEL AVISO DE ENTRADA (RUO). Ver ruo_constancia.py para el porqué:
+# hasta hoy el "acepto" vivía SÓLO en el navegador del cliente, o sea que la casa
+# no tenía con qué sostener que alguien lo aceptó.
+class RuoAceptarInput(BaseModel):
+    edad: bool = False
+    investigacion: bool = False
+    recordar: bool = True
+    idioma: str = ''
+
+
+@api_router.post('/ruo/aceptar')
+async def ruo_aceptar(payload: RuoAceptarInput, request: Request,
+                      user=Depends(get_optional_user)):
+    """Deja constancia en el SERVIDOR de que alguien aceptó el aviso de entrada.
+
+    `get_optional_user` a propósito, y es el punto entero: casi todo el mundo
+    acepta ANTES de tener cuenta, y ése es justo el caso que hay que poder probar.
+
+    ⛔ NUNCA DEVUELVE ERROR NI BLOQUEA. Si la base falla, contesta 200 con
+    `guardada: false` y el visitante entra igual. Un aviso legal que deja a la
+    gente afuera cuando se cae Mongo es peor que no tener constancia — y el
+    navegador ya guarda su propio rastro, que es lo que le abre la puerta.
+
+    Las dos casillas se exigen aquí también, no sólo en el botón del navegador:
+    quien llame a mano puede mandar lo que quiera, y una constancia a medias dice
+    que aceptó cuando no aceptó."""
+    quien = (user or {}).get('id') if isinstance(user, dict) else getattr(user, 'id', None)
+    res = await ruo_constancia.registrar(
+        db, request, payload.edad, payload.investigacion, payload.recordar,
+        user_id=quien, idioma=payload.idioma)
+    # Sólo se le devuelve lo que le importa: cuándo y qué versión. La IP y el
+    # user-agent son la prueba de la CASA, no información que el visitante pidió.
+    return {'guardada': bool(res.get('guardada')),
+            'accepted_at': res.get('accepted_at'),
+            'version': ruo_constancia.VERSION,
+            'edad_minima': ruo_constancia.EDAD_MINIMA}
 
 
 @api_router.get('/acuerdo/distribuidor')
