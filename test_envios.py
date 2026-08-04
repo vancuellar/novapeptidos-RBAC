@@ -1383,12 +1383,22 @@ def test_el_admin_ve_TODAS_las_paqueterias_no_solo_las_tres_del_cliente(
 
 
 def test_la_cotizacion_del_admin_usa_el_peso_y_la_caja_REALES(db, con_llave, monkeypatch):
+    """⚠️ ESTA PRUEBA CAMBIÓ EL 2026-08-04 y el cambio ES el arreglo.
+
+    Antes exigía la caja 'chica' de 20×15×10 de la tabla `CAJAS`. Christián:
+    «no es una caja, es un sobre de 12×15×1 cm de espesor». Esa caja nunca
+    existió en la bodega: la compra automática siempre usó el empaque real y
+    sólo la cotización del panel inventaba una caja, así que el admin decidía
+    con el precio de un bulto que nadie iba a mandar. Los dos caminos ya
+    preguntan lo mismo."""
     api = _falsear_skydropx(monkeypatch)
     asyncio.run(db.orders.insert_one(_orden('spei')))
     r = _cotizar_pedido(db)
-    assert r['paquete']['caja'] == 'chica'          # un vial
+    sobre = envios.empaques()[0]
+    assert r['paquete']['caja'] == sobre['nombre']          # la bolsa de verdad
     cuerpo = _peticiones(api, '/quotations')[0]['cuerpo']['quotation']
-    assert cuerpo['parcel'] == {'length': 20, 'width': 15, 'height': 10, 'weight': 1.0}
+    assert cuerpo['parcel'] == {'length': sobre['largo_cm'], 'width': sobre['ancho_cm'],
+                                'height': sobre['alto_cm'], 'weight': 1.0}
     assert cuerpo['address_to']['postal_code'] == '64000'
 
 
@@ -1913,3 +1923,22 @@ def test_con_guia_comprada_el_domicilio_YA_NO_se_cambia(db, monkeypatch):
         asyncio.run(server.admin_cambiar_direccion(
             pedido["id"], DireccionDePedido(postal_code="55718"), admin=_admin()))
     assert e.value.status_code == 409
+
+
+def test_la_cotizacion_del_admin_usa_el_SOBRE_no_una_caja_inventada(db):
+    """⛔ REGRESIÓN (Christián, 2026-08-04: «no es una caja, es un sobre de
+    12×15×1»). La cotización del panel salía con una caja de 20×15×10 de la tabla
+    `CAJAS` —que no existe en la bodega— mientras la compra automática usaba el
+    empaque real. El admin decidía con el precio de un bulto imaginario."""
+    asyncio.run(db.orders.insert_one(_pedido_de('maria')))
+    pedido = asyncio.run(db.orders.find_one({'order_number': 'EX-20260728-0001'}, {'_id': 0}))
+    paquete = asyncio.run(server._paquete_real_del_pedido(pedido))
+    sobre = envios.empaques()[0]
+    assert paquete['largo_cm'] == sobre['largo_cm']
+    assert paquete['ancho_cm'] == sobre['ancho_cm']
+    assert paquete['alto_cm'] == sobre['alto_cm']
+    # Y es EL MISMO bulto que compraría el camino automático.
+    auto = envios.paquete_de_empaque(envios.empaque_para(
+        envios.piezas_del_pedido(pedido.get('items') or [])))
+    for k in ('largo_cm', 'ancho_cm', 'alto_cm', 'peso_kg'):
+        assert paquete[k] == auto[k], k

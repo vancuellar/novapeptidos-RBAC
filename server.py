@@ -2208,9 +2208,29 @@ async def _paquete_real_del_pedido(order: dict) -> dict:
     Se resuelve el catálogo en vez de confiar en lo que quedó guardado: un pedido
     creado antes de que existieran los pesos traería medidas viejas, y despachar con
     medidas viejas es cotizar barato y pagar caro en el mostrador.
+
+    ⛔ EL BULTO SALE DEL EMPAQUE DE VERDAD (Christián, 2026-08-04: «no es una caja,
+    es un sobre de 12×15×1»). Esta función cotizaba con la tabla `CAJAS` —una caja
+    genérica de 20×15×10 que NO existe en la bodega— mientras la compra automática
+    usaba el empaque real (`empaque_para` + `paquete_de_empaque`). Dos caminos y dos
+    bultos distintos para el mismo pedido: el admin veía en pantalla el precio de
+    una caja imaginaria y la paquetería recibía otra cosa. Ahora los dos caminos
+    preguntan lo mismo.
+
+    Si el pedido NO cabe en ningún empaque registrado se cae a la tabla de cajas,
+    que es el comportamiento viejo: ahí la compra automática se frena y le pregunta
+    a Christián, pero la cotización tiene que poder enseñarle un precio con qué
+    decidir.
     """
     items = order.get('items') or []
     pflags = await _catalogo_de(items)
+    empaque = envios.empaque_para(envios.piezas_del_pedido(items))
+    if empaque:
+        paquete = envios.paquete_de_empaque(empaque)
+        # El peso del contenido viaja para que el panel enseñe por qué costó lo
+        # que costó, igual que en el camino de las cajas.
+        paquete['peso_contenido_kg'] = envios.peso_del_contenido(items, pflags)
+        return paquete
     return envios.paquete_del_pedido(items, pflags)
 
 
