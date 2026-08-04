@@ -565,6 +565,23 @@ class ComprarGuiaRequest(BaseModel):
     option_id: str
 
 
+class DireccionDePedido(BaseModel):
+    """El domicilio de ENTREGA de un pedido, para corregirlo antes de que salga.
+
+    Todos opcionales: se manda sólo lo que cambia. `full_name` viaja porque a
+    veces quien recibe no es quien compró (el pedido de Fabiola se mandó a casa
+    de una vecina) y la etiqueta tiene que decir el nombre correcto de la puerta.
+    El correo y el teléfono NO están aquí: identifican al cliente, no al destino.
+    """
+    full_name: Optional[str] = Field(None, max_length=120)
+    address: Optional[str] = Field(None, max_length=200)
+    address_2: Optional[str] = Field(None, max_length=200)
+    city: Optional[str] = Field(None, max_length=80)
+    state: Optional[str] = Field(None, max_length=80)
+    postal_code: Optional[str] = Field(None, max_length=10)
+    country: Optional[str] = Field(None, max_length=2)
+
+
 class OrderShippingUpdate(BaseModel):
     """Datos de envío que captura el admin cuando despacha un pedido."""
     carrier: Optional[str] = None

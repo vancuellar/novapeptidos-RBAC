@@ -1870,3 +1870,46 @@ def test_el_panel_separa_los_pesados_de_los_calculados(db):
     assert r['productos'][0]['formato_vial'] == '20R'
     # Y se dice de dónde sale el estimado, para poder defenderlo sin buscar la cita.
     assert 'ISO 8362-1' in r['fuente_del_estimado']
+
+
+# ==========================================================================
+#  Cambiar el domicilio de un pedido (Christián, 2026-08-04)
+# ==========================================================================
+# Fabiola pidió que su pedido fuera a casa de una vecina porque ella no recibe
+# entre semana. No había NINGUNA forma de hacerlo: ni por API ni en el Panel.
+
+def test_se_puede_corregir_el_domicilio_antes_de_que_salga(db, monkeypatch):
+    asyncio.run(db.orders.insert_one(_pedido_de('maria')))
+    pedido = asyncio.run(db.orders.find_one({'order_number': 'EX-20260728-0001'}, {'_id': 0}))
+    from models import DireccionDePedido
+    r = asyncio.run(server.admin_cambiar_direccion(
+        pedido['id'],
+        DireccionDePedido(full_name='La vecina de Fabiola', address='Acapulco s/n',
+                          address_2='Manzana 1, Morelos 1ra Secc.',
+                          city='Ecatepec de Morelos', state='Estado de México',
+                          postal_code='55718'),
+        admin=_admin()))
+    assert r['ok'] is True
+    fresco = asyncio.run(db.orders.find_one({'id': pedido['id']}, {'_id': 0}))
+    assert fresco['customer']['postal_code'] == '55718'
+    assert fresco['customer']['full_name'] == 'La vecina de Fabiola'
+    # ⛔ Queda rastro de a dónde iba antes: cambiarle el destino a un pedido
+    # pagado es de las cosas que después alguien pregunta por qué se hicieron.
+    assert fresco['direccion_anterior']['postal_code'] == pedido['customer']['postal_code']
+    assert fresco['direccion_cambiada_por']
+    # Y la cotización vieja se invalida: era contra el domicilio anterior.
+    assert not fresco.get('shipping_quote')
+
+
+def test_con_guia_comprada_el_domicilio_YA_NO_se_cambia(db, monkeypatch):
+    """La etiqueta ya está impresa con el domicilio viejo: cambiar el pedido
+    dejaría al sistema diciendo una cosa y al paquete viajando a otra."""
+    monkeypatch.setattr(server, 'avisar_del_envio', _async_nada)
+    asyncio.run(db.orders.insert_one(_pedido_de('maria')))
+    _capturar('EX-20260728-0001', MARIA, carrier='DHL', tracking_number='ABC999')
+    pedido = asyncio.run(db.orders.find_one({'order_number': 'EX-20260728-0001'}, {'_id': 0}))
+    from models import DireccionDePedido
+    with pytest.raises(server.HTTPException) as e:
+        asyncio.run(server.admin_cambiar_direccion(
+            pedido["id"], DireccionDePedido(postal_code="55718"), admin=_admin()))
+    assert e.value.status_code == 409

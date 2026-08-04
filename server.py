@@ -33,7 +33,7 @@ from models import (
     TokenInput, ActivateInput, ResendVerificationInput, AceptarAcuerdoInput,
     ChatInput, ChatRenameInput, DistributorCreate, DiscountCodeCreate, AnnouncementCreate, GoogleAuthInput, now_iso,
     QuoteEmailRequest, ShareCartRequest, PrellenadoRequest,
-    SolicitudPagoComision, RegistroPagoComision, RechazoPagoComision,
+    SolicitudPagoComision, RegistroPagoComision, RechazoPagoComision, DireccionDePedido,
     AprobarSolicitudGuia, RechazoSolicitudGuia,
 )
 from auth import (
@@ -5077,6 +5077,57 @@ async def _guardar_envio(order: dict, payload: OrderShippingUpdate, *,
         await award_order_points(result)
         result = await db.orders.find_one({'id': order_id}, {'_id': 0})
     return result
+
+
+@api_router.put('/admin/orders/{order_id}/direccion')
+async def admin_cambiar_direccion(order_id: str, payload: DireccionDePedido,
+                                  admin=Depends(get_current_admin)):
+    """Corrige el domicilio de entrega de un pedido.
+
+    ⛔ POR QUÉ EXISTE (Christián, 2026-08-04). No había NINGUNA forma de cambiar
+    una dirección: ni por API ni en el Panel. Y pasa de verdad — Fabiola pidió
+    que su pedido fuera a casa de una vecina porque ella no recibe entre semana.
+    Sin esto, la única salida era comprar la guía a un domicilio equivocado.
+
+    ⚠️ SÓLO ANTES DE QUE SALGA. Con guía ya comprada se niega: la etiqueta está
+    impresa con el domicilio viejo y cambiar el pedido dejaría al sistema
+    diciendo una cosa y al paquete viajando a otra. Para eso se cancela la guía
+    y se compra otra.
+
+    Queda RASTRO del domicilio anterior (`direccion_anterior`) y en la bitácora:
+    cambiarle el destino a un pedido pagado es de las cosas que después alguien
+    pregunta por qué se hicieron.
+    """
+    deny_view_as(admin)
+    order = await db.orders.find_one({'id': order_id}, {'_id': 0})
+    if not order:
+        raise HTTPException(status_code=404, detail='Pedido no encontrado')
+    if (order.get('tracking_number') or '').strip():
+        raise HTTPException(status_code=409,
+                            detail='Este pedido ya tiene guía comprada. Cancela esa '
+                                   'guía antes de cambiarle el domicilio.')
+    c = dict(order.get('customer') or {})
+    antes = {k: c.get(k, '') for k in
+             ('full_name', 'address', 'address_2', 'city', 'state', 'postal_code', 'country')}
+    nuevos = payload.model_dump(exclude_none=True)
+    # El nombre de quien RECIBE puede cambiar (el caso de la vecina) pero el
+    # correo y el teléfono del pedido no se tocan aquí: ésos identifican al
+    # cliente y su historial, no al destino del paquete.
+    c.update({k: v for k, v in nuevos.items() if k in antes})
+    await db.orders.update_one(
+        {'id': order_id},
+        {'$set': {'customer': c, 'direccion_anterior': antes,
+                  'direccion_cambiada_at': now_iso(),
+                  'direccion_cambiada_por': admin.get('email') or admin['id'],
+                  # La cotización guardada quedó contra el domicilio viejo: se
+                  # invalida a propósito para que nadie compre con ella.
+                  'shipping_quote': {}}})
+    logger.warning('Admin %s CAMBIÓ EL DOMICILIO del pedido %s: %s %s -> %s %s',
+                   admin.get('email'), order.get('order_number'),
+                   antes.get('city'), antes.get('postal_code'),
+                   c.get('city'), c.get('postal_code'))
+    return {'ok': True, 'order_number': order.get('order_number'),
+            'antes': antes, 'ahora': {k: c.get(k, '') for k in antes}}
 
 
 @api_router.put('/admin/orders/{order_id}/shipping')
