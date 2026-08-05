@@ -181,3 +181,16 @@ def test_sigue_cazando_el_correo_machacado_de_verdad():
     assert basura._correo_de_juego('fjwoijewijfeow@gmail.com')
     assert basura._machacado('asdkjhgqwlkjh')
     assert basura._machacado('zxcvbnmasd')
+
+
+def test_un_telefono_VACIO_no_es_una_senal():
+    """⛔ Las VENTAS DIRECTAS de la casa entran sin telefono ni ciudad (Alanis, Paz).
+    Contar el vacio como burla las dejaba a UNA señal de cancelarse solas."""
+    assert not basura._telefono_de_juguete('')
+    assert not basura._telefono_de_juguete(None)
+    venta_directa = {'full_name': 'Alanis Fernanda Mendoza',
+                     'email': 'alexfermc@hotmail.com', 'phone': '',
+                     'address': 'Venta directa', 'city': '', 'state': '',
+                     'postal_code': ''}
+    assert basura.senales(venta_directa) == []
+    assert not basura.es_basura(venta_directa)

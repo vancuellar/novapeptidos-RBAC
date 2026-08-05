@@ -120,8 +120,16 @@ def cp_cuadra_con_estado(cp, estado) -> bool:
 
 
 def _telefono_de_juguete(tel) -> bool:
-    """`1234567890`, `0000000000`, `1111111111`: nadie los teclea en serio."""
+    """`1234567890`, `0000000000`, `1111111111`: nadie los teclea en serio.
+
+    ⛔ VACÍO NO ES FALSO. Un teléfono en blanco es un campo que no se llenó, no una
+    burla — y las VENTAS DIRECTAS de la casa entran así, sin teléfono ni ciudad
+    (Alanis y Paz, en la base). Contarlo como señal las dejaba a una sola de
+    caducarse solas. Se juzga lo que SÍ escribió, no lo que faltó.
+    """
     d = re.sub(r'\D', '', str(tel or ''))
+    if not d:
+        return False
     if len(d) < 10:
         return True
     d = d[-10:]                              # sin lada de país
