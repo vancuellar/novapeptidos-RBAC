@@ -416,3 +416,51 @@ def _meta_falso(conversaciones, gasto):
         return ([{'conversaciones': conversaciones, 'spend': gasto}],
                 {'fuente': 'meta_en_vivo', 'actualizado': '', 'edad_segundos': 0, 'aviso': ''})
     return _fake
+
+
+# ==========================================================================
+#  El embudo cuenta PERSONAS, no sesiones (Christián, 2026-08-04)
+# ==========================================================================
+# «El embudo está contando doble, triple, visitas desde el mismo ordenador.»
+# Tenía razón: se contaba por sesión y una sesión caduca a los 30 minutos, así
+# que quien entraba tres veces en un día eran tres visitas.
+
+def test_quien_prefiere_el_dispositivo_y_cae_a_la_sesion():
+    assert server.quien({'visitor_id': 'v-1', 'session_id': 's-9'}) == 'v-1'
+    # Evento viejo, de antes de que el visitante viajara: su sesión es lo único
+    # que hay. Sin este respaldo toda la historia anterior sería un solo fantasma.
+    assert server.quien({'session_id': 's-9'}) == 's-9'
+    assert server.quien({'visitor_id': '  ', 'session_id': 's-9'}) == 's-9'
+    assert server.quien({}) == ''
+
+
+def test_el_mismo_dispositivo_en_tres_sesiones_es_UNA_persona():
+    """El caso exacto que reportó Christián: una computadora que entra tres
+    veces (mañana, tarde y noche) contaba tres visitas."""
+    evs = [
+        {'type': 'visit', 'visitor_id': 'v-ana', 'session_id': 's-1'},
+        {'type': 'visit', 'visitor_id': 'v-ana', 'session_id': 's-2'},
+        {'type': 'visit', 'visitor_id': 'v-ana', 'session_id': 's-3'},
+        {'type': 'visit', 'visitor_id': 'v-beto', 'session_id': 's-4'},
+    ]
+    pasos = server.personas_por_paso(evs)
+    assert len(pasos['visit']) == 2          # Ana y Beto, no cuatro visitas
+    # Y la conversión ya no se hunde con un denominador inflado: si Ana compra,
+    # es 1 de 2 (50%), no 1 de 4 (25%).
+    evs.append({'type': 'purchase', 'visitor_id': 'v-ana', 'session_id': 's-3'})
+    pasos = server.personas_por_paso(evs)
+    assert len(pasos['purchase']) == 1 and len(pasos['visit']) == 2
+
+
+def test_los_eventos_viejos_no_se_colapsan_en_uno_solo():
+    """Sin `visitor_id`, cada sesión sigue siendo una persona distinta: es lo
+    único que se sabe de esa época. Colapsarlas diría que el mes pasado hubo una
+    sola visita."""
+    evs = [{'type': 'visit', 'session_id': f's-{i}'} for i in range(5)]
+    assert len(server.personas_por_paso(evs)['visit']) == 5
+
+
+def test_un_paso_sin_nadie_no_inventa_gente():
+    evs = [{'type': 'visit', 'visitor_id': 'v-1', 'session_id': 's-1'}]
+    pasos = server.personas_por_paso(evs)
+    assert len(pasos['purchase']) == 0

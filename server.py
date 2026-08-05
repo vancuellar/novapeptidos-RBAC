@@ -10132,9 +10132,11 @@ async def admin_meta_dashboard(days: int = 30, admin=Depends(get_current_marketi
     # se calculaba con dinero que todavía no había entrado. Ahora los pedidos vivos y
     # los cobrados son dos cosas distintas, y el ingreso sale sólo de los segundos.
     vivas = [o for o in orders if esta_vivo(o)]
+    # Personas, no sesiones: el ROAS y el «costo por visita» se comparan contra
+    # gente distinta, no contra cuántas veces volvió la misma (2026-08-04).
     evs = await db.events.find({'created_at': {'$gte': desde}, 'type': 'visit'},
-                               {'_id': 0, 'session_id': 1}).to_list(50000)
-    visitas = len({e.get('session_id') for e in evs if e.get('session_id')})
+                               {'_id': 0, 'session_id': 1, 'visitor_id': 1}).to_list(50000)
+    visitas = len({quien(e) for e in evs if quien(e)})
     ingreso = sum(cobrado_de(o) for o in vivas)
     return {
         **estado,
@@ -10172,14 +10174,17 @@ async def _pedidos_y_sesiones(days: int):
 
     evs = await db.events.find(
         {'created_at': {'$gte': desde}, 'type': 'visit'},
-        {'_id': 0, 'session_id': 1, 'utm_campaign': 1, 'utm_source': 1,
-         'utm_content': 1, 'fbclid': 1, 'referrer': 1}
+        {'_id': 0, 'session_id': 1, 'visitor_id': 1, 'utm_campaign': 1,
+         'utm_source': 1, 'utm_content': 1, 'fbclid': 1, 'referrer': 1}
     ).to_list(100000)
+    # Por PERSONA: un anuncio que trae a alguien tres veces trajo UNA persona
+    # (2026-08-04). Contarlas por sesión hacía ver caro lo que funcionaba.
     sesiones = {}
     for e in evs:
         c = marketing.campana_del_pedido(e)
-        if c:
-            sesiones.setdefault(c, set()).add(e.get('session_id'))
+        q = quien(e)
+        if c and q:
+            sesiones.setdefault(c, set()).add(q)
     return desde, pedidos, {c: len(s) for c, s in sesiones.items()}
 
 
@@ -10778,16 +10783,24 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
     evs = await db.events.find(
         {'created_at': {'$gte': desde}, 'type': 'visit'},
         {'_id': 0, 'created_at': 1, 'session_id': 1, 'visitor_id': 1}).to_list(100000)
+    # Personas por cajón, con la misma regla del embudo (2026-08-04): el mismo
+    # dispositivo cuenta UNA vez, vuelva las veces que vuelva.
+    personas = {p: set() for p in periodos}
     for e in evs:
         p = etiqueta(e.get('created_at'))
+        q = quien(e)
         if p in filas:
             filas[p]['visitas'] += 1
             if e.get('session_id'):
                 sesiones[p].add(e['session_id'])
+            if q:
+                personas[p].add(q)
         if e.get('session_id'):
             sesiones_rango.add(e['session_id'])
-        if e.get('visitor_id'):
-            visitantes_rango.add(e['visitor_id'])
+        # `quien` incluye a los eventos viejos (sin visitor_id) por su sesión: si
+        # se pidiera sólo `visitor_id`, la historia anterior saldría en cero.
+        if q:
+            visitantes_rango.add(q)
 
     # ⛔ `paid` VIAJA EN LA CONSULTA. Sin ese campo la gráfica no puede distinguir lo
     # cobrado de lo fiado y la línea de ingreso pintaba la venta de Alanís como dinero
@@ -10809,6 +10822,7 @@ async def admin_series(bucket: str = 'day', days: int = 30, admin=Depends(get_cu
 
     for p in filas:
         filas[p]['sesiones'] = len(sesiones[p])
+        filas[p]['personas'] = len(personas[p])
         filas[p]['ingreso'] = round(filas[p]['ingreso'], 2)
         filas[p]['por_cobrar'] = round(filas[p]['por_cobrar'], 2)
 
@@ -10855,6 +10869,40 @@ ANCHOS = (
 )
 
 
+# ==========================================================================
+#  QUIÉN es una visita: la PERSONA, no la sesión (Christián, 2026-08-04)
+# ==========================================================================
+# «El embudo está contando doble, triple, visitas desde el mismo ordenador.»
+# Tenía razón, y la causa era la definición: se contaba por SESIÓN, y una sesión
+# caduca a los 30 minutos sin actividad. Quien entra en la mañana, vuelve al rato
+# y otra vez en la noche eran TRES visitas — y en un catálogo que se piensa varios
+# días antes de comprar, eso infla el denominador y hunde la conversión.
+#
+# Ahora se cuenta por VISITANTE (`visitor_id`), que el navegador ya mandaba desde
+# siempre y es permanente por dispositivo: la misma computadora es UNA persona,
+# entre hoy y el mes que viene.
+#
+# ⛔ EL RESPALDO NO SOBRA. Los eventos viejos no traen `visitor_id` (se empezó a
+# mandar después). Para ésos se usa su `session_id`, que es lo único que hay: sin
+# esto, toda la historia anterior se colapsaría en un solo visitante fantasma y el
+# mes pasado parecería tener una visita.
+def quien(e) -> str:
+    """La PERSONA detrás de un evento: su dispositivo, o su sesión si es viejo."""
+    return (e.get('visitor_id') or '').strip() or (e.get('session_id') or '').strip()
+
+
+def personas_por_paso(evs) -> dict:
+    """Cuánta gente DISTINTA llegó a cada paso del embudo."""
+    pasos = {t: set() for t in EVENT_TYPES}
+    for e in evs:
+        t = e.get('type')
+        if t in pasos:
+            q = quien(e)
+            if q:
+                pasos[t].add(q)
+    return pasos
+
+
 def _embudo_por_dispositivo(evs):
     """El embudo partido en teléfono / tableta / computadora, y los anchos.
 
@@ -10869,7 +10917,7 @@ def _embudo_por_dispositivo(evs):
     """
     ses_device, ses_ancho = {}, {}
     for e in sorted(evs, key=lambda x: x.get('created_at', '')):
-        sid = e.get('session_id')
+        sid = quien(e)          # la PERSONA, no la sesión (2026-08-04)
         if not sid:
             continue
         d = e.get('device')
@@ -10883,7 +10931,7 @@ def _embudo_por_dispositivo(evs):
     for d in DEVICES:
         pasos = {t: set() for t in EVENT_TYPES}
         for e in evs:
-            sid = e.get('session_id')
+            sid = quien(e)
             if ses_device.get(sid) != d:
                 continue
             if e.get('type') in pasos:
@@ -10904,8 +10952,8 @@ def _embudo_por_dispositivo(evs):
         n = sum(1 for w in ses_ancho.values() if lo <= w <= hi)
         anchos.append({'rango': etiqueta, 'sesiones': n})
 
-    # Sesiones que existen pero no dicen aparato: las de antes de que esto se midiera.
-    todas = {e.get('session_id') for e in evs if e.get('session_id')}
+    # Personas que existen pero no dicen aparato: las de antes de que esto se midiera.
+    todas = {quien(e) for e in evs if quien(e)}
     return filas, anchos, len(todas - set(ses_device))
 
 
@@ -10915,13 +10963,18 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
     desde = (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat()
     evs = await db.events.find({'created_at': {'$gte': desde}}, {'_id': 0}).to_list(50000)
 
-    # Embudo por SESIONES unicas (no por clics): una persona cuenta una vez por paso.
-    pasos = {t: set() for t in EVENT_TYPES}
+    # Embudo por PERSONAS únicas: el mismo dispositivo cuenta UNA vez por paso,
+    # entre a la hora que entre (Christián, 2026-08-04). Las sesiones se siguen
+    # contando aparte, porque «cuánta gente vino» y «cuántas veces vinieron» son
+    # dos preguntas distintas y las dos sirven.
+    pasos = personas_por_paso(evs)
+    ses = {t: set() for t in EVENT_TYPES}
     for e in evs:
         t = e.get('type')
-        if t in pasos:
-            pasos[t].add(e.get('session_id'))
-    embudo = [{'paso': t, 'sesiones': len(pasos[t])} for t in EVENT_TYPES]
+        if t in ses and e.get('session_id'):
+            ses[t].add(e['session_id'])
+    embudo = [{'paso': t, 'sesiones': len(pasos[t]), 'personas': len(pasos[t]),
+               'visitas_repetidas': len(ses[t])} for t in EVENT_TYPES]
 
     visitas = len(pasos['visit']) or 1
     compras = len(pasos['purchase'])
