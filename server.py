@@ -2764,6 +2764,30 @@ async def avisar_al_cliente(order: dict, evento: str) -> bool:
     return True
 
 
+async def avisar_de_la_guia(order: dict) -> bool:
+    """«Ya tienes guía» — NO «ya salió». Se manda al capturar/comprar el número.
+
+    ⛔ POR QUÉ EXISTEN DOS AVISOS Y NO UNO (Christián, 2026-08-05). Antes, capturar la
+    guía disparaba el de «Tu pedido va en camino». Pero comprar la guía es un trámite
+    de escritorio: el paquete puede pasar días en la mesa —el de Fabiola, sin ir más
+    lejos—. Ese correo le prometía movimiento al cliente y luego el rastreo no se movía,
+    que es la peor forma de estrenar la confianza de alguien que acaba de pagar.
+
+    El cliente SÍ tiene que recibir su número en cuanto existe (el correo de
+    confirmación se lo promete), así que aquí sale la campanita con la guía y sin
+    prometer nada. El correo de «va en camino» lo manda `avisar_del_envio`, cuando el
+    paquete sale de verdad.
+    """
+    if not order or not order.get('tracking_number'):
+        return False
+    num = order.get('order_number')
+    await notify(order.get('user_id'), 'order_label_ready', 'Tu guía ya está lista',
+                 f'El pedido {num} ya tiene guía: {order.get("tracking_number")}. '
+                 'Te avisamos en cuanto salga.',
+                 link=f'/pedido/{num}', dedup=f'label:{num}:{order["tracking_number"]}')
+    return True
+
+
 async def avisar_del_envio(order: dict) -> bool:
     """Le manda al cliente su número de guía. Nunca revienta hacia arriba.
 
@@ -5080,16 +5104,32 @@ async def _guardar_envio(order: dict, payload: OrderShippingUpdate, *,
             update['shipped_at'] = now_iso()
         elif status_pedido == 'entregado' and not order.get('delivered_at'):
             update['delivered_at'] = now_iso()
-    # Capturar una guía implica que ya salió: si seguía pendiente, pasa a enviado.
-    if number and not status_pedido and order.get('status') in ('pendiente', 'confirmado'):
-        update['status'] = 'enviado'
-        update.setdefault('shipped_at', now_iso())
+    # ⛔ TENER GUÍA NO ES HABER ENVIADO (Christián, 2026-08-05): «No puede aparecer un
+    # envío como enviado a menos que en verdad se haya enviado. Puede aparecer como
+    # guía generada, pero por ejemplo el de Fabiola aún no lo envío yo».
+    #
+    # Aquí vivía lo contrario: capturar el número de guía empujaba el pedido a
+    # `enviado` y le estampaba `shipped_at`. O sea que el sistema daba por salido un
+    # paquete que seguía en la mesa, y el tablero, los correos y el cliente repetían esa
+    # mentira. Comprar la guía es un trámite de escritorio; enviar es sacar la caja.
+    #
+    # Ahora el estado NO se mueve solo. «Guía generada» no es un estado nuevo en la
+    # base (meterlo obligaba a tocar `loyalty.PAID_STATUSES`, `cobrado.ESTADOS_PAGADOS`
+    # y media docena de filtros): se DEDUCE de tener número y no estar enviado todavía
+    # —`etapa_de_envio()`—, y quien despacha aprieta «Ya lo envié» cuando de verdad
+    # salió. Sólo entonces se estampa `shipped_at`.
     if update:
         await db.orders.update_one({'id': order_id}, {'$set': update})
     result = await db.orders.find_one({'id': order_id}, {'_id': 0})
-    # Si en esta captura APARECIÓ una guía que antes no existía, el cliente se entera.
-    # `dedup` en la notificación impide que reeditar el número mande dos correos.
+    # DOS AVISOS DISTINTOS, cada uno en su momento:
+    #   · apareció la guía  -> «ya tienes guía» (campanita, sin prometer movimiento);
+    #   · el paquete salió  -> «va en camino» (el de siempre, correo incluido).
+    # Prometerle movimiento a un paquete parado es la misma mentira del tablero, vista
+    # desde la bandeja de entrada del cliente. El `dedup` de cada uno impide que
+    # reeditar el número mande el aviso dos veces.
     if number and not (order.get('tracking_number') or ''):
+        await avisar_de_la_guia(result)
+    if result.get('status') == 'enviado' and order.get('status') != 'enviado':
         await avisar_del_envio(result)
     if result.get('status') in loyalty.PAID_STATUSES:
         # Los puntos tienen su propio candado de cobro dentro (`award_order_points`):
@@ -8195,6 +8235,14 @@ async def distributor_orders(dist=Depends(get_current_distributor)):
             'shipped_at': o.get('shipped_at'),
             'delivered_at': o.get('delivered_at'),
             'eta': o.get('eta', ''),
+            # ⛔ PARA IMPRIMIR LA GUÍA DESDE LA PROPIA LISTA (Christián, 2026-08-05:
+            # «ese botón debe estar bien visible y fácil de encontrar en los paneles de
+            # admin y distribuidor con cada pedido de cada cliente»). Hasta hoy había que
+            # abrir la ficha del pedido para verlo, y ahí dentro además estaba escondido
+            # tras una condición que fallaba. Con estos dos campos el botón se pinta en
+            # el renglón, sin abrir nada.
+            'tiene_etiqueta': bool((o.get('tracking_number') or '').strip()),
+            'etapa_envio': guias.etapa_de_envio(o),
             # Para el botón «Solicitar guía»: sólo pagado y sin guía se puede
             # pedir, y si ya se pidió el botón dice «Solicitada» y se apaga.
             'paid': esta_pagado(o),
@@ -8272,13 +8320,29 @@ def _detalle_de_pedido(o, dist_id=None, dist=None, es_admin=False):
         # proveedor —eso es la cuenta de envíos de la casa—: él pide el PDF por
         # `/distributor/orders/{numero}/etiqueta` y el servidor se lo sirve.
         #
-        # Es un SÍ/NO, no la liga, y dice «hay guía comprada por nosotros», no «hay
-        # PDF»: el papel puede tardar unos segundos en publicarse y aun así el botón
-        # tiene que estar (lo rescata solo). En cambio una guía TECLEADA a mano no
-        # tiene PDF que traer, y por eso el botón no aparece: prometer un papel que
-        # no existe es peor que no ofrecerlo.
-        'tiene_etiqueta': bool(o.get('label_url')
-                               or (o.get('label_provider') and o.get('tracking_number'))),
+        # Es un SÍ/NO, no la liga: el papel puede tardar unos segundos en publicarse y
+        # aun así el botón tiene que estar (lo rescata solo).
+        #
+        # ⛔ ANTES EXIGÍA `label_provider` Y ASÍ SE PERDIÓ EL BOTÓN (Christián,
+        # 2026-08-05: «no puedo imprimir las guías, teníamos un botón específico para
+        # eso y ya no está»). El razonamiento viejo era «una guía tecleada a mano no
+        # tiene PDF que traer», pero es falso: `etiquetas._rescatar()` le pregunta a la
+        # paquetería POR NÚMERO DE RASTREO, así que una guía comprada en la cuenta de
+        # la casa y luego capturada a mano —que es lo que pasa a diario— sí tiene papel.
+        # El botón se escondía justo en los pedidos donde imprimir habría funcionado.
+        #
+        # Ahora basta con que haya número. Si de verdad no hay PDF, el servidor lo dice
+        # con todas sus letras (409 `estado: manual`) y la pantalla lo explica. Un botón
+        # que a veces contesta «esta guía se capturó a mano» es infinitamente mejor que
+        # un botón invisible: lo segundo se ve igual que una app rota.
+        'tiene_etiqueta': bool((o.get('tracking_number') or '').strip()),
+        # El estricto de antes, para cuando la pantalla necesite distinguir entre «la
+        # compramos nosotros» y «alguien la tecleó».
+        'etiqueta_comprada': bool(o.get('label_url')
+                                  or (o.get('label_provider') and o.get('tracking_number'))),
+        # ⛔ LA VERDAD DEL ENVÍO, EN UNA PALABRA: sin_guia | guia_generada | enviado |
+        # entregado. Tener guía NO es haber enviado (ver `guias.etapa_de_envio`).
+        'etapa_envio': guias.etapa_de_envio(o),
         # Los datos de contacto sólo si quien pregunta puede verlos: el admin siempre,
         # el distribuidor sólo con su interruptor encendido (hoy, sólo María).
         **_contacto_del_cliente(o, dist, es_admin),
@@ -10189,6 +10253,57 @@ async def admin_meta_dashboard(days: int = 30, admin=Depends(get_current_marketi
         'recomendaciones': meta_ads.advise(summary, site_visits=visitas,
                                            site_orders=len(vivas), site_revenue=ingreso),
         'apagar': meta_ads.dead_weight(rows),
+    }
+
+
+@api_router.get('/admin/meta/cac')
+async def admin_meta_cac(days: int = 30, admin=Depends(get_current_marketing)):
+    """LO QUE CUESTA LA PUBLICIDAD POR PEDIDO, en pesos y en vivo.
+
+    ⛔ POR QUÉ EXISTE. El motor de precios mide el piso de 5× «con todo adentro», y la
+    publicidad era el único costo que quedaba fuera — no por descuido: `datos/cac.csv`
+    estaba vacío porque no había con qué medirla, y la vara AVISABA en vez de asumir cero
+    (`roi_con_todo.cac_por_pedido_mxn` devuelve `None`, que NO es cero). Hoy sí hay con
+    qué: el token de Meta funciona y la cuenta lleva $404.57 USD gastados. Éste es el
+    puente, y vive aquí porque es el único sitio donde están las DOS mitades: el gasto
+    (Meta) y los pedidos (la base).
+
+    Christián, 2026-08-05: «se debería actualizar en vivo 24/7». Se cumple solo: sale del
+    mismo `_meta_filas` que el panel, con su caché de 60 s, así que cada vez que alguien
+    pregunta, el número es el de ahora. No hay nada que programar ni que subir a mano, y
+    `estado` sigue diciendo de dónde salió el dato y qué tan viejo es.
+
+    ⚠️ EL DENOMINADOR SON LOS PEDIDOS VIVOS, NO LOS COBRADOS. Un pedido que ya se hizo
+    costó su publicidad aunque todavía no se pague; medir contra los cobrados inflaría el
+    CAC mientras haya cuentas por cobrar. Y si NO hay pedidos en la ventana se devuelve
+    `None` con su motivo, en vez de dividir entre cero o entregar un cero: «no sabemos» y
+    «no cuesta nada» son frases distintas, y ésa es la regla de la casa.
+    """
+    rows, estado = await _meta_filas(days)
+    summary = meta_ads.summarize(rows)
+    gasto_usd = float(summary.get('spend') or 0)
+    desde = (summary.get('date_start')
+             or (datetime.now(timezone.utc) - timedelta(days=max(1, days))).isoformat()[:10])
+    pedidos = await db.orders.find({'created_at': {'$gte': desde}}, {'_id': 0}).to_list(20000)
+    # Las pruebas de la casa no son pedidos: no se les hizo publicidad (Christián,
+    # 2026-08-04). Misma regla que el embudo.
+    reales = [o for o in pedidos if not o.get('es_prueba') and esta_vivo(o)]
+    gasto_mxn = round(gasto_usd * _fx(), 2)
+    n = len(reales)
+    return {
+        **estado,
+        'ventana': {'desde': desde, 'hasta': summary.get('date_end'), 'dias': days},
+        'gasto_usd': round(gasto_usd, 2),
+        'gasto_mxn': gasto_mxn,
+        'tipo_de_cambio': _fx(),
+        'pedidos': n,
+        'pedidos_cobrados': len([o for o in reales if esta_pagado(o)]),
+        'cac_por_pedido_mxn': round(gasto_mxn / n, 2) if n else None,
+        'sin_dato': None if n else 'no hubo pedidos en la ventana: el CAC no se puede medir',
+        # Lo que Meta DICE que vendió, para que el hueco se vea: hoy se atribuye 0 compras
+        # con 2,947 clics al enlace, y ése es el dato que decide si el gasto sigue.
+        'compras_que_meta_se_atribuye': summary.get('purchases'),
+        'clics_al_enlace': summary.get('link_clicks'),
     }
 
 
