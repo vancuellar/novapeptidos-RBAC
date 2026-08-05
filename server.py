@@ -107,6 +107,7 @@ import skydropx
 import etiquetas
 # De que paqueteria es un numero de guia. Gemelo de la deteccion de la pantalla
 # (src/lib/paqueteria.js); ver guias.py.
+import basura
 import guias
 # EL RASTREO DENTRO DE NUESTRA PÁGINA. La paquetería no se deja enmarcar
 # (`x-frame-options: SAMEORIGIN`), así que le pedimos los eventos a su API y los
@@ -3791,7 +3792,8 @@ async def _obsequios_del_pedido(payload):
 
 
 @api_router.post('/orders')
-async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
+async def create_order(payload: OrderCreate, request: Request = None,
+                       user=Depends(get_optional_user)):
     deny_view_as(user)          # en modo "ver como" no se compra nada
     if not payload.items:
         raise HTTPException(status_code=400, detail='El carrito esta vacio')
@@ -4295,8 +4297,25 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
         raise HTTPException(
             status_code=409,
             detail='Ese cupón acaba de usarse en otra compra. Vuelve a intentarlo.')
+    # ⛔ ¿ESTE PEDIDO HUELE A BROMA? (Christián, 2026-08-05: «quiero evitar esos
+    # chismosos que nada más le están picando a lo estúpido»). Se CLASIFICA, no se
+    # rechaza: la regla madre es vender siempre, y un filtro que se equivoca cuesta un
+    # cliente de verdad. Lo que cambia es el ruido — ver `basura.py`.
+    doc = order.model_dump()
+    motivos = basura.senales(payload.customer.model_dump()
+                             if hasattr(payload.customer, 'model_dump') else payload.customer)
+    doc['basura'] = len(motivos) >= basura.MINIMO_SENALES
+    doc['basura_motivos'] = motivos
+    # ⛔ DE DÓNDE VINO. No se guardaba NADA: ni IP ni navegador, así que cuando llegaron
+    # los pedidos de broma no había forma de saber si eran una persona picando o la
+    # competencia husmeando. Es dato de operación, no de mercadotecnia.
+    if request is not None:
+        doc['ip'] = (request.headers.get('cf-connecting-ip')
+                     or request.headers.get('x-forwarded-for', '').split(',')[0].strip()
+                     or (request.client.host if request.client else ''))
+        doc['user_agent'] = (request.headers.get('user-agent') or '')[:300]
     try:
-        await db.orders.insert_one(order.model_dump())
+        await db.orders.insert_one(doc)
     except Exception:
         await _devolver_reserva(reservado)      # sin pedido no hay nada que apartar
         await _devolver_reserva_viva(reservado_vivo)
@@ -4312,7 +4331,14 @@ async def create_order(payload: OrderCreate, user=Depends(get_optional_user)):
     # el canje que dos pedidos simultáneos podían hacer dos veces con el mismo cupón.
     # LA CAMPANITA: el admin y quien ganó comisión se enteran DENTRO de la app, no
     # sólo por correo (Christián, 2026-07-30).
-    await avisar_de_la_venta(order.model_dump(), commissions)
+    # ⛔ LA BASURA NO SUENA. «Que un pedido así no me notifique» (Christián, 2026-08-05).
+    # Queda guardado y visible en el panel con sus motivos; lo que no hace es despertar
+    # a nadie ni mandar correo por una venta que nunca fue.
+    if not doc['basura']:
+        await avisar_de_la_venta(doc, commissions)
+    else:
+        logger.info('Pedido %s marcado como basura (%s): no se avisa a nadie.',
+                    order.order_number, '; '.join(motivos))
     if points_used:
         # El saldo YA se restó arriba, apartado en un solo paso condicionado
         # (`_apartar_puntos`). Aquí solo queda el asiento en la bitácora. Se restaba
@@ -9467,6 +9493,10 @@ async def arrancar_recuperacion():
                 await _barrer_intentos()
             except Exception:
                 logger.exception('Fallo el barrido de carritos abandonados')
+            try:
+                await _caducar_basura()
+            except Exception:
+                logger.exception('Fallo el caducado de pedidos de broma')
     # ⛔ SE GUARDA LA TAREA PARA PODER MATARLA. Sin esto el bucle queda vivo y
     # dormido 15 minutos, y al apagar la app el grupo de tareas de anyio lo
     # ESPERA: en producción no se nota (el proceso muere entero), pero en las
@@ -10097,6 +10127,49 @@ async def admin_borrar_intento(intento_id: str, admin=Depends(get_current_admin)
     return {'deleted': True}
 
 
+# ⛔ HORAS QUE SE LE DAN A UN PEDIDO DE BROMA ANTES DE CADUCAR. Generosas a
+# propósito: si el filtro se equivocó con alguien de verdad, tiene un día entero
+# para pagar — y en cuanto pague ya no se toca, porque el dinero no miente.
+HORAS_PARA_CADUCAR_BASURA = 24
+
+
+async def _caducar_basura():
+    """Cancela solos los pedidos de broma que nadie pagó (Christián, 2026-08-05:
+    «que caduque solo»).
+
+    ⛔ TRES CANDADOS, y los tres importan:
+      1. sólo los marcados `basura` por `basura.py` (dos señales, no una);
+      2. sólo `pendiente` y **sin pagar** — si alguien pagó, era real y punto;
+      3. sólo después de 24 horas.
+
+    No borra: CANCELA. Un borrado no se puede revisar después, y aquí lo que se
+    quiere es que dejen de hacer ruido, no que desaparezcan del historial. Las
+    piezas vuelven al inventario por el camino de siempre (`restore_order_stock`),
+    que es donde vive la cuenta buena.
+    """
+    limite = (datetime.now(timezone.utc)
+              - timedelta(hours=HORAS_PARA_CADUCAR_BASURA)).isoformat()
+    try:
+        viejos = await db.orders.find(
+            {'basura': True, 'status': 'pendiente', 'paid': {'$ne': True},
+             'created_at': {'$lt': limite}}, {'_id': 0}).to_list(200)
+    except Exception as e:
+        logger.warning('No pude leer los pedidos de broma: %s', e)
+        return 0
+    for o in viejos:
+        try:
+            await db.orders.update_one(
+                {'id': o['id']},
+                {'$set': {'status': 'cancelado',
+                          'cancel_reason': 'caducado: datos de broma sin pago'}})
+            await restore_order_stock(o)
+            logger.info('Pedido %s caducado solo (%s)', o.get('order_number'),
+                        '; '.join(o.get('basura_motivos') or []))
+        except Exception:
+            logger.exception('No pude caducar el pedido %s', o.get('order_number'))
+    return len(viejos)
+
+
 async def _barrer_intentos():
     """Cada rato: a quién ya toca escribirle. UNA vez por carrito, nunca dos."""
     try:
@@ -10111,6 +10184,16 @@ async def _barrer_intentos():
             visto = datetime.fromisoformat(it.get('updated_at') or it.get('created_at'))
             minutos = (ahora - visto).total_seconds() / 60
         except (TypeError, ValueError):
+            continue
+        # ⛔ A UN CHISMOSO NO SE LE PERSIGUE (Christián, 2026-08-05: «que un pedido
+        # así no dispare un correo de carrito abandonado»). Mandarle un cupón a
+        # `hola@gmail.com` no recupera una venta que nunca existió: gasta envíos,
+        # ensucia la reputación del remitente y llena de ruido el reporte.
+        if basura.es_basura({'full_name': it.get('name'), 'email': it.get('email'),
+                             'phone': it.get('phone')}):
+            await db.checkout_intentos.update_one(
+                {'email': it.get('email'), 'session_id': it.get('session_id')},
+                {'$set': {'status': 'basura'}})
             continue
         if recovery.should_contact(it, minutos):
             await _mandar_oferta(it)
