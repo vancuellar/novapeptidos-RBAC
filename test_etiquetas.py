@@ -409,3 +409,48 @@ def test_capturar_la_guia_NO_empuja_el_pedido_a_enviado():
     cuerpo = inspect.getsource(server._guardar_envio)
     assert "update['status'] = 'enviado'" not in cuerpo, (
         'capturar una guía volvió a marcar el pedido como enviado')
+
+
+# =============================================================================
+#  7) SI NO SABEMOS DE QUIÉN ES LA GUÍA, SE LE PREGUNTA A TODOS
+# =============================================================================
+#  El caso de Fabiola (2026-08-05): la compra de la guía falló a medias, alguien
+#  capturó el número a mano y el pedido quedó SIN `label_provider`. El rescate
+#  asumía Skydropx y ahí no estaba — pero el número SÍ aparecía en la lista de
+#  Envíos Internacionales. El papel existía y nadie se lo pedía a quien lo tenía.
+def test_sin_proveedor_conocido_se_barren_todos_hasta_dar_con_el(monkeypatch):
+    preguntados = []
+
+    class _Mod:
+        def __init__(self, tiene): self.tiene = tiene
+        def enabled(self): return True
+        def etiqueta_por_rastreo(self, tn):
+            preguntados.append(self.tiene)
+            return {'label_url': 'https://papel/ok'} if self.tiene == 'quien_la_tiene' else {}
+
+    mods = {'skydropx': _Mod('no_la_tiene'), 'enviosinternacionales': _Mod('quien_la_tiene')}
+    monkeypatch.setattr(etiquetas.paqueterias, 'modulo', lambda c: mods.get(c))
+    monkeypatch.setattr(etiquetas.paqueterias, 'encendidos', lambda: [
+        {'clave': 'skydropx', 'nombre': 'Skydropx', 'activo': True},
+        {'clave': 'enviosinternacionales', 'nombre': 'EI', 'activo': True}])
+
+    assert etiquetas._rescatar('', 'TRK-DE-FABIOLA') == 'https://papel/ok'
+    assert preguntados == ['no_la_tiene', 'quien_la_tiene'], 'debe seguir buscando'
+
+
+def test_con_proveedor_conocido_NO_se_le_pregunta_a_nadie_mas(monkeypatch):
+    """El barrido es sólo para cuando no se sabe: no se anda molestando a todos."""
+    preguntados = []
+
+    class _Mod:
+        def __init__(self, clave): self.clave = clave
+        def enabled(self): return True
+        def etiqueta_por_rastreo(self, tn):
+            preguntados.append(self.clave)
+            return {'label_url': 'https://papel/' + self.clave}
+
+    monkeypatch.setattr(etiquetas.paqueterias, 'modulo', lambda c: _Mod(c))
+    monkeypatch.setattr(etiquetas.paqueterias, 'encendidos',
+                        lambda: [{'clave': 'skydropx', 'nombre': 'S', 'activo': True}])
+    assert etiquetas._rescatar('enviosinternacionales', 'TRK') == 'https://papel/enviosinternacionales'
+    assert preguntados == ['enviosinternacionales']

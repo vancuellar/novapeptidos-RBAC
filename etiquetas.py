@@ -94,23 +94,46 @@ def _bajar(url: str) -> bytes:
     return r.content
 
 
-def _rescatar(proveedor: str, tracking_number: str) -> str:
-    """Vuelve a preguntarle a la paquetería dónde está el PDF de una guía YA COMPRADA.
-
-    Es el mismo mecanismo del rescate del admin (`/admin/orders/{id}/rescatar-etiqueta`),
-    aquí puesto donde sirve solo: entre que alguien pica «Imprimir Guía» y que sale el
-    papel. No compra ni cobra nada.
-    """
-    mod = paqueterias.modulo(proveedor or 'skydropx')
+def _preguntarle_a(clave: str, tracking_number: str) -> str:
+    """La liga del PDF según ESE proveedor, o '' si no la tiene. Nunca revienta."""
+    mod = paqueterias.modulo(clave)
     if mod is None or not mod.enabled():
         return ''
     try:
         guia = mod.etiqueta_por_rastreo(tracking_number)
     except Exception as e:
         logger.warning('Etiqueta: %s no pudo devolver la guía %s: %s',
-                       proveedor, tracking_number, e)
+                       clave, tracking_number, e)
         return ''
     return (guia or {}).get('label_url') or ''
+
+
+def _rescatar(proveedor: str, tracking_number: str) -> str:
+    """Vuelve a preguntarle a la paquetería dónde está el PDF de una guía YA COMPRADA.
+
+    Es el mismo mecanismo del rescate del admin (`/admin/orders/{id}/rescatar-etiqueta`),
+    aquí puesto donde sirve solo: entre que alguien pica «Imprimir Guía» y que sale el
+    papel. No compra ni cobra nada.
+
+    ⛔ SI NO SABEMOS DE QUIÉN ES, SE LE PREGUNTA A TODOS (Christián, 2026-08-05). Aquí
+    decía `proveedor or 'skydropx'`: cuando el pedido no traía `label_provider` —porque
+    la compra falló a medias y alguien capturó el número a mano, que es justo el pedido
+    de Fabiola— se le preguntaba SIEMPRE a Skydropx, aunque la guía estuviera comprada
+    en Envíos Internacionales. Y estaba: su número aparece en la lista de envíos de
+    ellos. O sea que el papel existía y nadie se lo pedía a quien lo tenía.
+
+    Con proveedor conocido no cambia nada: se le pregunta a él y ya. El barrido sólo
+    ocurre cuando de verdad no se sabe, y para en el primero que contesta.
+    """
+    if proveedor:
+        return _preguntarle_a(proveedor, tracking_number)
+    for clave in [p['clave'] for p in paqueterias.encendidos() if p['activo']]:
+        liga = _preguntarle_a(clave, tracking_number)
+        if liga:
+            logger.info('Etiqueta: la guía %s no decía de quién era; la tenía %s',
+                        tracking_number, clave)
+            return liga
+    return ''
 
 
 def _pdf_de_la_guia(order: dict) -> tuple[bytes, str]:
