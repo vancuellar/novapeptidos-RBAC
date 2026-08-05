@@ -10977,7 +10977,7 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
                'visitas_repetidas': len(ses[t])} for t in EVENT_TYPES]
 
     visitas = len(pasos['visit']) or 1
-    compras = len(pasos['purchase'])
+    compras = len(pasos['purchase'])          # se recalcula tras verificar (abajo)
 
     # ⛔ EL INGRESO DEL EMBUDO SE VERIFICA CONTRA LOS PEDIDOS, NO CONTRA EL EVENTO.
     # El evento `purchase` lo escribe el navegador al terminar el checkout y trae el
@@ -10992,8 +10992,35 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
     if nums:
         docs = await db.orders.find({'order_number': {'$in': list(nums)}},
                                     {'_id': 0, 'order_number': 1, 'status': 1,
-                                     'paid': 1}).to_list(20000)
-        pagado_por_num = {d['order_number']: esta_pagado(d) for d in docs}
+                                     'paid': 1, 'es_prueba': 1}).to_list(20000)
+        # ⛔ LAS PRUEBAS DE LA CASA NO SON VENTAS (Christián, 2026-08-04: «sólo 3
+        # personas han comprado; los otros han sido nuestras pruebas»). Un pedido
+        # marcado como prueba se trata igual que uno borrado: no es ingreso, no es
+        # deuda y NO es una compra del embudo.
+        pagado_por_num = {d['order_number']: esta_pagado(d)
+                          for d in docs if not d.get('es_prueba')}
+
+    # ⛔ LAS COMPRAS DEL EMBUDO SE VERIFICAN CONTRA LOS PEDIDOS. Antes se contaba
+    # a toda persona con un evento `purchase`, y ese evento lo escribe el navegador:
+    # sobrevive a que el pedido se borre. Por eso el panel decía 17 compras cuando en
+    # la base había 3 pedidos pagados — los otros 14 eran pruebas nuestras ya barridas.
+    # Un evento cuyo pedido no existe (o es prueba) ya no cuenta como venta.
+    def _venta_de_verdad(e) -> bool:
+        num = e.get('order_number')
+        if not num:
+            # Sin número no hay contra qué verificar. Los eventos VIEJOS son así y
+            # se creen —es lo único que hay de esa época—, pero los nuevos SIEMPRE
+            # traen número, así que esto no es una puerta abierta hacia adelante.
+            return True
+        return num in pagado_por_num
+
+    compras_verificadas = {quien(e) for e in evs
+                           if e.get('type') == 'purchase' and _venta_de_verdad(e) and quien(e)}
+    pasos['purchase'] = compras_verificadas
+    compras = len(compras_verificadas)
+    for f in embudo:
+        if f['paso'] == 'purchase':
+            f['sesiones'] = f['personas'] = len(compras_verificadas)
 
     def _estado_del_evento(e) -> str:
         """'cobrado' | 'por_cobrar' | 'fantasma', según el pedido de este evento.
@@ -11014,20 +11041,31 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
             return 'fantasma'
         return 'cobrado' if pagado_por_num[num] else 'por_cobrar'
 
-    ingreso = 0.0
-    ingreso_por_cobrar = 0.0
-    ingreso_fantasma = 0.0
-    for e in evs:
-        if e.get('type') != 'purchase':
-            continue
-        monto = float(e.get('value', 0) or 0)
-        estado = _estado_del_evento(e)
-        if estado == 'cobrado':
-            ingreso += monto
-        elif estado == 'por_cobrar':
-            ingreso_por_cobrar += monto
-        else:
-            ingreso_fantasma += monto
+    # ⛔ EL DINERO SALE DE LOS PEDIDOS, NO DE LOS EVENTOS (Christián, 2026-08-04).
+    #
+    # Antes se sumaba el `value` que el NAVEGADOR pega en cada evento `purchase`, y
+    # eso mentía por tres lados a la vez:
+    #   1. un evento sin número de pedido se creía a ciegas y sumaba como ingreso;
+    #   2. si el evento del mismo pedido se disparaba dos veces (una recarga de la
+    #      página de gracias), su monto se sumaba DOS veces;
+    #   3. los eventos de las pruebas de la casa sobreviven a que el pedido se
+    #      borre, así que seguían sumando para siempre.
+    # Resultado medido ese día: el panel decía $87,193 de ingreso con $9,973 en la
+    # cuenta. Ahora se le pregunta a `orders`, que es donde vive el dinero de verdad,
+    # con la misma regla de cobro que usa el resto del backend (`cobrado.py`).
+    pedidos_periodo = await db.orders.find(
+        {'created_at': {'$gte': desde}},
+        {'_id': 0, 'total': 1, 'status': 1, 'paid': 1, 'es_prueba': 1}).to_list(20000)
+    reales = [o for o in pedidos_periodo if not o.get('es_prueba')]
+    ingreso = round(sum(cobrado_de(o) for o in reales), 2)
+    ingreso_por_cobrar = round(sum(por_cobrar_de(o) for o in reales), 2)
+    # Lo que los eventos DICEN que se vendió y no aparece en ningún pedido: pruebas
+    # barridas y recargas. Se enseña aparte para que la diferencia no sea un misterio.
+    dicho_por_eventos = sum(float(e.get('value', 0) or 0) for e in evs
+                            if e.get('type') == 'purchase')
+    ingreso_fantasma = round(max(0.0, dicho_por_eventos - ingreso - ingreso_por_cobrar), 2)
+    pedidos_reales = len([o for o in reales if esta_vivo(o)])
+    pedidos_pagados = len([o for o in reales if esta_pagado(o)])
 
     # Por origen: de donde vino y cuanto convirtio (esto mide la publicidad).
     origen = {}
@@ -11100,6 +11138,11 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
         # dicen: si el embudo enseña compras y cero pesos, la explicación tiene que estar
         # a la vista y no parecer un error del reporte.
         'ingreso_sin_pedido': round(ingreso_fantasma),
+        # Los pedidos DE VERDAD del periodo, contados en la base y no en los eventos:
+        # es el número contra el que se puede cuadrar todo lo de arriba. Las pruebas
+        # marcadas por la casa quedan fuera de los tres.
+        'pedidos_reales': pedidos_reales,
+        'pedidos_pagados': pedidos_pagados,
         'por_origen': por_origen,
         'top_vistos': top_vistos,
         'sin_datos': len(evs) == 0,

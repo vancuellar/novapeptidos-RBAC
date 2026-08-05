@@ -464,3 +464,76 @@ def test_un_paso_sin_nadie_no_inventa_gente():
     evs = [{'type': 'visit', 'visitor_id': 'v-1', 'session_id': 's-1'}]
     pasos = server.personas_por_paso(evs)
     assert len(pasos['purchase']) == 0
+
+
+# ==========================================================================
+#  El embudo no cuenta las pruebas de la casa (Christián, 2026-08-04)
+# ==========================================================================
+# «La realidad es que sólo 3 personas han comprado (pagado); los otros han sido
+# nuestras pruebas.» El panel decía 17 compras y $87,193 de ingreso con 3 pedidos
+# pagados y $9,973 en la cuenta.
+
+def _funnel(db, evs, pedidos):
+    for e in evs:
+        e.setdefault('created_at', '2026-08-04T10:00:00+00:00')
+    for o in pedidos:
+        o.setdefault('created_at', '2026-08-04T10:00:00+00:00')
+    for e in evs:
+        asyncio.run(db.events.insert_one(e))
+    for o in pedidos:
+        asyncio.run(db.orders.insert_one(o))
+    return asyncio.run(server.admin_funnel(days=30, admin={'id': 'a', 'role': 'admin'}))
+
+
+def test_una_compra_cuyo_pedido_YA_NO_EXISTE_no_es_una_venta(db):
+    """El evento del navegador sobrevive a que el pedido se borre. Ése fue el
+    origen de las 14 compras de más: pruebas nuestras ya barridas."""
+    r = _funnel(db, [
+        {'type': 'visit', 'visitor_id': 'v-1', 'session_id': 's-1'},
+        {'type': 'purchase', 'visitor_id': 'v-1', 'session_id': 's-1',
+         'order_number': 'EX-BORRADO', 'value': 5000},
+    ], [])
+    paso = next(p for p in r['embudo'] if p['paso'] == 'purchase')
+    assert paso['personas'] == 0
+    assert r['ingreso'] == 0
+
+
+def test_un_pedido_marcado_como_PRUEBA_no_cuenta_ni_como_venta_ni_como_dinero(db):
+    r = _funnel(db, [
+        {'type': 'visit', 'visitor_id': 'v-1', 'session_id': 's-1'},
+        {'type': 'purchase', 'visitor_id': 'v-1', 'session_id': 's-1',
+         'order_number': 'EX-PRUEBA', 'value': 4000},
+    ], [{'id': 'o-p', 'order_number': 'EX-PRUEBA', 'total': 4000, 'paid': True,
+         'status': 'confirmado', 'es_prueba': True}])
+    paso = next(p for p in r['embudo'] if p['paso'] == 'purchase')
+    assert paso['personas'] == 0
+    assert r['ingreso'] == 0 and r['pedidos_pagados'] == 0
+
+
+def test_el_ingreso_no_se_duplica_si_el_evento_se_dispara_dos_veces(db):
+    """Una recarga de la página de gracias mandaba el mismo `purchase` otra vez y
+    su monto se sumaba de nuevo. El dinero sale de `orders`, así que ya no."""
+    r = _funnel(db, [
+        {'type': 'visit', 'visitor_id': 'v-1', 'session_id': 's-1'},
+        {'type': 'purchase', 'visitor_id': 'v-1', 'session_id': 's-1',
+         'order_number': 'EX-REAL', 'value': 2830},
+        {'type': 'purchase', 'visitor_id': 'v-1', 'session_id': 's-1',
+         'order_number': 'EX-REAL', 'value': 2830},
+    ], [{'id': 'o-r', 'order_number': 'EX-REAL', 'total': 2830, 'paid': True,
+         'status': 'enviado'}])
+    assert r['ingreso'] == 2830          # una vez, no dos
+    paso = next(p for p in r['embudo'] if p['paso'] == 'purchase')
+    assert paso['personas'] == 1
+    assert r['pedidos_pagados'] == 1
+
+
+def test_un_pedido_FIADO_es_deuda_y_no_ingreso(db):
+    r = _funnel(db, [
+        {'type': 'visit', 'visitor_id': 'v-1', 'session_id': 's-1'},
+        {'type': 'purchase', 'visitor_id': 'v-1', 'session_id': 's-1',
+         'order_number': 'EX-FIADO', 'value': 3347},
+    ], [{'id': 'o-f', 'order_number': 'EX-FIADO', 'total': 3347, 'paid': False,
+         'status': 'entregado'}])
+    assert r['ingreso'] == 0
+    assert r['por_cobrar'] == 3347
+    assert r['pedidos_pagados'] == 0 and r['pedidos_reales'] == 1

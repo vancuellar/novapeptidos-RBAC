@@ -295,12 +295,27 @@ def test_una_compra_cuyo_pedido_ya_no_existe_no_es_ingreso_ni_deuda():
 
 
 def test_el_embudo_le_cree_a_un_evento_viejo_sin_numero_de_pedido():
-    """Los eventos de antes no traen `order_number`. Es lo único que hay de esa
-    época: descartarlos sería borrar historia."""
+    """⚠️ ESTA PRUEBA CAMBIÓ EL 2026-08-04 y el cambio ES el arreglo.
+
+    Antes exigía que un evento `purchase` SIN número de pedido sumara su monto al
+    ingreso ($1,000). Ese «creerle al navegador» es lo que hacía que el panel
+    dijera $87,193 con $9,973 en la cuenta: el monto lo escribe el navegador, el
+    evento sobrevive a que el pedido se borre, y una recarga de la página de
+    gracias lo mandaba otra vez.
+
+    La distinción que se conserva: el evento sigue contando como PASO del embudo
+    —esa persona sí llegó hasta el final, y descartarla sería borrar historia—,
+    pero ya no cuenta como DINERO, porque no hay pedido que lo respalde. El
+    ingreso sale de `orders`, que es donde vive el dinero de verdad."""
     base = _Base(orders=[], events=[_evento('visit', 's1'),
                                     _evento('purchase', 's1', value=1000.0)])
     r = _con_base(base, lambda: server.admin_funnel(days=30, admin={'email': 'a@b.c'}))
-    assert r['ingreso'] == 1000
+    assert r['ingreso'] == 0
+    # Pero la persona sí aparece en el paso de compra del embudo.
+    paso = next(p for p in r['embudo'] if p['paso'] == 'purchase')
+    assert paso['personas'] == 1
+    # Y lo que el navegador dijo y nadie respalda queda A LA VISTA, no escondido.
+    assert r['ingreso_sin_pedido'] == 1000
 
 
 # ------------------------------------------------------ fichas de cliente
