@@ -2767,26 +2767,31 @@ async def avisar_al_cliente(order: dict, evento: str) -> bool:
 
 
 async def avisar_de_la_guia(order: dict) -> bool:
-    """«Ya tienes guía» — NO «ya salió». Se manda al capturar/comprar el número.
+    """EL UNICO aviso al cliente: su numero de guia, una vez, y ya.
 
-    ⛔ POR QUÉ EXISTEN DOS AVISOS Y NO UNO (Christián, 2026-08-05). Antes, capturar la
-    guía disparaba el de «Tu pedido va en camino». Pero comprar la guía es un trámite
-    de escritorio: el paquete puede pasar días en la mesa —el de Fabiola, sin ir más
-    lejos—. Ese correo le prometía movimiento al cliente y luego el rastreo no se movía,
-    que es la peor forma de estrenar la confianza de alguien que acaba de pagar.
+    ⛔ UNO SOLO, POR ORDEN DE CHRISTIAN (2026-08-05): «prefiero el sistema actual de
+    un solo email con su numero de guia y ya! Simple!!!».
 
-    El cliente SÍ tiene que recibir su número en cuanto existe (el correo de
-    confirmación se lo promete), así que aquí sale la campanita con la guía y sin
-    prometer nada. El correo de «va en camino» lo manda `avisar_del_envio`, cuando el
-    paquete sale de verdad.
+    Hubo un rato en que fueron DOS —uno al aparecer la guia y otro al salir el
+    paquete—, con la buena intencion de no prometer movimiento antes de tiempo. Pero
+    dos correos por un mismo pedido son ruido para el cliente, y el segundo no le
+    aporta nada que no supiera: ya tenia el numero, y el movimiento se lo cuenta la
+    paqueteria. Se quedo el primero, que es el que trae el dato util.
+
+    Lo que SI se cuido es el texto: dice que la guia esta lista, no que el paquete ya
+    salio. El estado real del envio vive en el panel (`guias.etapa_de_envio`) y en el
+    rastreo, no en una promesa por correo.
     """
     if not order or not order.get('tracking_number'):
         return False
     num = order.get('order_number')
-    await notify(order.get('user_id'), 'order_label_ready', 'Tu guía ya está lista',
-                 f'El pedido {num} ya tiene guía: {order.get("tracking_number")}. '
-                 'Te avisamos en cuanto salga.',
+    await notify(order.get('user_id'), 'order_label_ready', 'Tu guia ya esta lista',
+                 f'El pedido {num} ya tiene guia: {order.get("tracking_number")}.',
                  link=f'/pedido/{num}', dedup=f'label:{num}:{order["tracking_number"]}')
+    # El correo va por LA PUERTA UNICA de siempre, con su candado de «nunca tres
+    # correos» y su ranura de rastreo: si este numero ya viajo dentro del correo de
+    # pago confirmado, de aqui no sale nada.
+    await avisar_al_cliente(order, 'enviado')
     return True
 
 
@@ -5156,16 +5161,13 @@ async def _guardar_envio(order: dict, payload: OrderShippingUpdate, *,
     if update:
         await db.orders.update_one({'id': order_id}, {'$set': update})
     result = await db.orders.find_one({'id': order_id}, {'_id': 0})
-    # DOS AVISOS DISTINTOS, cada uno en su momento:
-    #   · apareció la guía  -> «ya tienes guía» (campanita, sin prometer movimiento);
-    #   · el paquete salió  -> «va en camino» (el de siempre, correo incluido).
-    # Prometerle movimiento a un paquete parado es la misma mentira del tablero, vista
-    # desde la bandeja de entrada del cliente. El `dedup` de cada uno impide que
-    # reeditar el número mande el aviso dos veces.
+    # ⛔ UN SOLO AVISO AL CLIENTE, cuando APARECE la guia (Christian, 2026-08-05:
+    # «un solo email con su numero de guia y ya! Simple!!!»). Llego a haber un
+    # segundo al marcar «enviado»; se quito porque no le decia nada nuevo —ya tenia
+    # el numero, y el movimiento se lo cuenta la paqueteria— y dos correos por el
+    # mismo pedido son ruido. El `dedup` impide que reeditar el numero lo repita.
     if number and not (order.get('tracking_number') or ''):
         await avisar_de_la_guia(result)
-    if result.get('status') == 'enviado' and order.get('status') != 'enviado':
-        await avisar_del_envio(result)
     if result.get('status') in loyalty.PAID_STATUSES:
         # Los puntos tienen su propio candado de cobro dentro (`award_order_points`):
         # mover la mercancía no los libera si el pedido sigue sin pagarse.

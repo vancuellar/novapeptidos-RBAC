@@ -1954,3 +1954,28 @@ def test_la_cotizacion_del_admin_usa_el_SOBRE_no_una_caja_inventada(db):
         envios.piezas_del_pedido(pedido.get('items') or [])))
     for k in ('largo_cm', 'ancho_cm', 'alto_cm', 'peso_kg'):
         assert paquete[k] == auto[k], k
+
+
+def test_UN_SOLO_correo_al_cliente_por_pedido(db, monkeypatch):
+    """⛔ Christián, 2026-08-05: «prefiero el sistema actual de un solo email con su
+    número de guía y ya! Simple!!!».
+
+    Hubo un rato en que salían DOS avisos (uno al aparecer la guía, otro al marcar
+    enviado). El segundo no le decía nada nuevo al cliente —ya tenía el número, y el
+    movimiento se lo cuenta la paquetería— y dos correos por un pedido son ruido.
+    Si alguien vuelve a meter el segundo, esto se pone rojo.
+    """
+    avisos = []
+    monkeypatch.setattr(server, 'avisar_de_la_guia',
+                        lambda o: avisos.append('guia') or _async_nada())
+    monkeypatch.setattr(server, 'avisar_del_envio',
+                        lambda o: avisos.append('SEGUNDO-CORREO') or _async_nada())
+    asyncio.run(db.orders.insert_one(_orden('spei')))
+    from models import OrderShippingUpdate
+    # 1) aparece la guía  -> UN aviso
+    asyncio.run(server.update_order_shipping('o1', OrderShippingUpdate(
+        carrier='Estafeta', tracking_number='ABC123'), admin=_admin()))
+    # 2) y ahora sí se marca enviado -> NO sale nada más
+    asyncio.run(server.update_order_shipping('o1', OrderShippingUpdate(
+        status='enviado'), admin=_admin()))
+    assert avisos == ['guia'], f'salieron avisos de mas: {avisos}'
