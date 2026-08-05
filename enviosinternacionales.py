@@ -201,22 +201,66 @@ def etiqueta_por_rastreo(tracking_number: str) -> dict:
     except Exception as e:
         logger.warning('%s: no se pudo listar envios para rescatar la etiqueta: %s', NOMBRE, e)
         return {}
-    filas = data.get('data') if isinstance(data, dict) else data
-    for fila in (filas or []):
-        attrs = fila.get('attributes') if isinstance(fila, dict) else None
-        for c in [x for x in (fila, attrs) if isinstance(x, dict)]:
-            if tn in {str(c.get(k) or '') for k in
-                      ('tracking_number', 'master_tracking_number')}:
-                guia = skydropx._guia_del_json(
-                    {'data': fila, 'included': data.get('included') or []})
-                if guia.get('label_url'):
-                    return guia
-                if guia.get('shipment_id'):
-                    try:
-                        return skydropx._guia_del_json(_get(f"/shipments/{guia['shipment_id']}"))
-                    except Exception:
-                        return guia
+    if not isinstance(data, dict):
+        return {}
+
+    # ⛔⛔ EL NÚMERO DE GUÍA NO VIVE EN EL ENVÍO, VIVE EN SU PAQUETE (comprobado
+    # contra la API en vivo el 2026-08-05). Cada renglón de `data` trae
+    # `attributes.tracking_number = None`, y el número —y el `label_url`— están en
+    # `included`, en el objeto `type: "package"` al que apunta
+    # `relationships.packages.data[].id`.
+    #
+    # Lo que había aquí buscaba el número en el envío (donde nunca está) y luego le
+    # pasaba a `skydropx._guia_del_json` el `included` ENTERO de la lista — o sea, los
+    # paquetes de TODOS los envíos. Esa función se queda con el PRIMER `label_url` que
+    # encuentra, así que devolvía SIEMPRE LA MISMA ETIQUETA, sin importar qué guía se
+    # le hubiera pedido. Se detectó porque dos pedidos distintos (EX-20260730-5930 y
+    # el de Fabiola, EX-20260801-2402) sacaban un PDF con el MISMO sha256.
+    #
+    # ⛔ ESTO NO ERA UN BOTÓN QUE NO SIRVE: ERA UN PAQUETE CON LA ETIQUETA DE OTRO.
+    # Imprimir y pegar mandaba la caja al domicilio equivocado y con el nombre de otro
+    # cliente. Por eso ahora se casa por el PAQUETE y, si el número no coincide, no se
+    # devuelve nada: mejor sin etiqueta que con la de alguien más.
+    paquetes = {}
+    for inc in (data.get('included') or []):
+        if isinstance(inc, dict) and inc.get('type') == 'package' and inc.get('id'):
+            paquetes[str(inc['id'])] = inc
+
+    def _numero(inc: dict) -> str:
+        at = inc.get('attributes') if isinstance(inc.get('attributes'), dict) else {}
+        for c in (at, inc):
+            for k in ('tracking_number', 'master_tracking_number'):
+                if c.get(k):
+                    return str(c[k])
+        return ''
+
+    for fila in (data.get('data') or []):
+        if not isinstance(fila, dict):
+            continue
+        rel = fila.get('relationships') or {}
+        refs = ((rel.get('packages') or {}).get('data')) or []
+        if isinstance(refs, dict):
+            refs = [refs]
+        for ref in refs:
+            inc = paquetes.get(str((ref or {}).get('id') or ''))
+            if not inc or _numero(inc) != tn:
+                continue
+            # Sólo el paquete que SÍ es: su etiqueta y su envío, nada más.
+            guia = skydropx._guia_del_json({'data': fila, 'included': [inc]})
+            guia['tracking_number'] = tn
+            if guia.get('label_url'):
                 return guia
+            # Sin liga en la lista, se pide ese envío suelto: ahí `included` ya es suyo.
+            if guia.get('shipment_id'):
+                try:
+                    suelto = skydropx._guia_del_json(_get(f"/shipments/{guia['shipment_id']}"))
+                except Exception:
+                    return guia
+                # Y aun así se comprueba: un envío puede traer varios paquetes.
+                if suelto.get('tracking_number') in ('', tn):
+                    suelto['tracking_number'] = tn
+                    return suelto
+            return guia
     return {}
 
 

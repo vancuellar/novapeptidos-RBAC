@@ -95,17 +95,37 @@ def _bajar(url: str) -> bytes:
 
 
 def _preguntarle_a(clave: str, tracking_number: str) -> str:
-    """La liga del PDF según ESE proveedor, o '' si no la tiene. Nunca revienta."""
+    """La liga del PDF según ESE proveedor, o '' si no la tiene. Nunca revienta.
+
+    ⛔ SI EL NÚMERO NO COINCIDE, NO HAY ETIQUETA. Es el candado de última hora, y
+    existe por lo que pasó el 2026-08-05: un error al leer la respuesta de Envíos
+    Internacionales hacía que se devolviera SIEMPRE la misma etiqueta, la de otro
+    envío. Dos pedidos distintos sacaban el mismo PDF.
+
+    Una etiqueta equivocada no es un botón que falla: es una caja que sale con el
+    nombre y el domicilio de otro cliente. Entre no imprimir nada e imprimir la de
+    alguien más, no imprimir nada gana siempre. Por eso, cuando el proveedor dice de
+    qué guía es su papel, se le exige que sea LA QUE SE PIDIÓ. (Si no la dice, se
+    confía: hay proveedores que no devuelven el número, y el candado de arriba —casar
+    por paquete— ya es específico de cada uno.)
+    """
     mod = paqueterias.modulo(clave)
     if mod is None or not mod.enabled():
         return ''
     try:
-        guia = mod.etiqueta_por_rastreo(tracking_number)
+        guia = mod.etiqueta_por_rastreo(tracking_number) or {}
     except Exception as e:
         logger.warning('Etiqueta: %s no pudo devolver la guía %s: %s',
                        clave, tracking_number, e)
         return ''
-    return (guia or {}).get('label_url') or ''
+    devuelto = str(guia.get('tracking_number') or '').strip()
+    pedido = (tracking_number or '').strip()
+    if devuelto and devuelto != pedido:
+        logger.error('Etiqueta: %s devolvió la guía %s cuando se le pidió la %s. '
+                     'NO se entrega: sería la etiqueta de otro cliente.',
+                     clave, devuelto, pedido)
+        return ''
+    return guia.get('label_url') or ''
 
 
 def _rescatar(proveedor: str, tracking_number: str) -> str:

@@ -34,6 +34,7 @@ os.environ.setdefault('MONGO_URL', 'mongodb://localhost:27017')
 os.environ.setdefault('DB_NAME', 'exygen_test')
 
 import auth
+import enviosinternacionales as ei
 import etiquetas
 import guias
 import server
@@ -454,3 +455,61 @@ def test_con_proveedor_conocido_NO_se_le_pregunta_a_nadie_mas(monkeypatch):
                         lambda: [{'clave': 'skydropx', 'nombre': 'S', 'activo': True}])
     assert etiquetas._rescatar('enviosinternacionales', 'TRK') == 'https://papel/enviosinternacionales'
     assert preguntados == ['enviosinternacionales']
+
+
+# =============================================================================
+#  8) ⛔ NUNCA LA ETIQUETA DE OTRO CLIENTE  (2026-08-05)
+# =============================================================================
+#  Lo que se encontró: `enviosinternacionales.etiqueta_por_rastreo` buscaba el
+#  número en el ENVÍO (donde la API lo devuelve como None: vive en el PAQUETE) y
+#  le pasaba a `_guia_del_json` el `included` de TODA la lista. Esa función se
+#  queda con el primer `label_url` que ve, así que devolvía siempre la MISMA
+#  etiqueta. Dos pedidos distintos sacaban un PDF con el mismo sha256.
+#
+#  No es un botón que falla: es una caja que sale con el domicilio de otro.
+def test_se_casa_por_el_PAQUETE_y_devuelve_la_etiqueta_correcta(monkeypatch):
+    respuesta = {
+        'data': [
+            {'id': 'env-A', 'attributes': {'tracking_number': None},
+             'relationships': {'packages': {'data': [{'id': 'pk-A', 'type': 'package'}]}}},
+            {'id': 'env-B', 'attributes': {'tracking_number': None},
+             'relationships': {'packages': {'data': [{'id': 'pk-B', 'type': 'package'}]}}},
+        ],
+        'included': [
+            {'type': 'package', 'id': 'pk-A',
+             'attributes': {'tracking_number': '111', 'label_url': 'https://papel/A'}},
+            {'type': 'address', 'id': 'dir-A', 'attributes': {}},
+            {'type': 'package', 'id': 'pk-B',
+             'attributes': {'tracking_number': '222', 'label_url': 'https://papel/B'}},
+        ],
+    }
+    monkeypatch.setattr(ei, 'enabled', lambda: True)
+    monkeypatch.setattr(ei, '_get', lambda ruta: respuesta)
+
+    # El de la SEGUNDA fila tiene que traer SU etiqueta, no la primera del monton.
+    assert ei.etiqueta_por_rastreo('222')['label_url'] == 'https://papel/B'
+    assert ei.etiqueta_por_rastreo('111')['label_url'] == 'https://papel/A'
+    # Y una guia que no es de ellos no saca nada.
+    assert ei.etiqueta_por_rastreo('999') == {}
+
+
+def test_si_el_proveedor_devuelve_OTRA_guia_no_se_entrega(monkeypatch):
+    """El candado de ultima hora: mejor sin etiqueta que con la de alguien mas."""
+    class _Mentiroso:
+        def enabled(self): return True
+        def etiqueta_por_rastreo(self, tn):
+            return {'tracking_number': 'LA-DE-OTRO', 'label_url': 'https://papel/ajeno'}
+
+    monkeypatch.setattr(etiquetas.paqueterias, 'modulo', lambda c: _Mentiroso())
+    assert etiquetas._preguntarle_a('skydropx', 'LA-MIA') == ''
+
+
+def test_si_el_proveedor_no_dice_de_cual_es_se_confia(monkeypatch):
+    """No todos devuelven el numero; ahi manda el casado especifico de cada uno."""
+    class _Callado:
+        def enabled(self): return True
+        def etiqueta_por_rastreo(self, tn):
+            return {'label_url': 'https://papel/ok'}
+
+    monkeypatch.setattr(etiquetas.paqueterias, 'modulo', lambda c: _Callado())
+    assert etiquetas._preguntarle_a('skydropx', 'LA-MIA') == 'https://papel/ok'
