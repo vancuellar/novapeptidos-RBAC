@@ -483,7 +483,11 @@ async def armar_contexto(db, user, productos, tope_de=None, language=None,
             partes.append(costos)
 
     partes.append(f'IDIOMA DE RESPUESTA (OBLIGATORIO): {language_instruction(language)}')
-    return {'system_message': '\n\n'.join(partes)}
+    # `es_admin` viaja CON el sobre, no aparte: quien arma el contexto es quien sabe
+    # si adentro van costos y proveedores, y es lo que decide a qué motor puede ir
+    # (ver `modelo_ia.cadena_admin`). Separarlos permitiría que un sobre con costos
+    # acabara en el motor equivocado por un descuido de plomería.
+    return {'system_message': '\n\n'.join(partes), 'es_admin': admin}
 
 
 # ---------------------------------------------------------------------------

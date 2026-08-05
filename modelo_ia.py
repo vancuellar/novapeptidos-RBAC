@@ -235,11 +235,57 @@ def respaldo() -> str:
     return ''
 
 
-def cadena() -> list:
+# ---------------------------------------------------------------------------
+#  ⛔ EL CHAT DEL ADMIN NO VA A KIMI — y no es una preferencia, es un contrato
+# ---------------------------------------------------------------------------
+# Decisión de Christián del 2026-08-05, sobre el análisis del 1-ago:
+# «Kimi para el chat de la tienda y para lo demás GPT o Claude de paga».
+#
+# El porqué, que es lo que no se puede perder: los términos QUE OBLIGAN de Moonshot
+# se reservan usar el Contenido para «desarrollar y mejorar los Servicios», y sus
+# datos viven en Singapur. Y el sobre del ADMIN —sólo el suyo— lleva sus COSTOS DE
+# COMPRA y los NOMBRES DE SUS PROVEEDORES (`chat_negocio.bloque_costos`). Mandar eso
+# a un proveedor cuyos términos permiten quedárselo sería abrir por contrato la misma
+# puerta que `armar_contexto` cierra por código.
+#
+# ⛔ POR ESO KIMI NO ESTÁ EN ESTA LISTA, y quitarlo del prompt no habría servido de
+# nada: el candado tiene que estar en QUÉ MOTOR RECIBE EL SOBRE.
+#
+# El distribuidor SÍ puede ir a Kimi: su sobre nunca lleva costos ni proveedores —de
+# eso se encarga el `if admin` de `armar_contexto`— y ahí está el volumen de
+# preguntas. Gemini queda al final de los dos: su capa gratis tiene el mismo problema
+# de términos, así que sirve de última red, no de motor.
+ORDEN_ADMIN = ('openai', 'claude', 'gemini')
+
+# Se puede forzar a mano si algún día hace falta (`AI_PROVIDER_ADMIN=claude`), pero
+# NUNCA a Kimi: si alguien lo escribe, se ignora y se sigue con el orden de arriba.
+PROVEEDOR_ADMIN = (os.environ.get('AI_PROVIDER_ADMIN') or '').strip().lower()
+MOTORES_VETADOS_PARA_ADMIN = ('kimi',)
+
+
+def cadena_admin() -> list:
+    """Los motores del chat del ADMIN, en orden, sin Kimi jamás."""
+    puestos = []
+    if (PROVEEDOR_ADMIN and PROVEEDOR_ADMIN not in MOTORES_VETADOS_PARA_ADMIN
+            and _tiene_modelo(PROVEEDOR_ADMIN) and encendido(PROVEEDOR_ADMIN)):
+        puestos.append(PROVEEDOR_ADMIN)
+    for cual in ORDEN_ADMIN:
+        if cual in puestos:
+            continue
+        if _tiene_modelo(cual) and encendido(cual):
+            puestos.append(cual)
+    return puestos
+
+
+def cadena(es_admin: bool = False) -> list:
     """Los motores a intentar, en orden: el elegido y —si lo hay— su respaldo.
 
-    Sin configurar nada esto devuelve `['gemini']`, exactamente el chat de hoy.
+    `es_admin=True` cambia la lista entera: el chat del dueño lleva sus costos y sus
+    proveedores dentro del sobre, así que va por `cadena_admin()` y NUNCA por Kimi.
+    Ver el bloque de arriba: es un candado de contrato, no una preferencia.
     """
+    if es_admin:
+        return cadena_admin()
     puestos = [proveedor()]
     de_atras = respaldo()
     if de_atras:

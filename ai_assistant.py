@@ -384,7 +384,11 @@ async def stream_reply(chat: dict, message: str):
     """
     import modelo_ia
     system = chat['system_message']
-    motores = modelo_ia.cadena()
+    # ⛔ EL MOTOR DEPENDE DE QUIÉN PREGUNTA. El sobre del admin lleva sus costos y
+    # sus proveedores, y por eso no puede ir a Kimi (ver `modelo_ia.cadena_admin`).
+    # Lo marca quien arma el sobre; si no viene marcado se asume que NO es admin,
+    # que es el lado seguro: como mucho, un admin acaba en un motor más caro.
+    motores = modelo_ia.cadena(es_admin=bool(chat.get('es_admin')))
     ultimo_error = None
 
     for i, cual in enumerate(motores):

@@ -40,7 +40,7 @@ import asyncio
 # Todo lo que puede pisar la decisión de motor. Se limpia SIEMPRE antes de cada
 # prueba: si el `.env` de la máquina trae una de éstas, las pruebas medirían el
 # entorno de quien las corre en vez del código.
-ENTORNO = ('AI_PROVIDER', 'AI_PROVIDER_FALLBACK', 'AI_MODEL_NAME',
+ENTORNO = ('AI_PROVIDER', 'AI_PROVIDER_ADMIN', 'AI_PROVIDER_FALLBACK', 'AI_MODEL_NAME',
            'AI_MODEL_NAME_GEMINI', 'AI_MODEL_NAME_OPENAI', 'AI_MODEL_NAME_KIMI',
            'AI_MODEL_NAME_CLAUDE', 'OPENAI_API_KEY', 'MOONSHOT_API_KEY',
            'ANTHROPIC_API_KEY', 'GEMINI_API_KEY', 'GOOGLE_API_KEY',
@@ -399,3 +399,38 @@ def test_el_respaldo_se_puede_seguir_apagando(motor):
     m = motor(None, AI_PROVIDER_FALLBACK='ninguno', ANTHROPIC_API_KEY='a',
               GEMINI_API_KEY='g')
     assert m.cadena() == ['claude']
+
+
+# =============================================================================
+#  ⛔ EL CHAT DEL ADMIN NO VA A KIMI — candado de contrato, no preferencia
+# =============================================================================
+#  Christián, 2026-08-05: «Kimi para el chat de la tienda y para lo demás GPT o
+#  Claude de paga». El porqué: los términos que obligan de Moonshot se reservan
+#  usar el Contenido para "desarrollar y mejorar los Servicios", y el sobre del
+#  admin —sólo el suyo— lleva sus COSTOS DE COMPRA y sus PROVEEDORES.
+def test_el_admin_NUNCA_cae_en_kimi_aunque_sea_el_motor_de_la_casa(motor):
+    m = motor('kimi', MOONSHOT_API_KEY='k', OPENAI_API_KEY='o',
+              AI_MODEL_NAME_OPENAI='gpt-x')
+    assert m.cadena()[0] == 'kimi', 'la tienda sí va a Kimi'
+    admin = m.cadena(es_admin=True)
+    assert 'kimi' not in admin, 'los costos del admin no pueden ir a Moonshot'
+    assert admin[0] == 'openai'
+
+
+def test_ni_forzandolo_a_mano_el_admin_va_a_kimi(motor):
+    """Si alguien escribe AI_PROVIDER_ADMIN=kimi, se ignora."""
+    m = motor(AI_PROVIDER_ADMIN='kimi', MOONSHOT_API_KEY='k', OPENAI_API_KEY='o',
+              AI_MODEL_NAME_OPENAI='gpt-x')
+    assert 'kimi' not in m.cadena(es_admin=True)
+
+
+def test_el_de_la_tienda_y_el_distribuidor_SI_pueden_ir_a_kimi(motor):
+    """Su sobre nunca lleva costos: ahí está el volumen y no hay nada que proteger."""
+    m = motor('kimi', MOONSHOT_API_KEY='k')
+    assert m.cadena(es_admin=False)[0] == 'kimi'
+
+
+def test_el_admin_cae_a_claude_y_luego_a_gemini_si_no_hay_GPT(motor):
+    m = motor(ANTHROPIC_API_KEY='a', GEMINI_API_KEY='g', MOONSHOT_API_KEY='k')
+    admin = m.cadena(es_admin=True)
+    assert admin[0] == 'claude' and 'kimi' not in admin
