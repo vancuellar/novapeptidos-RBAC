@@ -773,3 +773,53 @@ def test_el_pedido_que_ve_el_cliente_NO_trae_lo_que_cuesta_la_guia(db, monkeypat
     assert visto['carrier'] == 'Estafeta'
     assert visto['tracking_url'] == 'https://estafeta.test/7712345678'
     assert visto['total'] == 1180
+
+
+# =============================================================================
+#  EL CASO DE CHRISTIÁN (2026-08-05): la guía NO se generó en la compra
+# =============================================================================
+#  «Si por alguna razón la guía no se genera durante la compra (ya pagada
+#   obviamente), y la generamos manualmente después, entonces sí habría un
+#   segundo correo cuando se ponga la guía manual. ¿Me explico?»
+#
+#  Sí — y es lo correcto. La cuenta no es "cuántos correos salen" sino
+#  "cuántos correos llevan el número de guía": UNO, siempre.
+#
+#    · Con guía al pagar  -> el número viaja DENTRO del correo de pago, y la
+#      ranura `enviado:{guia}` se aparta ahí mismo. No sale un segundo.
+#    · Sin guía al pagar  -> el correo de pago se va sin número (no lo había).
+#      Cuando la guía aparece, ESE es el primero y único que se lo lleva.
+def test_si_la_guia_llega_al_pagar_el_numero_va_DENTRO_y_no_sale_otro(db, monkeypatch):
+    salidas = []
+    async def _nada():
+        return None
+    monkeypatch.setattr(server, 'send_order_email',
+                        lambda o, lang, tipo: salidas.append(f'pagado:{tipo}') or _nada())
+    monkeypatch.setattr(server, 'send_shipped_email',
+                        lambda o, lang: salidas.append('SEGUNDO-CORREO-DE-GUIA') or _nada())
+    pedido = {'id': 'p1', 'order_number': 'EX-1', 'tracking_number': 'ABC123'}
+    asyncio.run(db.orders.insert_one(dict(pedido)))
+    asyncio.run(server.avisar_al_cliente(pedido, 'pagado'))
+    # Y ahora el camino del envío intenta avisar: la ranura ya está apartada.
+    asyncio.run(server.avisar_al_cliente(pedido, 'enviado'))
+    assert 'SEGUNDO-CORREO-DE-GUIA' not in salidas, 'se duplicó el aviso de la guía'
+
+
+def test_si_la_guia_llega_DESPUES_ese_correo_SI_sale(db, monkeypatch):
+    """⛔ Y TIENE QUE SALIR: el correo de pago se fue sin número porque no existía.
+    Si éste tampoco saliera, el cliente pagaría y NUNCA sabría su guía."""
+    salidas = []
+    async def _nada():
+        return None
+    monkeypatch.setattr(server, 'send_order_email',
+                        lambda o, lang, tipo: salidas.append(f'pagado:{tipo}') or _nada())
+    monkeypatch.setattr(server, 'send_shipped_email',
+                        lambda o, lang: salidas.append('correo-con-la-guia') or _nada())
+    sin_guia = {'id': 'p2', 'order_number': 'EX-2', 'tracking_number': ''}
+    asyncio.run(db.orders.insert_one(dict(sin_guia)))
+    asyncio.run(server.avisar_al_cliente(sin_guia, 'pagado'))     # se fue sin número
+    con_guia = dict(sin_guia, tracking_number='XYZ789')           # se captura a mano
+    asyncio.run(server.avisar_al_cliente(con_guia, 'enviado'))
+    assert 'correo-con-la-guia' in salidas
+    # Un total de DOS correos, pero sólo UNO lleva la guía. Es la cuenta correcta.
+    assert salidas.count('correo-con-la-guia') == 1
