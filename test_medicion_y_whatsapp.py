@@ -496,6 +496,7 @@ def test_una_compra_cuyo_pedido_YA_NO_EXISTE_no_es_una_venta(db):
     paso = next(p for p in r['embudo'] if p['paso'] == 'purchase')
     assert paso['personas'] == 0
     assert r['ingreso'] == 0
+    assert r['compras_sin_pedido'] == 1
 
 
 def test_un_pedido_marcado_como_PRUEBA_no_cuenta_ni_como_venta_ni_como_dinero(db):

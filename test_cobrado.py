@@ -311,11 +311,13 @@ def test_el_embudo_le_cree_a_un_evento_viejo_sin_numero_de_pedido():
                                     _evento('purchase', 's1', value=1000.0)])
     r = _con_base(base, lambda: server.admin_funnel(days=30, admin={'email': 'a@b.c'}))
     assert r['ingreso'] == 0
-    # Pero la persona sí aparece en el paso de compra del embudo.
+    # Y TAMPOCO cuenta como compra: un panel que enseña ventas que no existen no
+    # está conservando historia, está mintiendo (Christián, 2026-08-04). Lo que el
+    # navegador dijo y nadie respalda queda A LA VISTA, aparte.
     paso = next(p for p in r['embudo'] if p['paso'] == 'purchase')
-    assert paso['personas'] == 1
-    # Y lo que el navegador dijo y nadie respalda queda A LA VISTA, no escondido.
+    assert paso['personas'] == 0
     assert r['ingreso_sin_pedido'] == 1000
+    assert r['compras_sin_pedido'] == 1
 
 
 # ------------------------------------------------------ fichas de cliente

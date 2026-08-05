@@ -11006,16 +11006,21 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
     # la base había 3 pedidos pagados — los otros 14 eran pruebas nuestras ya barridas.
     # Un evento cuyo pedido no existe (o es prueba) ya no cuenta como venta.
     def _venta_de_verdad(e) -> bool:
+        """⛔ SIN PEDIDO NO HAY VENTA, punto. Antes un evento sin `order_number` se
+        creía «porque es lo único que hay de esa época», y eso dejaba 15 compras en
+        pantalla con 5 pedidos en la base: los eventos de las pruebas viejas de la
+        casa no traían número y sobrevivieron a que sus pedidos se borraran.
+        Christián lo cachó el 2026-08-04: «sólo 3 personas han comprado». Un panel
+        que enseña el triple de ventas de las que hay no está conservando historia,
+        está mintiendo. Lo descartado se cuenta aparte (`compras_sin_pedido`)."""
         num = e.get('order_number')
-        if not num:
-            # Sin número no hay contra qué verificar. Los eventos VIEJOS son así y
-            # se creen —es lo único que hay de esa época—, pero los nuevos SIEMPRE
-            # traen número, así que esto no es una puerta abierta hacia adelante.
-            return True
-        return num in pagado_por_num
+        return bool(num) and num in pagado_por_num
 
     compras_verificadas = {quien(e) for e in evs
                            if e.get('type') == 'purchase' and _venta_de_verdad(e) and quien(e)}
+    compras_sin_respaldo = {quien(e) for e in evs
+                            if e.get('type') == 'purchase' and not _venta_de_verdad(e)
+                            and quien(e)} - compras_verificadas
     pasos['purchase'] = compras_verificadas
     compras = len(compras_verificadas)
     for f in embudo:
@@ -11143,6 +11148,9 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
         # marcadas por la casa quedan fuera de los tres.
         'pedidos_reales': pedidos_reales,
         'pedidos_pagados': pedidos_pagados,
+        # Gente que llegó al final pero cuyo pedido no existe o es prueba de la casa.
+        # Se dice en voz alta: es la diferencia entre el embudo y la caja.
+        'compras_sin_pedido': len(compras_sin_respaldo),
         'por_origen': por_origen,
         'top_vistos': top_vistos,
         'sin_datos': len(evs) == 0,
