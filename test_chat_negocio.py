@@ -16,6 +16,7 @@ EL SOBRE, igual que `test_cotizador.py`.
   · Y el revés: en el del admin esos datos SÍ tienen que estar, o el chat no le
     sirve para lo único que él necesita.
 """
+import asyncio
 import os
 import re
 
@@ -859,3 +860,94 @@ def test_buscar_tambien_en_los_archivados(como):
     mio = next(c for c in chats if c['session_id'] == 's-viejo')
     assert mio['archivado'] is True
     assert 'gutiérrez' in mio['snippet'].lower()
+
+
+# =============================================================================
+#  EL ASESOR VE LOS PEDIDOS EN VIVO — y cada quien SOLO los suyos
+# =============================================================================
+#  Christián, 2026-08-05: «necesito que el asesor de negocios pueda ver en tiempo
+#  real TODO sobre clientes, sus nombres de pila, sus pedidos, sus números de guía,
+#  TODO, el status de sus pagos, envíos» — y «el distribuidor solo puede preguntar
+#  por sus clientes, claro».
+class _CursorPed:
+    def __init__(self, filas): self.filas = filas
+    def sort(self, *a, **k): return self
+    def limit(self, *a, **k): return self
+    async def to_list(self, length=None): return self.filas[:length]
+
+
+class _OrdersPed:
+    def __init__(self, filas): self.filas = filas; self.filtros = []
+    def find(self, filtro, *a, **k):
+        self.filtros.append(filtro)
+        if not filtro:
+            return _CursorPed(self.filas)
+        return _CursorPed([f for f in self.filas
+                        if all(f.get(k2) == v for k2, v in filtro.items())])
+
+
+class _DbPed:
+    def __init__(self, filas): self.orders = _OrdersPed(filas)
+
+
+PEDIDO_MIO = {
+    'order_number': 'EX-1', 'referred_by': 'dist-maria', 'total': 2316, 'paid': True,
+    'status': 'confirmado', 'tracking_number': 'ABC123', 'carrier': 'DHL',
+    'created_at': '2026-08-01T10:00:00', 'payment_method': 'spei',
+    'customer': {'full_name': 'Fabiola Hernández Rodríguez', 'phone': '5512345678',
+                 'email': 'fabiola@correo.test', 'city': 'Puebla', 'state': 'Puebla'},
+}
+PEDIDO_AJENO = {
+    'order_number': 'EX-2', 'referred_by': 'otro-dist', 'total': 999, 'paid': False,
+    'status': 'pendiente', 'created_at': '2026-08-02T10:00:00',
+    'customer': {'full_name': 'Cliente De Otro'},
+}
+
+
+def _bloque(user, admin):
+    return asyncio.run(chat_negocio.bloque_pedidos(
+        _DbPed([PEDIDO_MIO, PEDIDO_AJENO]), user, admin))
+
+
+def test_el_distribuidor_NO_ve_el_pedido_de_otro():
+    """⛔ EL CANDADO. Y se recorta en la CONSULTA: lo ajeno no llega ni al prompt."""
+    db = _DbPed([PEDIDO_MIO, PEDIDO_AJENO])
+    texto = asyncio.run(chat_negocio.bloque_pedidos(db, {'id': 'dist-maria'}, False))
+    assert 'EX-1' in texto
+    assert 'EX-2' not in texto and 'Cliente De Otro' not in texto
+    assert db.orders.filtros == [{'referred_by': 'dist-maria'}], (
+        'al distribuidor hay que pedirle a Mongo solo lo suyo, no filtrar despues')
+
+
+def test_el_admin_ve_todos_los_pedidos():
+    texto = _bloque({'id': 'admin'}, True)
+    assert 'EX-1' in texto and 'EX-2' in texto
+
+
+def test_sin_el_interruptor_solo_el_nombre_de_pila():
+    """Lo mismo que ve en su panel: nombre de pila y ni un dato de contacto."""
+    texto = _bloque({'id': 'dist-maria'}, False)
+    assert 'Fabiola' in texto
+    assert 'Hernández' not in texto
+    assert '5512345678' not in texto and 'fabiola@correo.test' not in texto
+
+
+def test_con_el_interruptor_si_ve_el_contacto_de_SUS_clientes():
+    texto = _bloque({'id': 'dist-maria', 've_datos_del_cliente': True}, False)
+    assert '5512345678' in texto and 'Puebla' in texto
+
+
+def test_le_dice_la_ETAPA_del_envio_no_el_estado_del_pedido():
+    """⛔ Con guía y sin salir, el asesor NO puede decir que va en camino."""
+    texto = _bloque({'id': 'admin'}, True)
+    assert 'envio: guia_generada' in texto
+    assert 'guia: DHL ABC123' in texto
+    assert 'NUNCA digas que un pedido va en camino' in texto
+
+
+def test_un_distribuidor_sin_codigo_no_saca_nada():
+    assert chat_negocio_sin_codigo() == ''
+
+
+def chat_negocio_sin_codigo():
+    return asyncio.run(chat_negocio.bloque_pedidos(_DbPed([PEDIDO_MIO]), {}, False))

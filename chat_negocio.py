@@ -307,6 +307,104 @@ def bloque_costos(proveedores, motor) -> str:
     return '\n\n'.join(partes)
 
 
+# ---------------------------------------------------------------------------
+#  LOS CLIENTES Y SUS PEDIDOS — lo que el asesor tiene que saber para contestar
+# ---------------------------------------------------------------------------
+# Christián, 2026-08-05: «necesito que el asesor de negocios pueda ver en tiempo
+# real TODO sobre clientes, sus nombres de pila, sus pedidos, sus números de guía,
+# TODO, TODO, TODO, el status de sus pagos, envíos, etc.»
+#
+# Y el candado, dicho por él en la misma conversación: «el distribuidor solo puede
+# preguntar por sus clientes, claro».
+#
+# ⛔ EL RECORTE SE HACE EN LA CONSULTA, NO EN EL PROMPT. Al distribuidor no se le
+# pide la lista entera para luego pedirle al modelo que se calle lo ajeno: se le
+# pregunta a Mongo SÓLO por los pedidos con su `referred_by`. Lo que no viaja no se
+# puede filtrar mal — es la misma regla que ya usa `_distributor_orders`.
+#
+# ⛔ Y EL CONTACTO VA POR EL INTERRUPTOR QUE YA EXISTE, no por uno nuevo. El admin
+# siempre; el distribuidor sólo si tiene `ve_datos_del_cliente` encendido (hoy, sólo
+# María). Si no lo tiene, el asesor sabe de sus pedidos y NO sabe el teléfono ni el
+# domicilio de nadie — exactamente lo mismo que ve en su panel.
+CAMPO_VE_CLIENTE = 've_datos_del_cliente'
+MAX_PEDIDOS = 60
+
+
+def _linea_de_pedido(o, ve_contacto: bool) -> str:
+    """Un pedido en un renglón, con la verdad del envío y sin adornos."""
+    import guias
+    c = o.get('customer') or {}
+    nombre = (c.get('full_name') or '').strip()
+    quien = nombre if ve_contacto else (nombre.split(' ')[0] if nombre else 'sin nombre')
+    partes = [
+        f"{o.get('order_number') or '?'}",
+        f"cliente: {quien or 'sin nombre'}",
+        f"fecha: {(o.get('created_at') or '')[:10]}",
+        f"total: {_pesos(o.get('total'))}",
+        f"pago: {'PAGADO' if o.get('paid') else 'NO PAGADO'}"
+        + (f" ({o.get('payment_method')})" if o.get('payment_method') else ''),
+        f"estado: {o.get('status') or 'pendiente'}",
+        # ⛔ LA ETAPA REAL, no el estado. «guia_generada» = hay guía y el paquete NO
+        # ha salido. El asesor NO puede decirle a nadie que algo va en camino si no
+        # ha salido: es la misma regla que el tablero y los correos.
+        f"envio: {guias.etapa_de_envio(o)}",
+    ]
+    if (o.get('tracking_number') or '').strip():
+        partes.append(f"guia: {o.get('carrier') or 'paqueteria sin identificar'} "
+                      f"{o['tracking_number']}")
+    else:
+        partes.append('guia: todavia no tiene')
+    if o.get('shipped_at'):
+        partes.append(f"salio: {str(o['shipped_at'])[:10]}")
+    if o.get('delivered_at'):
+        partes.append(f"entregado: {str(o['delivered_at'])[:10]}")
+    if ve_contacto:
+        for etiqueta, clave in (('tel', 'phone'), ('correo', 'email')):
+            if c.get(clave):
+                partes.append(f"{etiqueta}: {c[clave]}")
+        destino = ', '.join(x for x in (c.get('city'), c.get('state')) if x)
+        if destino:
+            partes.append(f"destino: {destino}")
+    return '  - ' + ' · '.join(partes)
+
+
+async def bloque_pedidos(db, user, admin: bool) -> str:
+    """Los pedidos que quien pregunta PUEDE ver, con su estado de pago y de envío.
+
+    Admin: todos. Distribuidor: sólo los suyos, recortado en la consulta.
+    """
+    if db is None:
+        return ''
+    filtro = {} if admin else {'referred_by': (user or {}).get('id')}
+    if not admin and not filtro.get('referred_by'):
+        return ''                     # sin código no hay pedidos suyos que enseñar
+    # `to_list` y no `async for`: es como lee el resto de la casa (y como saben
+    # contestar los dobles de las pruebas). Si la consulta falla por lo que sea, el
+    # asesor se queda sin este bloque pero sigue contestando lo demas.
+    try:
+        cursor = db.orders.find(filtro, {'_id': 0}).sort('created_at', -1).limit(MAX_PEDIDOS)
+        pedidos = await cursor.to_list(length=MAX_PEDIDOS)
+    except Exception:
+        return ''
+    if not pedidos:
+        return ''
+    ve_contacto = bool(admin or (user or {}).get(CAMPO_VE_CLIENTE))
+    encabezado = (
+        'PEDIDOS Y CLIENTES (datos EN VIVO, del momento de esta pregunta).\n'
+        'Son ' + ('TODOS los pedidos de la tienda.' if admin
+                  else 'UNICAMENTE los pedidos de TUS clientes.') + '\n'
+        '⛔ COMO LEER "envio": sin_guia = no hay guia todavia · guia_generada = HAY '
+        'guia pero el paquete NO HA SALIDO · enviado = ya salio · entregado = llego. '
+        'NUNCA digas que un pedido va en camino si su envio dice guia_generada: '
+        'la guia es un papel impreso, no un paquete en movimiento.')
+    if not ve_contacto:
+        encabezado += ('\n⛔ De cada cliente sabes su NOMBRE DE PILA y nada mas. No '
+                       'tienes telefono, correo ni domicilio: si te los piden, di que '
+                       'esos datos no estan en tu panel.')
+    return encabezado + '\n' + '\n'.join(
+        _linea_de_pedido(o, ve_contacto) for o in pedidos)
+
+
 def bloque_compuestos(pregunta) -> str:
     """Las fichas de los compuestos QUE LA PREGUNTA PIDE, más la guía de /aprende
     que le toque y la aritmética de la calculadora.
@@ -367,6 +465,13 @@ async def armar_contexto(db, user, productos, tope_de=None, language=None,
     compuestos = bloque_compuestos(pregunta)
     if compuestos:
         partes.append(compuestos)
+
+    # LOS PEDIDOS EN VIVO. Va para los DOS roles, pero NO con los mismos pedidos: al
+    # distribuidor la consulta ya le devuelve sólo los suyos (`referred_by`), así que
+    # lo ajeno no llega ni al prompt. El interruptor de contacto se respeta adentro.
+    pedidos = await bloque_pedidos(db, user, admin)
+    if pedidos:
+        partes.append(pedidos)
 
     # ⛔ EL CANDADO. Un distribuidor no llega ni a la consulta.
     if admin:
