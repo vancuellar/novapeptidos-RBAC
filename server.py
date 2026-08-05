@@ -9365,12 +9365,37 @@ async def business_chat_history(session_id: str, user=Depends(get_current_distri
 # ----------------- Startup: seed -----------------
 # Handle del barrido de carritos, para poder cancelarlo al apagar.
 _TAREA_RECUPERACION = None
+_TAREA_REINTENTO_GUIAS = None
+# El mismo tratamiento para el reintento de guías: su bucle duerme 600 segundos y
+# una tarea dormida que nadie cancela deja el apagado esperándola. Sin esto, UNA
+# sola prueba (`test_microsoft_config_endpoint_apagado`, que abre y cierra la app
+# con `with TestClient(app)`) se llevaba **121 de los 132 segundos** de toda la
+# suite: el 92% del tiempo era el apagado esperando a un `sleep` de diez minutos.
+# Medido el 2026-08-05, buscando por qué publicar tardaba tanto.
+
+
+def _en_pruebas() -> bool:
+    """¿Estamos dentro de pytest?
+
+    ⛔ POR QUÉ HACE FALTA. Los eventos de arranque de la app hablan con Mongo, y en
+    las pruebas no hay Mongo: cada uno se queda esperando su tiempo de espera. Una
+    sola prueba que abre y cierra la app (`with TestClient(app)`) tardaba **121 de
+    los 132 segundos** de la suite entera — el 92% del reloj era arranque esperando
+    a una base que no existe. Medido el 2026-08-05, buscando por qué publicar tardaba.
+
+    Se mira `PYTEST_CURRENT_TEST`, que pytest pone solo: no hay que acordarse de
+    encender nada, y en producción la variable no existe, así que el arranque real
+    no cambia ni una línea.
+    """
+    return bool(os.environ.get('PYTEST_CURRENT_TEST'))
 
 
 @app.on_event('startup')
 async def arrancar_recuperacion():
     """Cada 15 minutos revisa los carritos abandonados y manda LA oferta a quien
     ya lleva una hora sin cerrar. Una vez por carrito, nunca dos."""
+    if _en_pruebas():
+        return
     async def bucle():
         while True:
             await asyncio.sleep(900)
@@ -9435,7 +9460,14 @@ async def _reintentar_guias_pendientes() -> int:
 
 @app.on_event('startup')
 async def arrancar_reintento_de_guias():
-    """Cada 10 minutos reintenta las guías que no se pudieron comprar."""
+    """Cada 10 minutos reintenta las guías que no se pudieron comprar.
+
+    ⛔ LA TAREA SE GUARDA PARA PODER MATARLA, igual que el barrido de carritos.
+    Sin la referencia, al apagar la app el grupo de tareas de anyio ESPERA a que
+    el `sleep(600)` termine. En producción no se nota —el proceso muere entero—
+    pero en las pruebas cada `with TestClient(app)` colgaba dos minutos."""
+    if _en_pruebas():
+        return
     async def bucle():
         while True:
             await asyncio.sleep(600)
@@ -9443,7 +9475,8 @@ async def arrancar_reintento_de_guias():
                 await _reintentar_guias_pendientes()
             except Exception:
                 logger.exception('Fallo el reintento de guias pendientes')
-    asyncio.create_task(bucle())
+    global _TAREA_REINTENTO_GUIAS
+    _TAREA_REINTENTO_GUIAS = asyncio.create_task(bucle())
 
 
 @app.on_event('startup')
@@ -9465,6 +9498,8 @@ async def reanclar_comisiones_en_la_base():
     Corre sola al arrancar y UNA sola vez: la marca se toma con un upsert atómico,
     así que si dos procesos arrancan a la vez sólo uno la aplica.
     """
+    if _en_pruebas():
+        return
     MARCA = 'reancla-comision-30-2026-07-30'
     try:
         tomada = await db.migraciones.update_one(
@@ -9516,6 +9551,8 @@ async def avisos_de_ventas_atrasados():
     No hace falta que sea perfecto ni que corra siempre: `avisar_de_la_venta` deduplica
     por número de pedido, así que aunque se repitiera no ensucia nada.
     """
+    if _en_pruebas():
+        return
     MARCA = 'avisos-de-venta-atrasados-2026-07-30'
     try:
         tomada = await db.migraciones.update_one(
@@ -9547,6 +9584,8 @@ async def avisos_de_venta_apuntan_al_cliente():
     únicos avisos de venta que existen hoy serían justo los que no llevan a la persona.
 
     Una sola vez, con marca en `migraciones`, y sin tocar nada más del aviso."""
+    if _en_pruebas():
+        return
     MARCA = 'avisos-de-venta-con-cliente-2026-07-30'
     try:
         tomada = await db.migraciones.update_one(
@@ -9578,6 +9617,8 @@ async def avisos_de_venta_apuntan_al_cliente():
 
 @app.on_event('startup')
 async def seed_db():
+    if _en_pruebas():
+        return
     try:
         # Llaves de pasarelas que Christian pegó desde el Admin. El .env manda,
         # así que esto solo llena lo que no venga del entorno. Ver secretos.py.
@@ -9629,15 +9670,16 @@ async def apagar_recuperacion():
     Es el par de `arrancar_recuperacion`: su bucle duerme 900 segundos entre
     vuelta y vuelta, y una tarea dormida que nadie cancela deja el apagado
     esperandola."""
-    tarea = _TAREA_RECUPERACION
-    if tarea is not None and not tarea.done():
+    for tarea in (_TAREA_RECUPERACION, _TAREA_REINTENTO_GUIAS):
+        if tarea is None or tarea.done():
+            continue
         tarea.cancel()
         try:
             await tarea
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.exception('El barrido de carritos murio raro al apagar')
+            logger.exception('Una tarea de fondo murio raro al apagar')
 
 
 @app.on_event('shutdown')
