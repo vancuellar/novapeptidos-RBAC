@@ -61,3 +61,51 @@ def se_puede_barrer(order) -> bool:
     (nadie barre lo que no marcó) y que no enseñe ninguna señal de venta real.
     """
     return bool(order) and order.get('es_prueba') is True and not senales_de_venta_real(order)
+
+
+# ==========================================================================
+#  USUARIOS DE PRUEBA — el barrido de las cuentas que dejan las corridas E2E
+# ==========================================================================
+#
+# Christián, 2026-08-05: «¿Puedes borrar los usuarios de prueba que se llaman E2E
+# Guia (prueba)?» — y enseguida, mejor: «o dame un botón para borrarlos y yo lo
+# hago». Esto es ese botón.
+#
+# Cada corrida de `npm run e2e:*` crea su cuenta desechable y la deja ahí. Con el
+# tiempo el padrón de clientes se llena de gente que no existe, y eso ensucia
+# cualquier número de negocio que se cuente por usuarios.
+#
+# ⛔ MISMA FILOSOFÍA QUE EL BARRIDO DE PEDIDOS: no se borra por parecerse a una
+# prueba, se borra por NO tener nada real colgando. El nombre es sólo el filtro de
+# entrada; el candado de verdad es que no haya un pedido detrás.
+
+# El correo que se inventan los guiones E2E. Es el ÚNICO patrón que entra al
+# barrido: una cuenta que no lo cumpla no se mira siquiera, por más sospechosa que
+# parezca. Los guiones usan `e2e.<algo>@` (con o sin `+etiqueta` de Gmail).
+PATRON_CORREO_E2E = r'(^|\+)e2e\.'
+
+# Roles que NUNCA se barren, aunque el correo cuadre y no tengan pedidos. Un admin
+# o una distribuidora con el correo raro sigue siendo una persona con acceso.
+ROLES_INTOCABLES = ('admin', 'distributor', 'marketing')
+
+
+def razones_para_conservar(user, pedidos) -> list:
+    """Por qué NO se puede borrar esta cuenta. Vacío = se puede barrer.
+
+    `pedidos` son los pedidos de ese usuario, ya consultados por quien llama.
+    """
+    razones = []
+    if (user or {}).get('role') in ROLES_INTOCABLES:
+        razones.append(f"tiene rol {user.get('role')}")
+    for o in (pedidos or []):
+        # Se reusa EXACTAMENTE el mismo juez que protege a los pedidos: si un pedido
+        # suyo no se podría barrer, su dueño tampoco. Un candado, no dos copias.
+        motivos = senales_de_venta_real(o)
+        if motivos:
+            razones.append(f"su pedido {o.get('order_number')} es venta real "
+                           f"({', '.join(motivos)})")
+    if pedidos and not razones:
+        # Sin señales de venta, pero con pedidos: se conserva igual. Borrar al dueño
+        # dejaría pedidos huérfanos, y un pedido sin cliente no se puede ni leer.
+        razones.append(f'tiene {len(pedidos)} pedido(s) colgando')
+    return razones

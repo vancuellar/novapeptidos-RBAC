@@ -4980,6 +4980,58 @@ class BarridoDePruebas(BaseModel):
     simulacro: bool = True
 
 
+@api_router.post('/admin/users/barrer-pruebas')
+async def admin_barrer_usuarios_de_prueba(payload: BarridoDePruebas,
+                                          admin=Depends(get_current_admin)):
+    """BARRE las cuentas desechables que dejan las corridas E2E.
+
+    Christian, 2026-08-05: «o dame un boton para borrarlos y yo lo hago». Cada
+    `npm run e2e:*` crea su cuenta y la deja ahi; con el tiempo el padron de
+    clientes se llena de gente que no existe y ensucia cualquier numero que se
+    cuente por usuarios.
+
+    Tres candados, calcados del barrido de pedidos:
+
+      1. Solo mira cuentas cuyo CORREO cuadra con el patron de los guiones E2E
+         (`pruebas.PATRON_CORREO_E2E`). Una cuenta que no lo cumpla no se mira,
+         por sospechosa que parezca. No hay «borrar todos los que no compraron».
+      2. Aparta a quien tenga cualquier cosa colgando: rol de admin, distribuidor
+         o marketing, o CUALQUIER pedido — y con mas razon si ese pedido enseña
+         señal de venta real. Se reusa `senales_de_venta_real`, el MISMO juez que
+         protege a los pedidos: un candado, no dos copias que se separan.
+      3. Por omision es SIMULACRO: contesta que haria y no toca nada. Borra de
+         verdad solo con `simulacro: false`.
+
+    ⛔ Y NO BORRA PEDIDOS, NUNCA. Si una cuenta tiene aunque sea uno, se conserva:
+    borrar al dueño dejaria pedidos huerfanos, y un pedido sin cliente no se puede
+    ni leer. Los pedidos tienen su propio barrido, con sus propios candados.
+    """
+    deny_view_as(admin)
+    candidatos = await db.users.find(
+        {'email': {'$regex': pruebas.PATRON_CORREO_E2E, '$options': 'i'}},
+        {'_id': 0}).to_list(500)
+    barrer, protegidos = [], []
+    for u in candidatos:
+        pedidos = await db.orders.find({'user_id': u.get('id')}, {'_id': 0}).to_list(50)
+        razones = pruebas.razones_para_conservar(u, pedidos)
+        ficha = {'id': u.get('id'), 'email': u.get('email'),
+                 'nombre': u.get('full_name') or '', 'alta': u.get('created_at')}
+        if razones:
+            protegidos.append({**ficha, 'motivos': razones})
+        else:
+            barrer.append(ficha)
+    if payload.simulacro:
+        return {'simulacro': True, 'barreria': barrer, 'protegidos': protegidos}
+    borrados = 0
+    for u in barrer:
+        r = await db.users.delete_one({'id': u['id']})
+        borrados += r.deleted_count
+    logger.info('Barrido de usuarios de prueba: %s borrados, %s protegidos',
+                borrados, len(protegidos))
+    return {'simulacro': False, 'borrados': borrados,
+            'barridos': barrer, 'protegidos': protegidos}
+
+
 @api_router.post('/admin/orders/barrer-pruebas')
 async def admin_barrer_pruebas(payload: BarridoDePruebas, admin=Depends(get_current_admin)):
     """BARRE los pedidos marcados como prueba. No puede llevarse una venta de verdad.

@@ -267,3 +267,60 @@ def test_el_barrido_solo_mira_los_marcados():
     cuerpo = src.split('async def admin_barrer_pruebas(')[1].split('\n@api_router')[0]
     assert "{'es_prueba': True}" in cuerpo, 'el barrido dejó de filtrar por la etiqueta'
     assert 'senales_de_venta_real' in cuerpo, 'se fue el segundo filtro'
+
+
+# =============================================================================
+#  BARRIDO DE USUARIOS DE PRUEBA — el botón que pidió Christián (2026-08-05)
+# =============================================================================
+#  «¿Puedes borrar los usuarios de prueba que se llaman E2E Guia (prueba)?» …
+#  «o dame un botón para borrarlos y yo lo hago».
+#
+#  Lo que estas pruebas cuidan NO es que borre, sino que NO se lleve a nadie por
+#  delante. Un cliente borrado no se recupera.
+import pruebas as _pruebas
+
+
+def test_solo_entran_los_correos_de_los_guiones_E2E():
+    """El nombre es el filtro de entrada, y es estrecho a propósito: no existe
+    «borrar a todos los que no compraron»."""
+    import re
+    pat = re.compile(_pruebas.PATRON_CORREO_E2E, re.I)
+    assert pat.search('e2e.guia.af7a4c@example.com')
+    assert pat.search('christiancuellar+e2e.guia.e356a5@gmail.com')
+    # Y NO entra gente de verdad, por más que su correo tenga letras parecidas.
+    for real in ('fabiola@gmail.com', 'e2ehermanos@gmail.com', 'jose.e2@empresa.mx',
+                 'contacto@we2e.com'):
+        assert not pat.search(real), f'iba a barrer a {real}'
+
+
+def test_un_usuario_con_UN_pedido_NO_se_borra_aunque_no_haya_pagado():
+    """⛔ Borrar al dueño dejaría pedidos huérfanos, y un pedido sin cliente no se
+    puede ni leer. Con pedidos, se conserva. Punto."""
+    razones = _pruebas.razones_para_conservar(
+        {'role': 'user'}, [{'order_number': 'EX-1', 'status': 'pendiente'}])
+    assert razones and 'colgando' in razones[0]
+
+
+def test_un_usuario_con_VENTA_REAL_se_protege_y_dice_por_que():
+    razones = _pruebas.razones_para_conservar(
+        {'role': 'user'}, [{'order_number': 'EX-9', 'paid': True, 'status': 'enviado'}])
+    assert any('venta real' in r for r in razones)
+    assert any('EX-9' in r for r in razones)
+
+
+def test_un_admin_o_distribuidor_NUNCA_se_barre():
+    """Aunque el correo cuadre y no tenga un solo pedido: sigue siendo alguien con
+    acceso al sistema."""
+    for rol in ('admin', 'distributor', 'marketing'):
+        assert _pruebas.razones_para_conservar({'role': rol}, [])
+
+
+def test_la_cuenta_desechable_y_vacia_SI_se_barre():
+    """El caso real: las tres que dejaron las corridas del 3-ago, con cero pedidos."""
+    assert _pruebas.razones_para_conservar({'role': 'user'}, []) == []
+
+
+def test_reusa_EL_MISMO_juez_que_protege_a_los_pedidos():
+    """Un candado, no dos copias que se separan con el tiempo."""
+    import inspect
+    assert 'senales_de_venta_real' in inspect.getsource(_pruebas.razones_para_conservar)
