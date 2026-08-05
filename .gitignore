@@ -96,3 +96,7 @@ credentials.json
 # Estado del ultimo despliegue (imagen + commit para la marcha atras).
 # Lo escribe deploy.sh en el servidor; es local de cada maquina.
 .despliegue-anterior
+
+# La marca del último publicado que escribe ../publicar.sh (--rapido la lee).
+# Es LOCAL a esta máquina: lo que está en vivo no es un hecho del repo.
+.ultimo-publicado
