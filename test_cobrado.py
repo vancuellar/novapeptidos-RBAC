@@ -320,6 +320,51 @@ def test_el_embudo_le_cree_a_un_evento_viejo_sin_numero_de_pedido():
     assert r['compras_sin_pedido'] == 1
 
 
+def test_el_desglose_por_origen_no_puede_vender_mas_que_el_embudo():
+    """⛔ EL EMBUDO QUEDÓ ARREGLADO A MEDIAS Y NADIE LO VIO EN UN DÍA (2026-08-05).
+
+    El 4-ago se arregló el último escalón del embudo y el ingreso: se verifican contra
+    `orders`. Pero el desglose POR ORIGEN, veinte líneas más abajo en el MISMO endpoint,
+    se quedó contando el evento del navegador a secas —`compras.add(session_id)`, sin
+    pasar por `_venta_de_verdad`— y su `_estado_del_evento` seguía tratando un evento SIN
+    número de pedido como «cobrado», justo la regla que la mitad de arriba ya había
+    tirado. Resultado medido en la base viva: el panel decía arriba «3 compras, $13,320»
+    y abajo «directo: 20 compras, $87,193». Los $87,193 son EXACTAMENTE la cifra falsa
+    que Christián había cachado el día anterior.
+
+    Esta prueba fija el invariante que lo hace imposible: **ningún canal, ni todos
+    juntos, pueden declarar más compras ni más dinero que el total verificado.** Es una
+    desigualdad y no una igualdad a propósito: un mismo pedido puede tener eventos de dos
+    orígenes distintos, y ahí la suma por canal queda por debajo, nunca por encima.
+    """
+    fantasma = _evento('purchase', 's9', value=87193.0)          # sin número: no existe
+    doble = _evento('purchase', 's8', value=COBRADO_REAL,        # el mismo pedido, otra vez
+                    order_number=PAZ['order_number'])
+    base = _Base(
+        orders=[PAZ, ALANIS],
+        events=[_evento('visit', 's1'), _evento('visit', 's2'),
+                _evento('visit', 's8'), _evento('visit', 's9'),
+                _evento('purchase', 's1', value=COBRADO_REAL,
+                        order_number=PAZ['order_number']),
+                _evento('purchase', 's2', value=FIADO,
+                        order_number=ALANIS['order_number']),
+                doble, fantasma])
+    r = _con_base(base, lambda: server.admin_funnel(days=30, admin={'email': 'a@b.c'}))
+
+    compras_arriba = next(p for p in r['embudo'] if p['paso'] == 'purchase')['personas']
+    compras_por_canal = sum(o['compras'] for o in r['por_origen'])
+    assert compras_por_canal <= compras_arriba, (
+        f'los canales declaran {compras_por_canal} compras y el embudo verificó '
+        f'{compras_arriba}: el desglose cuenta eventos sin pedido o pedidos dobles')
+
+    dinero_por_canal = sum(o['ingreso'] + o['por_cobrar'] for o in r['por_origen'])
+    assert dinero_por_canal <= r['ingreso'] + r['por_cobrar'], (
+        f'los canales declaran ${dinero_por_canal:,.0f} y los pedidos dicen '
+        f'${r["ingreso"] + r["por_cobrar"]:,.0f}')
+    # Y el fantasma no se cuela por ningún lado: ni como compra ni como peso.
+    assert all(o['ingreso'] < 87193 for o in r['por_origen'])
+
+
 # ------------------------------------------------------ fichas de cliente
 def test_la_ficha_del_cliente_no_dice_que_pago_lo_que_debe():
     base = _base_con_los_dos()

@@ -11031,15 +11031,20 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
     nums = {e.get('order_number') for e in evs
             if e.get('type') == 'purchase' and e.get('order_number')}
     pagado_por_num = {}
+    # El MONTO real de cada pedido, para que el dinero por canal salga de `orders` igual
+    # que el total. Ver `por_origen` más abajo para por qué el `value` del evento no sirve.
+    dinero_por_num = {}
     if nums:
         docs = await db.orders.find({'order_number': {'$in': list(nums)}},
                                     {'_id': 0, 'order_number': 1, 'status': 1,
-                                     'paid': 1, 'es_prueba': 1}).to_list(20000)
+                                     'paid': 1, 'es_prueba': 1, 'total': 1}).to_list(20000)
         # ⛔ LAS PRUEBAS DE LA CASA NO SON VENTAS (Christián, 2026-08-04: «sólo 3
         # personas han comprado; los otros han sido nuestras pruebas»). Un pedido
         # marcado como prueba se trata igual que uno borrado: no es ingreso, no es
         # deuda y NO es una compra del embudo.
         pagado_por_num = {d['order_number']: esta_pagado(d)
+                          for d in docs if not d.get('es_prueba')}
+        dinero_por_num = {d['order_number']: (cobrado_de(d), por_cobrar_de(d))
                           for d in docs if not d.get('es_prueba')}
 
     # ⛔ LAS COMPRAS DEL EMBUDO SE VERIFICAN CONTRA LOS PEDIDOS. Antes se contaba
@@ -11084,13 +11089,22 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
         la cuenta. Un pedido borrado no es ingreso NI cuenta por cobrar —no hay a quién
         cobrarle— así que no entra en ninguna de las dos cifras; se cuenta aparte.
 
-        Sin número de pedido no hay nada contra qué verificar (eventos de antes de que
-        el número viajara): se cree, porque es lo único que hay de esa época.
+        ⛔ SIN NÚMERO DE PEDIDO ES FANTASMA, NO COBRADO. Aquí decía «se cree, porque es lo
+        único que hay de esa época», y eso CONTRADECÍA a `_venta_de_verdad`, que unas
+        líneas arriba ya había dejado de creerle a los eventos sin número por esta misma
+        razón («SIN PEDIDO NO HAY VENTA, punto»). El arreglo del 2026-08-04 se aplicó al
+        embudo de arriba y se quedó sin aplicar aquí, así que el desglose POR ORIGEN siguió
+        publicando los números viejos: el 2026-08-05 el panel enseñaba «directo: 20 compras
+        y $87,193 de ingreso» cuando el negocio entero tenía 5 pedidos y $13,320 cobrados.
+        Los $87,193 son EXACTAMENTE la cifra que Christián cachó como falsa el día
+        anterior — seguía viva en la mitad de abajo del mismo endpoint.
+
+        Dos cuentas de la misma cosa en el mismo archivo con reglas distintas es peor que
+        una cuenta mala: se corrige la de arriba y la de abajo sigue mintiendo con la
+        autoridad de estar al lado de la corregida.
         """
         num = e.get('order_number')
-        if not num:
-            return 'cobrado'
-        if num not in pagado_por_num:
+        if not num or num not in pagado_por_num:
             return 'fantasma'
         return 'cobrado' if pagado_por_num[num] else 'por_cobrar'
 
@@ -11142,14 +11156,32 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
         if e.get('type') == 'visit':
             o['visitas'].add(e.get('session_id'))
         if e.get('type') == 'purchase':
-            o['compras'].add(e.get('session_id'))
-            # Mismo candado que arriba: por origen tampoco se cuenta como ingreso
-            # una venta que no se cobró. Si no, el ROAS de un canal se infla con fiado.
-            estado_e = _estado_del_evento(e)
-            if estado_e == 'cobrado':
-                o['ingreso'] += float(e.get('value', 0) or 0)
-            elif estado_e == 'por_cobrar':
-                o['por_cobrar'] += float(e.get('value', 0) or 0)
+            # ⛔ LAS COMPRAS DE UN CANAL SE CUENTAN POR PEDIDO VERIFICADO, no por sesión
+            # con un evento. Aquí se hacía `o['compras'].add(session_id)` sin pasar por
+            # `_venta_de_verdad`, así que el desglose por origen contaba las pruebas
+            # barridas de la casa Y contaba dos veces al mismo pedido cuando la página de
+            # gracias se recargaba en otra sesión: el 2026-08-05 «directo» declaraba 20
+            # compras con 5 pedidos en toda la base. Es el MISMO candado que el último
+            # escalón del embudo ya usaba veinte líneas más arriba; sólo faltaba aquí.
+            #
+            # Se guarda el `order_number` y no la sesión por la misma razón que arriba: una
+            # venta es UN pedido, aunque se dispare desde tres aparatos.
+            if not _venta_de_verdad(e):
+                continue
+            num = e.get('order_number')
+            if num in o['compras']:
+                continue                      # el mismo pedido ya contó en este canal
+            o['compras'].add(num)
+            # ⛔ EL DINERO POR CANAL TAMBIÉN SALE DE `orders`, NO DEL `value` DEL EVENTO.
+            # Aquí se sumaba lo que el navegador pegó en el evento, y eso mentía por dos
+            # lados: (1) una recarga de la página de gracias mandaba el evento otra vez y
+            # el monto se sumaba DOS veces —medido: el mismo pedido de $3,347 dejaba
+            # $6,694 en su canal—, y (2) el monto del navegador no tiene por qué coincidir
+            # con lo que se cobró. El total de arriba ya se arregló así el 4-ago
+            # («EL DINERO SALE DE LOS PEDIDOS»); esta mitad se quedó sin arreglar.
+            cobrado_n, deuda_n = dinero_por_num.get(num, (0.0, 0.0))
+            o['ingreso'] += cobrado_n
+            o['por_cobrar'] += deuda_n
     por_origen = sorted(
         [{'origen': v['origen'], 'visitas': len(v['visitas']), 'compras': len(v['compras']),
           'ingreso': round(v['ingreso']), 'por_cobrar': round(v['por_cobrar']),
