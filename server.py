@@ -11016,11 +11016,17 @@ async def admin_funnel(days: int = 30, admin=Depends(get_current_marketing)):
         num = e.get('order_number')
         return bool(num) and num in pagado_por_num
 
-    compras_verificadas = {quien(e) for e in evs
-                           if e.get('type') == 'purchase' and _venta_de_verdad(e) and quien(e)}
+    # ⛔ EL PASO DE COMPRA CUENTA PEDIDOS, NO PERSONAS. Los demás pasos sí son
+    # gente (nadie «visita» dos veces desde dos aparatos a la vez), pero una venta
+    # es UN pedido: cuando Christián probaba el checkout desde el teléfono y la
+    # computadora, o en incógnito, el mismo pedido aparecía como varias compras y
+    # el embudo enseñaba 15 con 5 pedidos en la base. Contando pedidos, el último
+    # escalón del embudo cuadra con la caja — que es la única forma de que sirva.
+    compras_verificadas = {e.get('order_number') for e in evs
+                           if e.get('type') == 'purchase' and _venta_de_verdad(e)}
     compras_sin_respaldo = {quien(e) for e in evs
                             if e.get('type') == 'purchase' and not _venta_de_verdad(e)
-                            and quien(e)} - compras_verificadas
+                            and quien(e)}
     pasos['purchase'] = compras_verificadas
     compras = len(compras_verificadas)
     for f in embudo:
