@@ -109,6 +109,7 @@ import etiquetas
 # (src/lib/paqueteria.js); ver guias.py.
 import basura
 import guias
+import turnstile
 # EL RASTREO DENTRO DE NUESTRA PÁGINA. La paquetería no se deja enmarcar
 # (`x-frame-options: SAMEORIGIN`), así que le pedimos los eventos a su API y los
 # pintamos nosotros. Vive aparte y sólo lee; ver rastreo.py.
@@ -4304,6 +4305,14 @@ async def create_order(payload: OrderCreate, request: Request = None,
     doc = order.model_dump()
     motivos = basura.senales(payload.customer.model_dump()
                              if hasattr(payload.customer, 'model_dump') else payload.customer)
+    # ⛔ EL ESCUDO SUMA SEÑALES, NO RECHAZA. Un token que no valida es evidencia
+    # fuerte de bot, pero una red intermitente o un bloqueador agresivo lo rompen
+    # igual — y ésos son clientes. Vale por el umbral completo, así que un fallo
+    # basta para apagarle el ruido al pedido; la venta sigue viva (`turnstile.py`).
+    escudo = turnstile.verificar(payload.turnstile_token or '',
+                                 (request.headers.get('cf-connecting-ip') if request else '') or '')
+    if not escudo['ok']:
+        motivos += [f"no paso el escudo antibots ({escudo['motivo']})"] * turnstile.SENALES_SI_FALLA
     doc['basura'] = len(motivos) >= basura.MINIMO_SENALES
     doc['basura_motivos'] = motivos
     # ⛔ DE DÓNDE VINO. No se guardaba NADA: ni IP ni navegador, así que cuando llegaron

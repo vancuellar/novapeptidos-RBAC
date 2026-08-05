@@ -49,6 +49,11 @@ PERMITIDAS = {
     # se comporta igual que hoy: se cotiza y se compra sólo con Skydropx.
     'ENVIOSINT_CLIENT_ID',
     'ENVIOSINT_CLIENT_SECRET',
+    # Turnstile (Cloudflare): el escudo antibots del checkout. No cobra ni cotiza;
+    # vive aquí por lo mismo que las demás — para poder pegarla desde el teléfono.
+    # La PÚBLICA (sitekey) NO va aquí: esa se publica en el HTML a propósito, no es
+    # secreto. Aquí sólo la que valida del lado del servidor.
+    'TURNSTILE_SECRET_KEY',
     # El motor del chat. No cobra ni cotiza: vive aquí por lo mismo que las
     # demás — para poder pegarlo desde el teléfono. Mientras no estén, el chat
     # sigue con Gemini exactamente como hoy (ver `modelo_ia.py`).

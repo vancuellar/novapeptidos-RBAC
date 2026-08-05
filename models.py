@@ -259,6 +259,10 @@ class OrderCreate(BaseModel):
     # servidor va por el precio a la cotización que ÉL guardó. Ver `shipping_quotes`
     # en server.py. Lo que el navegador mande en `shipping` se sigue ignorando.
     shipping_quote_id: Optional[str] = None
+    # ⛔ EL ESCUDO ANTIBOTS (Turnstile de Cloudflare). Lo pone el navegador solo; el
+    # cliente no ve nada. Si viene vacío o no valida NO se rechaza la compra: cuenta
+    # como señal de basura y se le apaga el ruido (ver `turnstile.py`).
+    turnstile_token: Optional[str] = None
     # ⛔ EL CLIENTE YA NO ESCOGE PAQUETERÍA (Christián, 2026-08-02): escoge el TIPO.
     # ESTÁNDAR (3-5 días hábiles, $250 o incluido según el importe) o EXPRESS
     # (1-2 días hábiles, +$150 SIEMPRE). Del navegador viaja sólo esta bandera;
