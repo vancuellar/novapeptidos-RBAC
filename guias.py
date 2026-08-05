@@ -77,3 +77,56 @@ def paqueteria_de(numero) -> str:
     """El nombre de la paquetería, o '' si no se puede saber. Atajo para quien sólo
     quiere el nombre y no le importa qué tan seguro es."""
     return detectar(numero).get('quien', '')
+
+
+# ==========================================================================
+#  ⛔ EN QUÉ VA EL ENVÍO — y por qué «enviado» no puede mentir
+# ==========================================================================
+#
+# Christián, 2026-08-05: «No puede aparecer un envío como enviado a menos que en
+# verdad se haya enviado. Puede aparecer como guía generada, pero por ejemplo el
+# de Fabiola aún no lo envío yo».
+#
+# Antes había DOS cosas metidas en una sola palabra: comprar/capturar la guía
+# empujaba el pedido a `enviado`. Comprar la guía es un trámite de escritorio —el
+# paquete sigue en la mesa—; enviar es soltarlo en el mostrador de la paquetería.
+# Con las dos pegadas, el tablero daba por salido lo que nadie había movido, y
+# quien despacha perdía la única lista que le importa: lo que falta por sacar.
+#
+# ⛔ NO ES UN ESTADO NUEVO EN LA BASE, A PROPÓSITO. Meter `guia_generada` al
+# vocabulario obligaba a tocar `loyalty.PAID_STATUSES`, `cobrado.ESTADOS_PAGADOS`,
+# `coa_store.PAID_STATUSES` y los filtros de media docena de pantallas — y cada uno
+# de esos es una decisión de dinero. Se DEDUCE de lo que ya está guardado, que
+# además es lo honesto: la verdad de si algo salió es `shipped_at`, no una etiqueta.
+ETAPAS = ('sin_guia', 'guia_generada', 'enviado', 'entregado')
+
+
+def etapa_de_envio(order: dict) -> str:
+    """En qué va el envío de este pedido, sin inventar nada.
+
+      · `sin_guia`       — todavía no hay número que enseñar.
+      · `guia_generada`  — hay guía (comprada o tecleada) y el paquete NO ha salido.
+                           Éste es el cajón donde vive el pedido de Fabiola.
+      · `enviado`        — alguien dijo que salió. Es lo único que autoriza decir
+                           «va en camino», y trae su `shipped_at`.
+      · `entregado`      — llegó.
+
+    Se lee del pedido tal como está guardado: no escribe, no adivina y no depende de
+    que alguien haya apretado el botón correcto en el orden correcto.
+    """
+    if not order:
+        return 'sin_guia'
+    estado = (order.get('status') or '').strip()
+    if estado == 'entregado' or order.get('delivered_at'):
+        return 'entregado'
+    if estado == 'enviado' or order.get('shipped_at'):
+        return 'enviado'
+    if (order.get('tracking_number') or '').strip():
+        return 'guia_generada'
+    return 'sin_guia'
+
+
+def ya_salio(order: dict) -> bool:
+    """¿El paquete SALIÓ de verdad? Para todo lo que le promete movimiento a alguien
+    —correos, campanita, tablero del asesor— la pregunta es ésta y no «¿tiene guía?»."""
+    return etapa_de_envio(order) in ('enviado', 'entregado')

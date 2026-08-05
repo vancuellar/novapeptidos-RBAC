@@ -35,6 +35,7 @@ os.environ.setdefault('DB_NAME', 'exygen_test')
 
 import auth
 import etiquetas
+import guias
 import server
 
 
@@ -245,11 +246,22 @@ def test_al_distribuidor_no_le_viaja_la_liga_del_proveedor(mundo, como):
     assert ficha['tiene_etiqueta'] is True
 
 
-def test_una_guia_tecleada_a_mano_no_ofrece_boton(mundo, como):
-    """No la compramos nosotros: no hay PDF que traer. Prometer un papel que no
-    existe es peor que no ofrecerlo."""
+def test_una_guia_tecleada_a_mano_SI_ofrece_boton_y_el_servidor_explica(mundo, como):
+    """⛔ SE INVIRTIÓ EL 2026-08-05, y por una queja concreta de Christián: «no puedo
+    imprimir las guías, teníamos un botón específico para eso y ya no está».
+
+    La regla vieja («si no la compramos nosotros, no hay PDF») sonaba prudente y era
+    falsa: `etiquetas._rescatar()` le pregunta a la paquetería POR NÚMERO DE RASTREO,
+    así que una guía comprada en la cuenta de la casa y luego capturada a mano —el pan
+    de cada día— sí tiene papel. El botón se escondía justo donde habría funcionado.
+
+    Ahora el botón sale siempre que haya número. Cuando de verdad no hay PDF, el
+    servidor lo dice con todas sus letras en vez de desaparecer: 409 `estado: manual`.
+    Un botón invisible se ve igual que una app rota; un botón que explica, no.
+    """
     ficha = server._detalle_de_pedido(A_MANO, MARIA['id'], dist=MARIA)
-    assert ficha['tiene_etiqueta'] is False
+    assert ficha['tiene_etiqueta'] is True          # el botón se pinta
+    assert ficha['etiqueta_comprada'] is False      # pero sabemos que no es nuestra
 
 
 # =============================================================================
@@ -349,3 +361,51 @@ def test_cuando_por_fin_lo_publican_se_imprime_sin_tocar_nada_mas(mundo, como):
     r = como(MARIA).get(RUTA_DIST.format('EX-RECIEN2'))
     assert r.status_code == 200
     assert r.content == PDF_FRESCO
+
+
+# =============================================================================
+#  6) TENER GUÍA NO ES HABER ENVIADO  (Christián, 2026-08-05)
+# =============================================================================
+#  «No puede aparecer un envío como enviado a menos que en verdad se haya enviado.
+#   Puede aparecer como guía generada, pero por ejemplo el de Fabiola aún no lo
+#   envío yo».
+#
+#  El caso Fabiola: guía comprada e impresa, paquete todavía en la mesa. Antes el
+#  sistema lo daba por salido y se lo decía al cliente por correo. Estas pruebas son
+#  el candado de que no vuelva a pasar.
+def test_con_guia_y_sin_salir_la_etapa_es_GUIA_GENERADA():
+    """El cajón de Fabiola: hay número, no ha salido."""
+    assert guias.etapa_de_envio(
+        {'status': 'confirmado', 'tracking_number': 'ABC123'}) == 'guia_generada'
+
+
+def test_solo_lo_que_de_verdad_salio_dice_ENVIADO():
+    assert guias.etapa_de_envio({'status': 'enviado'}) == 'enviado'
+    # `shipped_at` manda aunque el estado se haya quedado atrás: la fecha de salida
+    # es un hecho, el estado es una etiqueta que alguien pudo no mover.
+    assert guias.etapa_de_envio(
+        {'status': 'confirmado', 'shipped_at': '2026-08-01T10:00:00'}) == 'enviado'
+
+
+def test_sin_numero_no_hay_guia_que_enseñar():
+    assert guias.etapa_de_envio({'status': 'confirmado'}) == 'sin_guia'
+    assert guias.etapa_de_envio({}) == 'sin_guia'
+
+
+def test_ya_salio_es_la_pregunta_de_los_correos_no_tiene_guia():
+    """Todo lo que le PROMETE movimiento a alguien pregunta por aquí."""
+    assert guias.ya_salio({'tracking_number': 'ABC123'}) is False
+    assert guias.ya_salio({'tracking_number': 'ABC123', 'status': 'enviado'}) is True
+
+
+def test_capturar_la_guia_NO_empuja_el_pedido_a_enviado():
+    """⛔ EL CANDADO DE LA REGLA. Si alguien vuelve a meter el auto-'enviado' en la
+    ruta que guarda el envío, esto se pone rojo.
+
+    Se lee el código a propósito: el bug vivía en dos líneas que empujaban el estado
+    y estampaban `shipped_at` sin que nadie dijera que el paquete salió.
+    """
+    import inspect
+    cuerpo = inspect.getsource(server._guardar_envio)
+    assert "update['status'] = 'enviado'" not in cuerpo, (
+        'capturar una guía volvió a marcar el pedido como enviado')

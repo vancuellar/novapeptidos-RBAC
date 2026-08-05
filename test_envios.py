@@ -1544,10 +1544,17 @@ def test_al_comprar_la_guia_le_llega_el_rastreo_al_cliente(
 
 def test_capturar_la_guia_A_MANO_tambien_le_avisa_al_cliente(db, monkeypatch):
     """El admin puede seguir pegando una guía comprada en el mostrador. El cliente
-    tiene que enterarse igual."""
+    tiene que enterarse igual.
+
+    ⛔ PERO LE AVISA DE LA GUÍA, NO DEL ENVÍO (Christián, 2026-08-05). Capturar el
+    número no saca el paquete de la mesa: el aviso que sale aquí es «ya tienes guía».
+    El «va en camino» se manda cuando de verdad sale (ver el test de más abajo).
+    """
     avisados = []
-    monkeypatch.setattr(server, 'avisar_del_envio',
+    monkeypatch.setattr(server, 'avisar_de_la_guia',
                         lambda o: avisados.append(o.get('tracking_number')) or _async_nada())
+    monkeypatch.setattr(server, 'avisar_del_envio',
+                        lambda o: avisados.append('NO-DEBIO-SALIR') or _async_nada())
     asyncio.run(db.orders.insert_one(_orden('spei')))
     from models import OrderShippingUpdate
     asyncio.run(server.update_order_shipping('o1', OrderShippingUpdate(
@@ -1649,8 +1656,11 @@ def test_la_distribuidora_captura_la_guia_de_SU_pedido(db, monkeypatch):
     assert ficha['carrier'] == 'Estafeta'
     assert ficha['tracking_number'] == 'ABC123'
     assert 'ABC123' in ficha['tracking_url']        # armada por el servidor
-    # Capturar una guía ES que ya salió: el pedido pasa solo a 'enviado'.
-    assert ficha['status'] == 'enviado' and ficha['shipped_at']
+    # ⛔ CAPTURAR UNA GUÍA NO ES HABER ENVIADO (Christián, 2026-08-05: «el de Fabiola
+    # aún no lo envío yo»). El estado NO se mueve solo y `shipped_at` no se estampa:
+    # el paquete sigue en la mesa hasta que alguien diga que salió.
+    assert ficha['status'] != 'enviado' and not ficha.get('shipped_at')
+    assert ficha['etapa_envio'] == 'guia_generada'   # y se ve como tal
     # Y sigue viendo SU comisión, no el margen de la casa.
     assert 'my_commission' in ficha
 
@@ -1734,9 +1744,11 @@ def test_capturar_no_marca_el_pedido_como_pagado(db, monkeypatch):
 
 
 def test_al_capturar_la_distribuidora_le_sale_el_correo_al_cliente(db, monkeypatch):
-    """El punto de todo esto: que el cliente reciba su rastreo sin esperar al admin."""
+    """El punto de todo esto: que el cliente reciba su rastreo sin esperar al admin.
+
+    Desde el 2026-08-05 lo que le llega es «ya tienes guía», no «ya salió»."""
     avisados = []
-    monkeypatch.setattr(server, 'avisar_del_envio',
+    monkeypatch.setattr(server, 'avisar_de_la_guia',
                         lambda o: avisados.append(o.get('tracking_number')) or _async_nada())
     asyncio.run(db.orders.insert_one(_pedido_de('maria')))
     _capturar('EX-20260728-0001', MARIA, carrier='Estafeta', tracking_number='ABC123')
@@ -1744,9 +1756,9 @@ def test_al_capturar_la_distribuidora_le_sale_el_correo_al_cliente(db, monkeypat
 
 
 def test_corregir_la_guia_no_manda_un_SEGUNDO_correo(db, monkeypatch):
-    """Se equivocó de dígito y la corrige: el cliente no recibe dos "ya salió"."""
+    """Se equivocó de dígito y la corrige: el cliente no recibe dos avisos."""
     avisados = []
-    monkeypatch.setattr(server, 'avisar_del_envio',
+    monkeypatch.setattr(server, 'avisar_de_la_guia',
                         lambda o: avisados.append(o.get('tracking_number')) or _async_nada())
     asyncio.run(db.orders.insert_one(_pedido_de('maria')))
     _capturar('EX-20260728-0001', MARIA, carrier='Estafeta', tracking_number='ABC123')

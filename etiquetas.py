@@ -58,7 +58,17 @@ class EtiquetaNoLista(Exception):
     Se distingue de un error de verdad porque lo que hay que hacer es distinto: aquí
     no se avisa a nadie ni se reintenta la compra, sólo se vuelve a preguntar en unos
     segundos. Por eso es su propia clase y no un `RuntimeError` pelón.
+
+    `estado` separa dos cosas que se veían iguales y NO se arreglan igual:
+      · `generando` — el papel viene en camino: hay que esperar y reintentar.
+      · `manual`    — no hay papel nuestro y no lo va a haber (la guía se tecleó a
+                      mano y la paquetería no nos la reconoce). Reintentar es perder
+                      el tiempo; lo que toca es ir por el PDF a donde se compró.
     """
+
+    def __init__(self, mensaje: str, estado: str = 'generando'):
+        super().__init__(mensaje)
+        self.estado = estado
 
 
 def _parece_pdf(contenido: bytes) -> bool:
@@ -118,6 +128,15 @@ def _pdf_de_la_guia(order: dict) -> tuple[bytes, str]:
         return pdf, guardada
     fresca = _rescatar(order.get('label_provider') or '', numero)
     if not fresca:
+        # ⛔ DECIR CUÁL DE LAS DOS ES. Si el pedido nunca pasó por una paquetería
+        # nuestra, esto NO es un «espérate»: no hay papel que esperar, y quien está
+        # frente a la impresora tiene que enterarse ya para ir por él a otro lado en
+        # vez de picarle diez veces. Con guía comprada por nosotros sí es esperar.
+        comprada = bool(guardada or order.get('label_provider'))
+        if not comprada:
+            raise EtiquetaNoLista(
+                'Esa guía se capturó a mano: no hay PDF nuestro que imprimir. '
+                'Búscalo donde se compró la guía.', estado='manual')
         raise EtiquetaNoLista('La paquetería todavía no publica el PDF de esa guía')
     pdf = _bajar(fresca)
     if not pdf:
@@ -136,10 +155,12 @@ async def etiqueta_para_imprimir(order: dict) -> Response:
     try:
         pdf, liga = await asyncio.to_thread(_pdf_de_la_guia, order)
     except EtiquetaNoLista as e:
-        # 409, no 404: el pedido y la guía existen: lo que falta es el papel, y va a
-        # llegar solo. La pantalla lo pinta como «Generando…» y vuelve a preguntar.
+        # 409, no 404: el pedido y la guía existen; lo que falta es el papel. Con
+        # `generando` la pantalla pinta «Generando…» y vuelve a preguntar sola; con
+        # `manual` deja de reintentar y explica que esa guía no tiene PDF nuestro.
         raise HTTPException(status_code=409,
-                            detail={'estado': 'generando', 'mensaje': str(e)})
+                            detail={'estado': getattr(e, 'estado', 'generando'),
+                                    'mensaje': str(e)})
     # Si la liga cambió (la firmada de antes caducó) se deja escrita la nueva: la
     # próxima impresión ya no tiene que salir a preguntar.
     if liga and liga != (order.get('label_url') or ''):
