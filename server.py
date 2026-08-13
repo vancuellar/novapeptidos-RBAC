@@ -109,6 +109,7 @@ import etiquetas
 # (src/lib/paqueteria.js); ver guias.py.
 import basura
 import guias
+import resenas
 import turnstile
 # EL RASTREO DENTRO DE NUESTRA PÁGINA. La paquetería no se deja enmarcar
 # (`x-frame-options: SAMEORIGIN`), así que le pedimos los eventos a su API y los
@@ -4978,6 +4979,30 @@ async def admin_marcar_prueba(order_id: str, payload: MarcaDePrueba,
 
 class BarridoDePruebas(BaseModel):
     simulacro: bool = True
+
+
+@api_router.get('/resenas')
+async def resenas_publicas():
+    """Las reseñas de Google para la portada. PUBLICA: la ve cualquiera.
+
+    Christian, 2026-08-05: «una seccion en el home que muestre nuestros reviews».
+
+    ⛔ VA A OTRO HILO. Preguntarle a Google es una llamada de red de hasta 8
+    segundos; hacerla en el hilo del servidor dejaria a la TIENDA ENTERA esperando
+    mientras alguien mira la portada. Mismo cuidado que el PDF de las guias.
+
+    ⛔ Y NUNCA REVIENTA. Sin llaves, sin red, o con una respuesta rara, contesta
+    listas vacias y la portada simplemente no pinta la seccion. Una portada sin
+    testimonios se ve bien; una portada rota, no.
+
+    El caché vive dentro de `resenas.traer()`: la portada la ve cualquiera y una
+    llamada por visita seria pagarle a Google por cada curioso.
+    """
+    try:
+        return await asyncio.to_thread(resenas.traer)
+    except Exception:
+        logger.exception('Reseñas: fallo al traerlas')
+        return {'resenas': [], 'promedio': 0, 'cuantas': 0}
 
 
 @api_router.post('/admin/users/barrer-pruebas')

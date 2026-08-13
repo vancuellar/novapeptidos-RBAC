@@ -54,6 +54,12 @@ PERMITIDAS = {
     # La PÚBLICA (sitekey) NO va aquí: esa se publica en el HTML a propósito, no es
     # secreto. Aquí sólo la que valida del lado del servidor.
     'TURNSTILE_SECRET_KEY',
+    # Las reseñas de Google del Perfil de Empresa, para la portada. No cobran ni
+    # cotizan; viven aquí por lo mismo que las demás. El PLACE_ID no es un secreto
+    # (es público y sale en el mapa), pero se guarda junto a su llave para que las
+    # dos se peguen en el mismo lugar y no haya que entrar al servidor por una.
+    'GOOGLE_PLACES_API_KEY',
+    'GOOGLE_PLACE_ID',
     # El motor del chat. No cobra ni cotiza: vive aquí por lo mismo que las
     # demás — para poder pegarlo desde el teléfono. Mientras no estén, el chat
     # sigue con Gemini exactamente como hoy (ver `modelo_ia.py`).
