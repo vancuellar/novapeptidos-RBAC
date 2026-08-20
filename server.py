@@ -4981,6 +4981,38 @@ class BarridoDePruebas(BaseModel):
     simulacro: bool = True
 
 
+@api_router.get('/catalogo/ocultos')
+async def catalogo_ocultos():
+    """Qué productos NO debe pintar el sitio. PUBLICA.
+
+    ⛔ POR QUE EXISTE (Christian, 2026-08-05: «esconde todos los otros compuestos de
+    los que no tenemos stock»). El backend ya respeta `hidden` en todo lo suyo —la
+    lista publica lo filtra, la ficha da 404 y el checkout lo rechaza—, pero EL SITIO
+    NO LEE DE AQUI su catalogo: lo lee de `src/data/fallbackCatalog.js`, que viaja
+    dentro del bundle. Por eso, hasta hoy, esconder un producto obligaba a BORRARLO A
+    MANO de ese archivo y volver a desplegar.
+
+    Con esto, esconder vuelve a ser lo que debe ser: un dato. Se marca `hidden` en el
+    Panel y el sitio deja de pintarlo en la siguiente carga, sin tocar codigo y sin
+    despliegue. Y al reves: para volver a mostrarlo, se desmarca y ya.
+
+    ⛔ FALLA ABIERTO. Si esto truena o no contesta, el sitio pinta el catalogo
+    COMPLETO. Es la misma regla de siempre: mejor enseñar de mas un rato que dejar la
+    tienda vacia por un error nuestro.
+    """
+    try:
+        docs = await db.products.find(
+            {'hidden': True}, {'_id': 0, 'sku': 1, 'slug': 1, 'id': 1}).to_list(1000)
+    except Exception:
+        logger.exception('Ocultos: fallo la consulta; el sitio vera el catalogo entero')
+        return {'skus': [], 'slugs': [], 'ids': []}
+    return {
+        'skus': sorted({d['sku'] for d in docs if d.get('sku')}),
+        'slugs': sorted({d['slug'] for d in docs if d.get('slug')}),
+        'ids': sorted({d['id'] for d in docs if d.get('id')}),
+    }
+
+
 @api_router.get('/resenas')
 async def resenas_publicas():
     """Las reseñas de Google para la portada. PUBLICA: la ve cualquiera.
