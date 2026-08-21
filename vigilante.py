@@ -81,7 +81,21 @@ ENV_APP = os.environ.get('EXYGEN_ENV', '/opt/exygen/app/.env')
 
 TIEMPO = 20               # segundos de paciencia por peticion
 FALLAS_PARA_GRITAR = 2    # dos revisiones malas seguidas antes de dar la alarma
-PRODUCTOS_MINIMOS = 40    # menos que esto es un catalogo roto, no un catalogo
+# ⛔ EL PISO MIDE EL CATALOGO ENTERO, NO LO QUE ESTA A LA VENTA (2026-08-05).
+# Era 40 a secas, y el 5-ago mando una alarma FALSA a Christian diciendo que la
+# tienda estaba caida: ese dia el dejo a la venta SOLO las 13 presentaciones que
+# tiene en bodega y escondio las otras 192, a proposito. La tienda estaba perfecta.
+#
+# Un piso escrito a mano convierte cada decision de negocio en una alarma falsa, y
+# una alarma que grita cuando la casa hizo lo que QUISO se aprende a ignorar — que es
+# la peor averia posible en un vigia. Es la misma leccion que ya se aprendio en
+# `auditoria-e2e.js` el 1-ago con las presentaciones ocultadas por ventana de sentido.
+#
+# Lo que este vigia tiene que cazar de verdad son DOS cosas, y las dos siguen vivas:
+#   1. que no haya NADA que vender (cero productos), y
+#   2. que la respuesta venga TRUNCADA — se mide a la venta + escondidos, porque un
+#      truncamiento se lleva los dos por delante y llega en decenas de menos.
+PRODUCTOS_MINIMOS = 40    # a la venta + escondidos; menos que esto es truncamiento
 
 
 # --------------------------------------------------------------------------
@@ -148,8 +162,24 @@ def revisar_catalogo(fallas, tiempos):
     except ValueError:
         fallas.append('el catalogo contesta algo que no es JSON')
         return
-    if cuantos < PRODUCTOS_MINIMOS:
-        fallas.append(f'el catalogo trae {cuantos} productos (deberian ser {PRODUCTOS_MINIMOS}+): no se puede vender')
+    # Cero es cero: no hay nada que vender, y eso si es la tienda caida.
+    if cuantos == 0:
+        fallas.append('el catalogo no trae NI UN producto: no se puede vender')
+        return
+    # Y el truncamiento se mide contra el catalogo COMPLETO. Que Christian esconda
+    # 192 productos a proposito no es una averia; que se pierdan 192 sin que nadie
+    # los escondiera, si — y eso lo caza igual, porque entonces tampoco aparecen
+    # en la lista de escondidos.
+    escondidos = 0
+    codigo_o, cuerpo_o, _ = _traer(f'{API}/catalogo/ocultos')
+    if codigo_o == 200:
+        try:
+            escondidos = len(json.loads(cuerpo_o).get('skus') or [])
+        except ValueError:
+            escondidos = 0
+    if cuantos + escondidos < PRODUCTOS_MINIMOS:
+        fallas.append(f'el catalogo trae {cuantos} a la venta + {escondidos} escondidos '
+                      f'(deberian ser {PRODUCTOS_MINIMOS}+ en total): viene truncado')
 
 
 def revisar_sitio(fallas, tiempos):
